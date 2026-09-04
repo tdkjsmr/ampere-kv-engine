@@ -4,7 +4,22 @@ AmpereKV Engine 是一个面向 NVIDIA RTX 3090 24GB（Ampere，`sm_86`）和 Qw
 
 项目聚焦长上下文在线推理中的 KV Cache 容量、Decode Attention 显存访问、Prefill 与 Decode 相互干扰，以及短 Kernel 启动开销。目标是构建一条具备明确正确性契约、可复现实验配置和分层性能测量的最小推理路径。
 
-> 当前状态：项目处于初始化阶段，仓库暂时只包含目录骨架，尚未发布可运行代码或性能结果。
+> 当前状态：v0.1 基础设施已经进入实现阶段。CPU 契约可在无 CUDA
+> 环境中检查；CUDA/Triton Smoke 必须在 RTX 3090 云端完成后才能记为通过。
+
+## 实现方式
+
+AmpereKV Engine 是独立实现，不是 nano-vLLM、vLLM 或其他推理框架的
+Fork。项目会参考成熟引擎的公开设计思路，但自行定义模块边界、数据结构、
+CUDA 算子、测试和实验记录。Hugging Face/PyTorch 用作正确性参考，
+vLLM 只在后续阶段作为明确版本的对照实现。
+
+这条边界意味着：
+
+- 不复制上游仓库的提交历史或直接在其代码上改造；
+- 每个核心组件都必须能够独立解释、测试和替换；
+- 借鉴外部实现时记录来源和许可证，不把外部代码误写为原创；
+- 对照框架只提供参考结果，不进入 AmpereKV 的运行时依赖。
 
 ## 核心模块
 
@@ -78,7 +93,10 @@ third_party/     第三方依赖和来源说明
 ## 当前进度
 
 - [x] 初始化仓库与目录结构；
-- [ ] 冻结开发环境与模型契约；
+- [x] 锁定 Qwen3-8B 模型版本与静态模型契约；
+- [x] 建立 CPU 契约测试、KV 容量计算和运行清单 Schema；
+- [x] 编写面向 sm_86 的 CUDA Extension 与 Triton 最小 Smoke；
+- [ ] 在 RTX 3090 云端冻结实际开发环境并通过两个 GPU Smoke；
 - [ ] 建立 Hugging Face/PyTorch 正确性基线；
 - [ ] 实现最小 BF16 推理路径；
 - [ ] 实现 Paged KV Cache 与 CUDA Decode Kernel；
@@ -86,4 +104,9 @@ third_party/     第三方依赖和来源说明
 - [ ] 实现在线调度、Chunked Prefill 与 CUDA Graph；
 - [ ] 完成分层 Benchmark、Profiler 分析和可复现发布。
 
-在代码、测试和实测结果达到对应阶段的验收条件后，本 README 将持续补充构建方法、复现命令、正确性结果和性能报告。
+v0.1 的具体范围、运行命令和未完成验收项见
+docs/v0.1_status.md。任何 CUDA、模型推理或性能结论都必须由云端实际结果
+支持；仅在本地通过语法检查不代表 GPU 路径可用。
+
+在代码、测试和实测结果达到对应阶段的验收条件后，本 README 将持续补充
+构建方法、复现命令、正确性结果和性能报告。

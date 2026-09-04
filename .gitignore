@@ -1,0 +1,57 @@
+# Python 缓存与测试产物
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+
+# Python 虚拟环境与构建产物
+.venv/
+venv/
+build/
+dist/
+*.egg-info/
+*.so
+*.pyd
+*.dll
+
+# CMake 与 CUDA 编译产物
+cmake-build-*/
+CMakeCache.txt
+CMakeFiles/
+*.o
+*.obj
+*.a
+*.lib
+
+# 模型权重与外部数据
+*.safetensors
+*.bin
+*.pt
+*.pth
+models/
+datasets/
+local_private/
+
+# 原始 Profiler 文件与临时运行结果
+*.nsys-rep
+*.ncu-rep
+results/runs/
+profiles/raw/
+
+# 本地环境变量、凭据与编辑器文件
+.env
+.env.*
+!.env.example
+.idea/
+.vscode/
+*.swp
+*.tmp
+*.log
+
+# 操作系统生成文件
+.DS_Store
+Thumbs.db
+Desktop.ini

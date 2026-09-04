@@ -1,0 +1,33 @@
+schema_version: 1
+
+model:
+  id: Qwen/Qwen3-8B
+  revision: b968826d9c46dd6066d109eabc6255188de91218
+  tokenizer_revision: b968826d9c46dd6066d109eabc6255188de91218
+  dtype: bfloat16
+  trust_remote_code: false
+  enable_thinking: false
+
+metadata_files:
+  config.json:
+    sha256: f7c4eadfbbf522470667b797a3c89be2524832d2d599797248dc304fff447c30
+  tokenizer_config.json:
+    sha256: d5d09f07b48c3086c508b30d1c9114bd1189145b74e982a265350c923acd8101
+  generation_config.json:
+    sha256: 2325da0f15bb848e018c5ae071b7943332e9f871d6b60e2ed22ca97d4cb993d2
+
+contract:
+  architecture: Qwen3ForCausalLM
+  model_type: qwen3
+  parameter_count: 8190735360
+  num_hidden_layers: 36
+  hidden_size: 4096
+  intermediate_size: 12288
+  num_attention_heads: 32
+  num_key_value_heads: 8
+  head_dim: 128
+  max_position_embeddings: 40960
+  vocab_size: 151936
+  rope_theta: 1000000
+  tie_word_embeddings: false
+  torch_dtype: bfloat16

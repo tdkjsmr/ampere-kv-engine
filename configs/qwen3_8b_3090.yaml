@@ -1,0 +1,29 @@
+schema_version: 1
+
+hardware:
+  gpu_name: NVIDIA GeForce RTX 3090
+  compute_capability: "8.6"
+  cuda_arch: sm_86
+  nominal_memory_gib: 24
+
+model:
+  lock_file: configs/model.lock.yaml
+  inference_dtype: bfloat16
+  attention_type: gqa
+  num_hidden_layers: 36
+  num_attention_heads: 32
+  num_key_value_heads: 8
+  head_dim: 128
+
+kv_cache:
+  default_block_size: 16
+  block_size_candidates: [8, 16, 32]
+  baseline_dtype: bfloat16
+  quantized_dtype: int8
+  scale_dtype: float16
+  scale_granularity: per_token_per_kv_head_per_k_or_v
+
+benchmark:
+  batch_sizes: [1, 2, 4, 8, 16, 32]
+  context_lengths: [1, 15, 16, 17, 127, 128, 129, 512, 2048, 8192, 16384, 32768]
+  random_seed: 20260904
