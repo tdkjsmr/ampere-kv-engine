@@ -1,33 +1,25 @@
-"""最小 CUDA Extension Smoke 的 Python 调用层。"""
+"""运行 G0 的最小 CUDA 正确性检查。"""
 
-from __future__ import annotations
+import torch
+
+from ampere_kv import _C
 
 
-def run_cuda_smoke() -> dict[str, object]:
-    """运行自定义 CUDA 加法算子并与 PyTorch Reference 比较。"""
-
-    import torch
+def main() -> None:
+    """调用自定义加法 Kernel，并与 PyTorch 结果逐元素比较。"""
 
     if not torch.cuda.is_available():
-        raise RuntimeError("CUDA 不可用，必须在云端 GPU 环境运行 Smoke")
-
-    # 导入扩展时会完成 torch.library 算子注册。
-    from ampere_kv import _C  # noqa: F401
+        raise RuntimeError("CUDA 不可用")
 
     left = torch.tensor([1.0, 2.0, 3.0, 4.0], device="cuda")
     right = torch.tensor([10.0, 20.0, 30.0, 40.0], device="cuda")
-    actual = torch.ops.ampere_kv.smoke_add(left, right)
-    expected = left + right
+    actual = _C.smoke_add(left, right)
 
-    # 显式同步，确保异步 Kernel 启动错误不会在进程退出后被遗漏。
+    # 同步后再比较，确保异步 Kernel 的运行错误能在这里暴露。
     torch.cuda.synchronize()
-    torch.testing.assert_close(actual, expected, rtol=0.0, atol=0.0)
+    torch.testing.assert_close(actual, left + right, rtol=0.0, atol=0.0)
+    print("[PASS] CUDA Extension Smoke")
 
-    major, minor = torch.cuda.get_device_capability(0)
-    return {
-        "status": "PASS",
-        "gpu_name": torch.cuda.get_device_name(0),
-        "compute_capability": f"{major}.{minor}",
-        "dtype": str(actual.dtype),
-        "result": actual.cpu().tolist(),
-    }
+
+if __name__ == "__main__":
+    main()

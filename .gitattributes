@@ -1,19 +1,9 @@
-# 默认把可识别的文本文件纳入换行规范化。
+# Windows 本地编辑、Linux 云端构建，因此源码统一保存为 LF。
 * text=auto
-
-# Linux 云端直接执行的脚本和构建文件必须使用 LF。
-*.sh text eol=lf
 Makefile text eol=lf
-CMakeLists.txt text eol=lf
-
-# 源码、配置和文档统一在仓库中保存为 LF。
 *.py text eol=lf
 *.cpp text eol=lf
 *.cu text eol=lf
-*.h text eol=lf
 *.toml text eol=lf
-*.yaml text eol=lf
-*.yml text eol=lf
-*.json text eol=lf
 *.md text eol=lf
 *.MD text eol=lf

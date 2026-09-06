@@ -4,8 +4,6 @@
 #include <c10/cuda/CUDAException.h>
 #include <c10/cuda/CUDAGuard.h>
 
-#include "ops.h"
-
 namespace {
 
 constexpr int kThreadsPerBlock = 256;
@@ -16,8 +14,7 @@ __global__ void smoke_add_kernel(
     const scalar_t* __restrict__ right,
     scalar_t* __restrict__ output,
     int64_t num_elements) {
-  // 每个 CUDA Thread 负责一个元素。该 Kernel 故意保持最小，
-  // 只验证指针传递、Grid 计算、Kernel 启动和结果回写是否正常。
+  // 每个 CUDA Thread 只负责一个元素。
   const int64_t index =
       static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
   if (index < num_elements) {
@@ -51,12 +48,12 @@ at::Tensor smoke_add_cuda(
     const at::Tensor& right) {
   check_smoke_inputs(left, right);
 
-  // 守卫保证后续分配和 Kernel 都落在 left 所在的 GPU 上。
+  // 保证输出分配和 Kernel 启动都发生在输入所在的 GPU 上。
   const c10::cuda::CUDAGuard device_guard(left.device());
   at::Tensor output = at::empty_like(left);
   const int64_t num_elements = left.numel();
 
-  // 空 Tensor 不需要启动 Kernel，但输出形状仍然必须正确。
+  // 空 Tensor 没有需要计算的元素，直接返回同形状输出。
   if (num_elements == 0) {
     return output;
   }
@@ -83,8 +80,7 @@ at::Tensor smoke_add_cuda(
             num_elements);
       });
 
-  // 这里只检查 Launch Error，不在算子内部强制 cudaDeviceSynchronize。
-  // 同步由测试端统一执行，避免把错误的同步习惯带入后续性能 Kernel。
+  // 这里只检查启动错误；同步由 Python 调用端完成。
   C10_CUDA_KERNEL_LAUNCH_CHECK();
   return output;
 }
