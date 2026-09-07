@@ -52,6 +52,48 @@ class ContiguousKVCache:
         return self._key[:, :, :self.length, :], self._value[:, :, :self.length, :]
 
 
+@torch.no_grad()
+def decode_attention(
+    query: torch.Tensor, key: torch.Tensor, value: torch.Tensor, cache: ContiguousKVCache,
+) -> torch.Tensor:
+    """追加当前单 Token 的 BF16 K/V，返回 [1, Query 头数, 1, 每头维度] 的 FP32 输出。
+
+    调用前缓存只包含历史，调用方不要提前追加当前 K/V；重复调用会重复追加。
+    输入检查在写入前完成；追加后若计算失败，不自动回滚缓存，不能盲目重试。
+    这是推理参考计算，不包含 QKV 投影、位置编码、头合并或输出投影。
+    """
+
+    # 先检查 Q 与头映射，避免非法输入已经写入缓存后才报错。
+    if any(tensor.ndim != 4 for tensor in (query, key, value)):
+        raise ValueError("Q/K/V 必须是四维张量")
+    if any(tensor.shape[0] != 1 or tensor.shape[2] != 1 for tensor in (query, key, value)):
+        raise ValueError("Decode 只支持单请求、单 Token")
+    if key.shape != value.shape or query.shape[-1] != key.shape[-1]:
+        raise ValueError("K/V 形状必须相同，Q/K/V 每头维度必须一致")
+    if query.shape[1] <= 0 or key.shape[1] <= 0 or query.shape[1] % key.shape[1] != 0:
+        raise ValueError("Query 头数必须是 KV 头数的正整数倍")
+    if any(tensor.dtype != torch.bfloat16 for tensor in (query, key, value)):
+        raise ValueError("Q/K/V 必须使用 BF16")
+    if query.device != key.device or key.device != value.device:
+        raise ValueError("Q/K/V 必须位于同一设备")
+
+    # append 继续负责检查 K/V 与缓存的形状、设备及容量是否匹配。
+    cache.append(key, value)
+    cached_key, cached_value = cache.get()
+    # 缓存仍是 BF16；仅临时计算张量转 FP32，最终输出也保留 FP32。
+    compute_key, compute_value = cached_key.float(), cached_value.float()
+    group_size = query.shape[1] // key.shape[1]
+    if group_size > 1:
+        # GQA 按 [KV0, KV0, KV1, KV1] 连续重复头；不改变缓存本体。
+        # 这会复制临时数据，只是参考路径，不是高性能共享 KV 内核。
+        compute_key = compute_key.repeat_interleave(group_size, dim=1)
+        compute_value = compute_value.repeat_interleave(group_size, dim=1)
+    # Q 仅对应最后一个位置，K/V 只含有效历史及当前位置，无未来或填充需屏蔽。
+    return torch.nn.functional.scaled_dot_product_attention(
+        query.float(), compute_key, compute_value, dropout_p=0.0, is_causal=False,
+    )
+
+
 def main() -> None:
     """显式运行本模块时，在 CPU 上检查存储和 Attention 对照；不使用 GPU。"""
 
@@ -107,25 +149,20 @@ def main() -> None:
     # 容量故意大于有效长度，检查 get() 不会把未初始化的空闲位置交给 Attention。
     attention_cache = ContiguousKVCache(num_kv_heads=2, head_dim=4, capacity=6)
     attention_cache.append(full_key[:, :, :3, :], full_value[:, :, :3, :])
-    attention_cache.append(full_key[:, :, 3:4, :], full_value[:, :, 3:4, :])
+    # 当前 K/V 由接口追加，自检只提前写入历史，避免当前 Token 被写入两次。
+    actual_output = decode_attention(query, full_key[:, :, 3:4, :], full_value[:, :, 3:4, :], attention_cache)
     cached_key, cached_value = attention_cache.get()
     assert attention_cache.length == 4
     assert cached_key.shape == cached_value.shape == (1, 2, 4, 4)
     assert torch.equal(cached_key, full_key) and torch.equal(cached_value, full_value)
 
-    # 当前 Query 位于最后，传入的 K/V 只有历史和当前位置，没有未来或填充位置。
-    # 所以允许关注整个有效前缀；此处不能用左上对齐的 is_causal=True 掩码。
-    actual_output = torch.nn.functional.scaled_dot_product_attention(
-        query.float(), cached_key.float(), cached_value.float(),
-        dropout_p=0.0, is_causal=False,
-    )
     # 手写公式与 SDPA 的运算顺序可能不同，FP32 对照使用小容差，不要求逐位一致。
     torch.testing.assert_close(actual_output, expected_output, rtol=1e-5, atol=1e-6)
     max_error = (actual_output - expected_output).abs().max().item()
     print(f"[PASS] 单 Token Attention 对照：输出形状={tuple(actual_output.shape)}，最大绝对误差={max_error:.8g}")
     print("[PASS] CPU 等头数 Attention 对照通过")
 
-    # GQA：沿用刚才缓存中的 2 个 KV 头，但使用 4 个 Query 头，每 2 个共享一组 K/V。
+    # GQA：沿用原始 K/V 数据，但另建缓存；4 个 Query 头共享 2 个 KV 头。
     gqa_query = torch.randn(1, 4, 1, 4, generator=generator).to(torch.bfloat16)
     assert gqa_query.shape[1] % cached_key.shape[1] == 0
     group_size = gqa_query.shape[1] // cached_key.shape[1]
@@ -141,19 +178,25 @@ def main() -> None:
         head_outputs.append(weights @ head_value)
     expected_gqa = torch.cat(head_outputs, dim=1)
 
-    # CPU 对照显式临时扩展为 [KV0, KV0, KV1, KV1]，不依赖原生 GQA 后端支持。
-    # repeat_interleave 连续重复每个头；不能用得到 [KV0, KV1, KV0, KV1] 的平铺代替。
-    # 这会复制临时计算数据，不是高性能共享 KV 内核；缓存本体仍然只有 2 个 KV 头。
-    expanded_key = cached_key.float().repeat_interleave(group_size, dim=1)
-    expanded_value = cached_value.float().repeat_interleave(group_size, dim=1)
-    actual_gqa = torch.nn.functional.scaled_dot_product_attention(
-        gqa_query.float(), expanded_key, expanded_value, dropout_p=0.0, is_causal=False,
-    )
+    gqa_cache = ContiguousKVCache(num_kv_heads=2, head_dim=4, capacity=6)
+    gqa_cache.append(full_key[:, :, :3, :], full_value[:, :, :3, :])
+    actual_gqa = decode_attention(gqa_query, full_key[:, :, 3:4, :], full_value[:, :, 3:4, :], gqa_cache)
     torch.testing.assert_close(actual_gqa, expected_gqa, rtol=1e-5, atol=1e-6)
-    assert attention_cache.get()[0].shape == attention_cache.get()[1].shape == (1, 2, 4, 4)
+    assert gqa_cache.length == 4
+    assert gqa_cache.get()[0].shape == gqa_cache.get()[1].shape == (1, 2, 4, 4)
+    assert torch.equal(gqa_cache.get()[0], full_key) and torch.equal(gqa_cache.get()[1], full_value)
     max_error = (actual_gqa - expected_gqa).abs().max().item()
     print(f"[PASS] GQA 头映射 [0, 0, 1, 1]：输出形状={tuple(actual_gqa.shape)}，最大绝对误差={max_error:.8g}")
-    print("[PASS] CPU 缓存与 Attention 自检通过；未验证 GPU、原生 GQA 内核或完整模型")
+    # 3 个 Query 头不能分组到 2 个 KV 头：必须在追加前拒绝，历史内容保持不变。
+    try:
+        decode_attention(gqa_query[:, :3], full_key[:, :, 3:4], full_value[:, :, 3:4], gqa_cache)
+    except ValueError as error:
+        assert gqa_cache.length == 4
+        assert torch.equal(gqa_cache.get()[0], full_key) and torch.equal(gqa_cache.get()[1], full_value)
+        print(f"[PASS] 非法头数在写入前被拒绝，缓存未改变：{error}")
+    else:
+        raise AssertionError("[FAIL] Decode 接口接受了非法的头数关系")
+    print("[PASS] CPU Decode 接口自检通过；未验证 GPU、原生 GQA 内核或完整模型")
 
 
 if __name__ == "__main__":
