@@ -1,4 +1,4 @@
-"""单层 BF16 连续 KV 存储，附 CPU 存储与单 Token Attention 自检；不加载模型。"""
+"""单层 BF16 连续 KV 存储，附 CPU 存储、单 Token Attention 和 GQA 头映射自检。"""
 
 import torch
 
@@ -123,7 +123,37 @@ def main() -> None:
     torch.testing.assert_close(actual_output, expected_output, rtol=1e-5, atol=1e-6)
     max_error = (actual_output - expected_output).abs().max().item()
     print(f"[PASS] 单 Token Attention 对照：输出形状={tuple(actual_output.shape)}，最大绝对误差={max_error:.8g}")
-    print("[PASS] CPU 缓存接入 Attention 自检通过；未验证 GPU、GQA 或完整模型")
+    print("[PASS] CPU 等头数 Attention 对照通过")
+
+    # GQA：沿用刚才缓存中的 2 个 KV 头，但使用 4 个 Query 头，每 2 个共享一组 K/V。
+    gqa_query = torch.randn(1, 4, 1, 4, generator=generator).to(torch.bfloat16)
+    assert gqa_query.shape[1] % cached_key.shape[1] == 0
+    group_size = gqa_query.shape[1] // cached_key.shape[1]
+    # 独立参考不读缓存、不扩展 K/V：逐个 Query 头按整数除法找到对应的原始 KV 头。
+    head_outputs = []
+    for query_head in range(gqa_query.shape[1]):
+        kv_head = query_head // group_size  # 0、1 映射到 0；2、3 映射到 1。
+        head_query = gqa_query[:, query_head:query_head + 1].float()
+        head_key = full_key[:, kv_head:kv_head + 1].float()
+        head_value = full_value[:, kv_head:kv_head + 1].float()
+        scores = head_query @ head_key.transpose(-2, -1)
+        weights = torch.softmax(scores / gqa_query.shape[-1] ** 0.5, dim=-1)
+        head_outputs.append(weights @ head_value)
+    expected_gqa = torch.cat(head_outputs, dim=1)
+
+    # CPU 对照显式临时扩展为 [KV0, KV0, KV1, KV1]，不依赖原生 GQA 后端支持。
+    # repeat_interleave 连续重复每个头；不能用得到 [KV0, KV1, KV0, KV1] 的平铺代替。
+    # 这会复制临时计算数据，不是高性能共享 KV 内核；缓存本体仍然只有 2 个 KV 头。
+    expanded_key = cached_key.float().repeat_interleave(group_size, dim=1)
+    expanded_value = cached_value.float().repeat_interleave(group_size, dim=1)
+    actual_gqa = torch.nn.functional.scaled_dot_product_attention(
+        gqa_query.float(), expanded_key, expanded_value, dropout_p=0.0, is_causal=False,
+    )
+    torch.testing.assert_close(actual_gqa, expected_gqa, rtol=1e-5, atol=1e-6)
+    assert attention_cache.get()[0].shape == attention_cache.get()[1].shape == (1, 2, 4, 4)
+    max_error = (actual_gqa - expected_gqa).abs().max().item()
+    print(f"[PASS] GQA 头映射 [0, 0, 1, 1]：输出形状={tuple(actual_gqa.shape)}，最大绝对误差={max_error:.8g}")
+    print("[PASS] CPU 缓存与 Attention 自检通过；未验证 GPU、原生 GQA 内核或完整模型")
 
 
 if __name__ == "__main__":
