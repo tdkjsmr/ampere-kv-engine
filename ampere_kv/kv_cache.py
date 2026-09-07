@@ -1,4 +1,4 @@
-"""单层、单请求的 BF16 连续 KV 存储；本文件不计算 Attention，也不加载模型。"""
+"""单层 BF16 连续 KV 存储，附 CPU 存储与单 Token Attention 自检；不加载模型。"""
 
 import torch
 
@@ -53,7 +53,7 @@ class ContiguousKVCache:
 
 
 def main() -> None:
-    """显式运行本模块时，在 CPU 上做微型存储自检；不自动使用 GPU。"""
+    """显式运行本模块时，在 CPU 上检查存储和 Attention 对照；不使用 GPU。"""
 
     cache = ContiguousKVCache(num_kv_heads=2, head_dim=4, capacity=6)
     # 地址只用于验证原地追加，没有在类的公开接口中增加调试功能。
@@ -90,6 +90,40 @@ def main() -> None:
     assert torch.equal(actual_key, keys) and torch.equal(actual_value, values)
     assert (cache._key.data_ptr(), cache._value.data_ptr()) == addresses
     print("[PASS] 单层连续 KV 存储自检通过；此结果不代表模型或 GPU 验证通过")
+
+    # 新场景：3 个历史 Token + 1 个当前 Token；Q 只取当前位置，两个头不使用 GQA。
+    # 使用局部随机数生成器固定输入，不改变外部程序的全局随机状态。
+    generator = torch.Generator().manual_seed(0)
+    query = torch.randn(1, 2, 1, 4, generator=generator).to(torch.bfloat16)
+    full_key = torch.randn(1, 2, 4, 4, generator=generator).to(torch.bfloat16)
+    full_value = torch.randn(1, 2, 4, 4, generator=generator).to(torch.bfloat16)
+
+    # 参考路径不读取缓存：按 softmax(QK^T / sqrt(每头维度)) V 直接计算。
+    # 两边都从相同 BF16 数据转成 FP32 计算，只验证接线，不宣称 BF16 内核正确性。
+    scores = query.float() @ full_key.float().transpose(-2, -1)
+    weights = torch.softmax(scores / query.shape[-1] ** 0.5, dim=-1)
+    expected_output = weights @ full_value.float()
+
+    # 容量故意大于有效长度，检查 get() 不会把未初始化的空闲位置交给 Attention。
+    attention_cache = ContiguousKVCache(num_kv_heads=2, head_dim=4, capacity=6)
+    attention_cache.append(full_key[:, :, :3, :], full_value[:, :, :3, :])
+    attention_cache.append(full_key[:, :, 3:4, :], full_value[:, :, 3:4, :])
+    cached_key, cached_value = attention_cache.get()
+    assert attention_cache.length == 4
+    assert cached_key.shape == cached_value.shape == (1, 2, 4, 4)
+    assert torch.equal(cached_key, full_key) and torch.equal(cached_value, full_value)
+
+    # 当前 Query 位于最后，传入的 K/V 只有历史和当前位置，没有未来或填充位置。
+    # 所以允许关注整个有效前缀；此处不能用左上对齐的 is_causal=True 掩码。
+    actual_output = torch.nn.functional.scaled_dot_product_attention(
+        query.float(), cached_key.float(), cached_value.float(),
+        dropout_p=0.0, is_causal=False,
+    )
+    # 手写公式与 SDPA 的运算顺序可能不同，FP32 对照使用小容差，不要求逐位一致。
+    torch.testing.assert_close(actual_output, expected_output, rtol=1e-5, atol=1e-6)
+    max_error = (actual_output - expected_output).abs().max().item()
+    print(f"[PASS] 单 Token Attention 对照：输出形状={tuple(actual_output.shape)}，最大绝对误差={max_error:.8g}")
+    print("[PASS] CPU 缓存接入 Attention 自检通过；未验证 GPU、GQA 或完整模型")
 
 
 if __name__ == "__main__":
