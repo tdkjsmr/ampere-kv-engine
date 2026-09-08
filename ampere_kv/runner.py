@@ -2,6 +2,7 @@
 
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
+from transformers.models.qwen3.modeling_qwen3 import apply_rotary_pos_emb
 
 from ampere_kv.reference import MODEL_ID, MODEL_REVISION
 
@@ -36,6 +37,36 @@ def project_qkv(normalized: torch.Tensor, attention) -> tuple[torch.Tensor, torc
     key = rms_norm(key, attention.k_norm.weight, attention.k_norm.variance_epsilon)
     # 返回缓存与 Attention 所需的 [批大小, 头数, Token 数, 每头维度]，不强制复制为连续张量。
     return query.transpose(1, 2), key.transpose(1, 2), value.transpose(1, 2)
+
+
+def apply_rope(query: torch.Tensor, key: torch.Tensor, position_ids: torch.Tensor, config):
+    """按固定 Qwen3 的默认 RoPE 旋转 Q/K；位置显式传入，不修改原张量或 V。"""
+
+    # 只实现当前模型实际使用的完整维度默认 RoPE，不悄悄忽略长上下文缩放配置。
+    if config.rope_scaling is not None or getattr(config, "partial_rotary_factor", 1.0) != 1.0:
+        raise ValueError("当前 RoPE 仅支持无缩放、完整头维度的模型配置")
+    dim = config.head_dim
+    if dim % 2 != 0 or query.shape[-1] != dim or key.shape[-1] != dim:
+        raise ValueError("RoPE 需要偶数头维度，且 Q/K 维度必须与配置一致")
+    if position_ids.shape != (query.shape[0], query.shape[2]):
+        raise ValueError("位置形状必须是 [批大小, 本次 Token 数]")
+    # 从真实 rope_theta 计算各维度频率；与当前 CPU 加载后搬到 GPU 的模型路径一致。
+    # 这里只生成很短的频率向量，不复制模型权重；后续接入多层时再复用频率表。
+    exponent = torch.arange(0, dim, 2, dtype=torch.int64).float() / dim
+    inv_freq = (1.0 / (config.rope_theta ** exponent)).to(query.device)
+    with torch.autocast(device_type=query.device.type, enabled=False):
+        # [批大小, 半个头维度, 1] @ [批大小, 1, Token 数]，得到各位置的旋转角度。
+        frequencies = inv_freq[None, :, None].expand(query.shape[0], -1, 1)
+        angles = (frequencies @ position_ids[:, None, :].to(device=query.device, dtype=torch.float32)).transpose(1, 2)
+        # Qwen3 将前后两半配对，不是相邻偶/奇维度配对，因此角度表复制成两半。
+        angles = torch.cat((angles, angles), dim=-1)
+        cos = angles.cos().to(query.dtype).unsqueeze(1)
+        sin = angles.sin().to(query.dtype).unsqueeze(1)
+    half = dim // 2
+    rotated_query = torch.cat((-query[..., half:], query[..., :half]), dim=-1)
+    rotated_key = torch.cat((-key[..., half:], key[..., :half]), dim=-1)
+    # 保持 HF 的逐项乘法再相加顺序，旋转后仍是 BF16；这里不涉及 Attention。
+    return query * cos + rotated_query * sin, key * cos + rotated_key * sin
 
 
 def main() -> None:
@@ -110,7 +141,26 @@ def main() -> None:
         assert query_heads % kv_heads == 0
         assert query.shape[1] == query_heads and key.shape[1] == value.shape[1] == kv_heads
         print(f"[PASS] Q/K/V 准备通过：Query 头={query_heads}，KV 头={kv_heads}，每组={query_heads // kv_heads}")
-        print("本轮未应用 RoPE、未写入 KV Cache，也未验证完整 Attention 或模型生成")
+        # 整段位置从 0 开始；单 Token 复用最后一组真实 Q/K，但赋予下一位置 tokens。
+        # 后者只验证非零位置的旋转，不宣称完成了下一个 Token 的模型前向。
+        full_positions = torch.arange(tokens, device=query.device).unsqueeze(0)
+        next_position = torch.tensor([[tokens]], device=query.device)
+        for stage, q, k, positions in (
+            ("整段 RoPE", query, key, full_positions),
+            ("非零位置单 Token RoPE", query[:, :, -1:], key[:, :, -1:], next_position),
+        ):
+            actual_q, actual_k = apply_rope(q, k, positions, model.config)
+            # 参考频率与旋转都由 HF 提供；同一份旋转前 Q/K 隔离本轮 RoPE 的误差。
+            reference_cos, reference_sin = model.model.rotary_emb(q, positions)
+            expected_q, expected_k = apply_rotary_pos_emb(q, k, reference_cos, reference_sin)
+            for name, actual, expected in (("Q", actual_q, expected_q), ("K", actual_k, expected_k)):
+                error = (actual.float() - expected.float()).abs().max().item()
+                print(f"{stage} {name}：形状={tuple(actual.shape)}，类型={actual.dtype}，最大绝对误差={error:.8g}")
+                torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+            print(f"[PASS] {stage} 对照通过")
+        # V 不传给旋转函数，再次确认它仍与未旋转的 HF V 一致。
+        torch.testing.assert_close(value, reference_value, rtol=0, atol=0)
+        print("[PASS] RoPE 后 V 保持不变；未写入 KV Cache，未验证完整 Attention 或模型生成")
 
 
 if __name__ == "__main__":
