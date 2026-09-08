@@ -172,8 +172,8 @@ def main() -> None:
     # 独立参考一次计算全部 4 个位置，显式屏蔽未来；不调用我们的两个接口。
     future_mask = torch.ones(4, 4, dtype=torch.bool).triu(diagonal=1)
     # FP32 手写公式保留作参考；执行接口现已返回 BF16，不能再用原来的 FP32 容差。
-    # 以下仅用于这组 CPU 小张量：BF16 单次舍入的相对界约为 1/256，留少量计算余量。
-    # 这不是完整模型或未来 INT8 的验收阈值，真实 HF BF16 对照仍单独严格检查。
+    # 暂时保留原阈值以复现失败；单次 BF16 舍入界不能充当整个 Attention 的误差界。
+    # 先诊断缓存接入与精度路径，不根据一次失败自动放宽阈值。
     bf16_rtol, bf16_atol = 5e-3, 1e-5
     scores = full_query.float() @ full_key.float().transpose(-2, -1)
     scores = (scores / query.shape[-1] ** 0.5).masked_fill(future_mask, float("-inf"))
@@ -185,6 +185,41 @@ def main() -> None:
     prefill_output = prefill_attention(prefix_query, full_key[:, :, :3], full_value[:, :, :3], attention_cache)
     assert attention_cache.length == 3
     assert prefill_output.dtype == torch.bfloat16
+    # 仅在原检查失败时展开诊断；不改变正式执行路径，也不吞掉失败断言。
+    expected_prefill = expected_output[:, :, :3]
+    if not torch.allclose(prefill_output.float(), expected_prefill, rtol=bf16_rtol, atol=bf16_atol):
+        print(f"[诊断] PyTorch={torch.__version__}，设备={prefill_output.device}，原阈值 rtol={bf16_rtol}，atol={bf16_atol}")
+        # 直接使用原始输入，不读取缓存；保持相同的 3 Token 形状、布局、缩放和因果设置。
+        # 这一路隔离缓存接入问题；它复用 SDPA，因此不能替代下面的独立 FP32 公式。
+        direct_inputs = (prefix_query.contiguous(), full_key[:, :, :3].contiguous(), full_value[:, :, :3].contiguous())
+        direct_bf16 = torch.nn.functional.scaled_dot_product_attention(
+            *direct_inputs, dropout_p=0.0, is_causal=True, scale=query.shape[-1] ** -0.5,
+        )
+        # 同形状 FP32 SDPA 用来观察更换输入精度后的差异，不据此猜测 BF16 实际选中了哪个后端。
+        direct_fp32 = torch.nn.functional.scaled_dot_product_attention(
+            *(tensor.float() for tensor in direct_inputs),
+            dropout_p=0.0, is_causal=True, scale=query.shape[-1] ** -0.5,
+        )
+        # 同时重算 3 Token FP32 公式，区分原来整段 4 Token 与分段计算的形状影响。
+        prefix_scores = direct_inputs[0].float() @ direct_inputs[1].float().transpose(-2, -1)
+        prefix_scores = (prefix_scores * query.shape[-1] ** -0.5).masked_fill(future_mask[:3, :3], float("-inf"))
+        prefix_formula = torch.softmax(prefix_scores, dim=-1) @ direct_inputs[2].float()
+        for label, actual, expected in (
+            ("缓存 BF16 / 无缓存 BF16", prefill_output.float(), direct_bf16.float()),
+            ("无缓存 BF16 / 同形状 FP32 SDPA", direct_bf16.float(), direct_fp32),
+            ("同形状 FP32 SDPA / 同形状 FP32 公式", direct_fp32, prefix_formula),
+            ("3 Token FP32 公式 / 4 Token FP32 公式前缀", prefix_formula, expected_prefill),
+        ):
+            error = (actual - expected).abs().max().item()
+            print(f"[诊断] {label}：最大绝对误差={error:.9g}，逐元素完全一致={torch.equal(actual, expected)}")
+        # 只打印这组小张量中未满足原标准的元素；接近零时直接看原值和绝对误差。
+        matched = torch.isclose(prefill_output.float(), expected_prefill, rtol=bf16_rtol, atol=bf16_atol)
+        for coordinates in (~matched).nonzero().tolist():
+            index = tuple(coordinates)
+            actual = prefill_output[index].item()
+            expected = expected_prefill[index].item()
+            limit = bf16_atol + bf16_rtol * abs(expected)
+            print(f"[诊断] 索引={index}，实际={actual:.9g}，参考={expected:.9g}，绝对误差={abs(actual - expected):.9g}，允许误差={limit:.9g}")
     torch.testing.assert_close(prefill_output.float(), expected_output[:, :, :3], rtol=bf16_rtol, atol=bf16_atol)
     # 两个接口各自负责写入自己的 K/V，自检不重复追加。
     actual_output = decode_attention(query, full_key[:, :, 3:4, :], full_value[:, :, 3:4, :], attention_cache)
