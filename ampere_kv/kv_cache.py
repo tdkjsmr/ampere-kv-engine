@@ -55,7 +55,7 @@ class ContiguousKVCache:
 def prefill_attention(
     query: torch.Tensor, key: torch.Tensor, value: torch.Tensor, cache: ContiguousKVCache,
 ) -> torch.Tensor:
-    """仅向空缓存写入整段 BF16 K/V，返回全部输入位置的 FP32 因果 Attention 输出。
+    """仅向空缓存写入整段 BF16 K/V，返回全部输入位置的 BF16 因果 Attention 输出。
 
     不支持分块 Prefill 或填充输入；追加后若计算失败，不自动回滚缓存。
     """
@@ -65,7 +65,7 @@ def prefill_attention(
 def decode_attention(
     query: torch.Tensor, key: torch.Tensor, value: torch.Tensor, cache: ContiguousKVCache,
 ) -> torch.Tensor:
-    """追加当前单 Token 的 BF16 K/V，返回 [1, Query 头数, 1, 每头维度] 的 FP32 输出。
+    """追加当前单 Token 的 BF16 K/V，返回 [1, Query 头数, 1, 每头维度] 的 BF16 输出。
 
     调用前缓存只包含历史，调用方不要提前追加当前 K/V；重复调用会重复追加。
     输入检查在写入前完成；追加后若计算失败，不自动回滚缓存，不能盲目重试。
@@ -102,8 +102,9 @@ def _cached_attention(query, key, value, cache, *, is_causal: bool) -> torch.Ten
     # append 继续负责检查 K/V 与缓存的形状、设备及容量是否匹配。
     cache.append(key, value)
     cached_key, cached_value = cache.get()
-    # 缓存仍是 BF16；仅临时计算张量转 FP32，最终输出也保留 FP32。
-    compute_key, compute_value = cached_key.float(), cached_value.float()
+    # 与模型路径对齐：Q/K/V 直接以 BF16 交给 SDPA，输出也是 BF16。
+    # 张量类型不等于底层累加类型；不再创建整段 FP32 历史副本。
+    compute_key, compute_value = cached_key, cached_value
     group_size = query.shape[1] // key.shape[1]
     if group_size > 1:
         # GQA 按 [KV0, KV0, KV1, KV1] 连续重复头；不改变缓存本体。
@@ -113,7 +114,10 @@ def _cached_attention(query, key, value, cache, *, is_causal: bool) -> torch.Ten
     # Prefill 从空缓存开始，Q/K 等长，用下三角掩码屏蔽后面的位置。
     # Decode 的 Q 只对应最后一个位置，有效 K/V 全部可见，不额外加三角掩码。
     return torch.nn.functional.scaled_dot_product_attention(
-        query.float(), compute_key, compute_value, dropout_p=0.0, is_causal=is_causal,
+        # HF 4.51 的 SDPA 包装也先整理为连续布局；此处可能产生 BF16 临时副本。
+        query.contiguous(), compute_key.contiguous(), compute_value.contiguous(),
+        dropout_p=0.0, is_causal=is_causal and query.shape[2] > 1,
+        scale=query.shape[-1] ** -0.5,
     )
 
 
@@ -167,7 +171,10 @@ def main() -> None:
 
     # 独立参考一次计算全部 4 个位置，显式屏蔽未来；不调用我们的两个接口。
     future_mask = torch.ones(4, 4, dtype=torch.bool).triu(diagonal=1)
-    # 两边都从相同 BF16 数据转成 FP32 计算，只验证接线，不宣称 BF16 内核正确性。
+    # FP32 手写公式保留作参考；执行接口现已返回 BF16，不能再用原来的 FP32 容差。
+    # 以下仅用于这组 CPU 小张量：BF16 单次舍入的相对界约为 1/256，留少量计算余量。
+    # 这不是完整模型或未来 INT8 的验收阈值，真实 HF BF16 对照仍单独严格检查。
+    bf16_rtol, bf16_atol = 5e-3, 1e-5
     scores = full_query.float() @ full_key.float().transpose(-2, -1)
     scores = (scores / query.shape[-1] ** 0.5).masked_fill(future_mask, float("-inf"))
     weights = torch.softmax(scores, dim=-1)
@@ -177,17 +184,19 @@ def main() -> None:
     attention_cache = ContiguousKVCache(num_kv_heads=2, head_dim=4, capacity=6)
     prefill_output = prefill_attention(prefix_query, full_key[:, :, :3], full_value[:, :, :3], attention_cache)
     assert attention_cache.length == 3
-    torch.testing.assert_close(prefill_output, expected_output[:, :, :3], rtol=1e-5, atol=1e-6)
+    assert prefill_output.dtype == torch.bfloat16
+    torch.testing.assert_close(prefill_output.float(), expected_output[:, :, :3], rtol=bf16_rtol, atol=bf16_atol)
     # 两个接口各自负责写入自己的 K/V，自检不重复追加。
     actual_output = decode_attention(query, full_key[:, :, 3:4, :], full_value[:, :, 3:4, :], attention_cache)
+    assert actual_output.dtype == torch.bfloat16
     actual_output = torch.cat([prefill_output, actual_output], dim=2)
     cached_key, cached_value = attention_cache.get()
     assert attention_cache.length == 4
     assert cached_key.shape == cached_value.shape == (1, 2, 4, 4)
     assert torch.equal(cached_key, full_key) and torch.equal(cached_value, full_value)
 
-    # 手写公式与 SDPA 的运算顺序可能不同，FP32 对照使用小容差，不要求逐位一致。
-    torch.testing.assert_close(actual_output, expected_output, rtol=1e-5, atol=1e-6)
+    # 比较时转 FP32 便于算误差，并不会恢复 BF16 输出舍入时失去的信息。
+    torch.testing.assert_close(actual_output.float(), expected_output, rtol=bf16_rtol, atol=bf16_atol)
     max_error = (actual_output - expected_output).abs().max().item()
     print(f"[PASS] 等头数 Prefill + Decode 因果对照：输出形状={tuple(actual_output.shape)}，最大绝对误差={max_error:.8g}")
 
@@ -213,10 +222,12 @@ def main() -> None:
     gqa_cache = ContiguousKVCache(num_kv_heads=2, head_dim=4, capacity=6)
     gqa_prefill = prefill_attention(gqa_prefix, full_key[:, :, :3], full_value[:, :, :3], gqa_cache)
     assert gqa_cache.length == 3
-    torch.testing.assert_close(gqa_prefill, expected_gqa[:, :, :3], rtol=1e-5, atol=1e-6)
+    assert gqa_prefill.dtype == torch.bfloat16
+    torch.testing.assert_close(gqa_prefill.float(), expected_gqa[:, :, :3], rtol=bf16_rtol, atol=bf16_atol)
     actual_gqa = decode_attention(gqa_query, full_key[:, :, 3:4, :], full_value[:, :, 3:4, :], gqa_cache)
+    assert actual_gqa.dtype == torch.bfloat16
     actual_gqa = torch.cat([gqa_prefill, actual_gqa], dim=2)
-    torch.testing.assert_close(actual_gqa, expected_gqa, rtol=1e-5, atol=1e-6)
+    torch.testing.assert_close(actual_gqa.float(), expected_gqa, rtol=bf16_rtol, atol=bf16_atol)
     assert gqa_cache.length == 4
     assert gqa_cache.get()[0].shape == gqa_cache.get()[1].shape == (1, 2, 4, 4)
     assert torch.equal(gqa_cache.get()[0], full_key) and torch.equal(gqa_cache.get()[1], full_value)

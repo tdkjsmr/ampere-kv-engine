@@ -1,9 +1,11 @@
-"""自建 Qwen3 路径：真实 Embedding、第一层 RMSNorm 与 Q/K/V 准备；暂不生成文本。"""
+"""自建 Qwen3 路径：第一层 BF16 Prefill Self-Attention 对照；暂不生成文本。"""
 
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from transformers.models.qwen3.modeling_qwen3 import apply_rotary_pos_emb
+from transformers.integrations.sdpa_attention import sdpa_attention_forward
 
+from ampere_kv.kv_cache import ContiguousKVCache, prefill_attention
 from ampere_kv.reference import MODEL_ID, MODEL_REVISION
 
 
@@ -88,7 +90,7 @@ def main() -> None:
     )["input_ids"].to("cuda")
 
     # 暂时沿用已跑通的加载方式，不新写权重下载器或分片读取器。
-    # 加载完整 BF16 模型，但只执行 Embedding 和第一层 Q/K/V 准备，不跑完整前向。
+    # 加载完整 BF16 模型，但只执行到第一层 Self-Attention，不跑完整前向。
     print("正在从本地缓存加载固定版本 Qwen3-8B，用于真实权重对照……")
     model = AutoModelForCausalLM.from_pretrained(
         MODEL_ID, revision=MODEL_REVISION, torch_dtype=torch.bfloat16,
@@ -160,7 +162,45 @@ def main() -> None:
             print(f"[PASS] {stage} 对照通过")
         # V 不传给旋转函数，再次确认它仍与未旋转的 HF V 一致。
         torch.testing.assert_close(value, reference_value, rtol=0, atol=0)
-        print("[PASS] RoPE 后 V 保持不变；未写入 KV Cache，未验证完整 Attention 或模型生成")
+        print("[PASS] RoPE 后 V 保持不变")
+
+        # 只支持当前无滑动窗口的第一层，不能把普通因果 Attention 当成滑窗实现。
+        if attention.sliding_window is not None:
+            raise ValueError("当前真实 Attention 接入不支持滑动窗口")
+        # 明确重新取得整段旋转结果，不能误用上面循环最后一次的单 Token 结果。
+        rope_query, rope_key = apply_rope(query, key, full_positions, model.config)
+        cache = ContiguousKVCache(kv_heads, head_dim, capacity=tokens + 1, device=query.device)
+        head_output = prefill_attention(rope_query, rope_key, value, cache)
+        assert cache.length == tokens
+        stored_key, stored_value = cache.get()
+        torch.testing.assert_close(stored_key, rope_key, rtol=0, atol=0)
+        torch.testing.assert_close(stored_value, value, rtol=0, atol=0)
+        print(f"[PASS] 真实 Prefill KV 写入：有效长度={cache.length}，容量={cache.capacity}，类型={stored_key.dtype}")
+        # [批大小, 头数, Token 数, 每头维度] → [批大小, Token 数, 所有头合并的宽度]。
+        merged = head_output.transpose(1, 2).contiguous().reshape(batch, tokens, query_heads * head_dim)
+        output = torch.nn.functional.linear(merged, attention.o_proj.weight, attention.o_proj.bias)
+
+        # 分段对照：先比较输出投影前的结果，再比较整个 HF Self-Attention 模块。
+        # 参考使用自己的投影、归一化和 RoPE 结果，不读取我们写入的缓存。
+        position_embeddings = model.model.rotary_emb(reference_normalized, full_positions)
+        ref_q, ref_k = apply_rotary_pos_emb(reference_query, reference_key, *position_embeddings)
+        ref_heads, _ = sdpa_attention_forward(
+            attention, ref_q, ref_k, reference_value, attention_mask=None,
+            dropout=0.0, scaling=attention.scaling,
+        )
+        reference_merged = ref_heads.reshape(batch, tokens, query_heads * head_dim)
+        reference_output, _ = attention(
+            hidden_states=reference_normalized, position_embeddings=position_embeddings,
+            attention_mask=None, past_key_value=None,
+        )
+        # 两边同为 BF16 SDPA，缩放、布局和无填充因果语义已对齐；先保持严格检查。
+        # 若出现差异，输出误差定位在 Attention 还是输出投影，不自动修改阈值。
+        for stage, actual, expected in (("Attention 头合并", merged, reference_merged), ("Self-Attention 输出投影", output, reference_output)):
+            error = (actual.float() - expected.float()).abs().max().item()
+            print(f"{stage}：形状={tuple(actual.shape)}，类型={actual.dtype}，最大绝对误差={error:.8g}")
+            assert actual.dtype == torch.bfloat16
+            torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+        print("[PASS] 第一层 BF16 Prefill Self-Attention 对照通过；不含残差和 MLP，未验证完整模型或性能")
 
 
 if __name__ == "__main__":
