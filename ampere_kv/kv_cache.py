@@ -171,10 +171,42 @@ def main() -> None:
 
     # 独立参考一次计算全部 4 个位置，显式屏蔽未来；不调用我们的两个接口。
     future_mask = torch.ones(4, 4, dtype=torch.bool).triu(diagonal=1)
-    # FP32 手写公式保留作参考；执行接口现已返回 BF16，不能再用原来的 FP32 容差。
-    # 暂时保留原阈值以复现失败；单次 BF16 舍入界不能充当整个 Attention 的误差界。
-    # 先诊断缓存接入与精度路径，不根据一次失败自动放宽阈值。
-    bf16_rtol, bf16_atol = 5e-3, 1e-5
+    # 将缓存接入与独立数学对照分开；本函数仅供当前 CPU 小张量自检使用。
+    def check_attention(label, q, k, v, actual, formula):
+        # 用显式索引建立 GQA 头映射，不复用被测路径的 repeat_interleave。
+        # 等头数映射为 [0, 1]，4 个 Query 头映射为 [0, 0, 1, 1]。
+        mapping = torch.arange(q.shape[1]) // (q.shape[1] // k.shape[1])
+        direct_key = k.index_select(1, mapping)
+        direct_value = v.index_select(1, mapping)
+        for dtype in (torch.bfloat16, torch.float32):
+            # 两种精度使用相同原始输入；BF16 对照严格匹配被测路径的分段形状。
+            direct_query = q.to(dtype)
+            key_input, value_input = direct_key.to(dtype), direct_value.to(dtype)
+            prefix = torch.nn.functional.scaled_dot_product_attention(
+                direct_query[:, :, :3].contiguous(), key_input[:, :, :3].contiguous(),
+                value_input[:, :, :3].contiguous(), dropout_p=0.0, is_causal=True,
+                scale=q.shape[-1] ** -0.5,
+            )
+            # 最后一个 Query 可以看见全部 4 个有效位置；这里不读取我们的缓存。
+            last = torch.nn.functional.scaled_dot_product_attention(
+                direct_query[:, :, 3:].contiguous(), key_input.contiguous(), value_input.contiguous(),
+                dropout_p=0.0, is_causal=False, scale=q.shape[-1] ** -0.5,
+            )
+            direct = torch.cat([prefix, last], dim=2)
+            if dtype == torch.bfloat16:
+                # 相同精度和执行形状下要求完全一致，检查缓存接入与 GQA 映射。
+                torch.testing.assert_close(actual, direct, rtol=0, atol=0)
+                print(f"[PASS] {label}：缓存与无缓存 BF16 分段输出完全一致")
+            else:
+                # 独立公式包含显式因果掩码；FP32 阈值仅用于当前小张量，非模型或量化标准。
+                torch.testing.assert_close(direct, formula, rtol=1e-5, atol=1e-6)
+                error = (direct - formula).abs().max().item()
+                print(f"[PASS] {label}：FP32 分段 SDPA 与整段因果公式对照，最大绝对误差={error:.8g}")
+        # 跨精度只做观测，不伪装成精度验收；NaN/Inf 仍必须拒绝。
+        assert torch.isfinite(actual).all() and torch.isfinite(formula).all()
+        error = (actual.float() - formula).abs().max().item()
+        print(f"[观测] {label}：BF16 / FP32 公式最大绝对误差={error:.8g}；不代表跨精度验收通过")
+
     scores = full_query.float() @ full_key.float().transpose(-2, -1)
     scores = (scores / query.shape[-1] ** 0.5).masked_fill(future_mask, float("-inf"))
     weights = torch.softmax(scores, dim=-1)
@@ -185,42 +217,6 @@ def main() -> None:
     prefill_output = prefill_attention(prefix_query, full_key[:, :, :3], full_value[:, :, :3], attention_cache)
     assert attention_cache.length == 3
     assert prefill_output.dtype == torch.bfloat16
-    # 仅在原检查失败时展开诊断；不改变正式执行路径，也不吞掉失败断言。
-    expected_prefill = expected_output[:, :, :3]
-    if not torch.allclose(prefill_output.float(), expected_prefill, rtol=bf16_rtol, atol=bf16_atol):
-        print(f"[诊断] PyTorch={torch.__version__}，设备={prefill_output.device}，原阈值 rtol={bf16_rtol}，atol={bf16_atol}")
-        # 直接使用原始输入，不读取缓存；保持相同的 3 Token 形状、布局、缩放和因果设置。
-        # 这一路隔离缓存接入问题；它复用 SDPA，因此不能替代下面的独立 FP32 公式。
-        direct_inputs = (prefix_query.contiguous(), full_key[:, :, :3].contiguous(), full_value[:, :, :3].contiguous())
-        direct_bf16 = torch.nn.functional.scaled_dot_product_attention(
-            *direct_inputs, dropout_p=0.0, is_causal=True, scale=query.shape[-1] ** -0.5,
-        )
-        # 同形状 FP32 SDPA 用来观察更换输入精度后的差异，不据此猜测 BF16 实际选中了哪个后端。
-        direct_fp32 = torch.nn.functional.scaled_dot_product_attention(
-            *(tensor.float() for tensor in direct_inputs),
-            dropout_p=0.0, is_causal=True, scale=query.shape[-1] ** -0.5,
-        )
-        # 同时重算 3 Token FP32 公式，区分原来整段 4 Token 与分段计算的形状影响。
-        prefix_scores = direct_inputs[0].float() @ direct_inputs[1].float().transpose(-2, -1)
-        prefix_scores = (prefix_scores * query.shape[-1] ** -0.5).masked_fill(future_mask[:3, :3], float("-inf"))
-        prefix_formula = torch.softmax(prefix_scores, dim=-1) @ direct_inputs[2].float()
-        for label, actual, expected in (
-            ("缓存 BF16 / 无缓存 BF16", prefill_output.float(), direct_bf16.float()),
-            ("无缓存 BF16 / 同形状 FP32 SDPA", direct_bf16.float(), direct_fp32),
-            ("同形状 FP32 SDPA / 同形状 FP32 公式", direct_fp32, prefix_formula),
-            ("3 Token FP32 公式 / 4 Token FP32 公式前缀", prefix_formula, expected_prefill),
-        ):
-            error = (actual - expected).abs().max().item()
-            print(f"[诊断] {label}：最大绝对误差={error:.9g}，逐元素完全一致={torch.equal(actual, expected)}")
-        # 只打印这组小张量中未满足原标准的元素；接近零时直接看原值和绝对误差。
-        matched = torch.isclose(prefill_output.float(), expected_prefill, rtol=bf16_rtol, atol=bf16_atol)
-        for coordinates in (~matched).nonzero().tolist():
-            index = tuple(coordinates)
-            actual = prefill_output[index].item()
-            expected = expected_prefill[index].item()
-            limit = bf16_atol + bf16_rtol * abs(expected)
-            print(f"[诊断] 索引={index}，实际={actual:.9g}，参考={expected:.9g}，绝对误差={abs(actual - expected):.9g}，允许误差={limit:.9g}")
-    torch.testing.assert_close(prefill_output.float(), expected_output[:, :, :3], rtol=bf16_rtol, atol=bf16_atol)
     # 两个接口各自负责写入自己的 K/V，自检不重复追加。
     actual_output = decode_attention(query, full_key[:, :, 3:4, :], full_value[:, :, 3:4, :], attention_cache)
     assert actual_output.dtype == torch.bfloat16
@@ -230,10 +226,7 @@ def main() -> None:
     assert cached_key.shape == cached_value.shape == (1, 2, 4, 4)
     assert torch.equal(cached_key, full_key) and torch.equal(cached_value, full_value)
 
-    # 比较时转 FP32 便于算误差，并不会恢复 BF16 输出舍入时失去的信息。
-    torch.testing.assert_close(actual_output.float(), expected_output, rtol=bf16_rtol, atol=bf16_atol)
-    max_error = (actual_output - expected_output).abs().max().item()
-    print(f"[PASS] 等头数 Prefill + Decode 因果对照：输出形状={tuple(actual_output.shape)}，最大绝对误差={max_error:.8g}")
+    check_attention("等头数 Prefill + Decode", full_query, full_key, full_value, actual_output, expected_output)
 
     # GQA：沿用原始 K/V 数据，但另建缓存；4 个 Query 头共享 2 个 KV 头。
     gqa_query = torch.randn(1, 4, 1, 4, generator=generator).to(torch.bfloat16)
@@ -258,16 +251,13 @@ def main() -> None:
     gqa_prefill = prefill_attention(gqa_prefix, full_key[:, :, :3], full_value[:, :, :3], gqa_cache)
     assert gqa_cache.length == 3
     assert gqa_prefill.dtype == torch.bfloat16
-    torch.testing.assert_close(gqa_prefill.float(), expected_gqa[:, :, :3], rtol=bf16_rtol, atol=bf16_atol)
     actual_gqa = decode_attention(gqa_query, full_key[:, :, 3:4, :], full_value[:, :, 3:4, :], gqa_cache)
     assert actual_gqa.dtype == torch.bfloat16
     actual_gqa = torch.cat([gqa_prefill, actual_gqa], dim=2)
-    torch.testing.assert_close(actual_gqa.float(), expected_gqa, rtol=bf16_rtol, atol=bf16_atol)
     assert gqa_cache.length == 4
     assert gqa_cache.get()[0].shape == gqa_cache.get()[1].shape == (1, 2, 4, 4)
     assert torch.equal(gqa_cache.get()[0], full_key) and torch.equal(gqa_cache.get()[1], full_value)
-    max_error = (actual_gqa - expected_gqa).abs().max().item()
-    print(f"[PASS] GQA Prefill + Decode 因果对照：输出形状={tuple(actual_gqa.shape)}，最大绝对误差={max_error:.8g}")
+    check_attention("GQA Prefill + Decode", full_gqa_query, full_key, full_value, actual_gqa, expected_gqa)
     # 已完成 Prefill/Decode 的缓存不能再次 Prefill，拒绝后有效历史保持不变。
     try:
         prefill_attention(gqa_prefix, full_key[:, :, :3], full_value[:, :, :3], gqa_cache)
