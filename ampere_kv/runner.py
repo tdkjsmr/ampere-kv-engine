@@ -1,4 +1,4 @@
-"""自建 Qwen3 路径：第一层 BF16 Prefill Self-Attention 对照；暂不生成文本。"""
+"""自建 Qwen3 路径：第一层完整 BF16 Prefill Decoder Layer 对照；暂不生成文本。"""
 
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
@@ -90,7 +90,7 @@ def main() -> None:
     )["input_ids"].to("cuda")
 
     # 暂时沿用已跑通的加载方式，不新写权重下载器或分片读取器。
-    # 加载完整 BF16 模型，但只执行到第一层 Self-Attention，不跑完整前向。
+    # 加载完整 BF16 模型，但只执行第一层 Decoder Layer，不跑完整模型前向。
     print("正在从本地缓存加载固定版本 Qwen3-8B，用于真实权重对照……")
     model = AutoModelForCausalLM.from_pretrained(
         MODEL_ID, revision=MODEL_REVISION, torch_dtype=torch.bfloat16,
@@ -200,7 +200,52 @@ def main() -> None:
             print(f"{stage}：形状={tuple(actual.shape)}，类型={actual.dtype}，最大绝对误差={error:.8g}")
             assert actual.dtype == torch.bfloat16
             torch.testing.assert_close(actual, expected, rtol=0, atol=0)
-        print("[PASS] 第一层 BF16 Prefill Self-Attention 对照通过；不含残差和 MLP，未验证完整模型或性能")
+        print("[PASS] 第一层 BF16 Prefill Self-Attention 对照通过")
+
+        layer = model.model.layers[0]
+        # 第一次残差：加回本层最初的输入，而不是归一化后的 normalized。
+        # 不使用原地加法，保留原始输入给后面的完整 HF 层独立对照。
+        after_attention = hidden_states + output
+        reference_after_attention = reference_hidden + reference_output
+        # HF 属性名表示 Attention 之后；相对于 MLP，它仍是 Pre-Norm，不是 Post-Norm 架构。
+        mlp_norm = layer.post_attention_layernorm
+        mlp_input = rms_norm(after_attention, mlp_norm.weight, mlp_norm.variance_epsilon)
+        reference_mlp_input = mlp_norm(reference_after_attention)
+
+        # 当前固定模型使用 SiLU 门控 MLP；不能静默把其他激活函数当作 SiLU。
+        if model.config.hidden_act != "silu":
+            raise ValueError("当前 MLP 仅支持 SiLU 激活")
+        mlp = layer.mlp
+        # 两路投影均从隐藏维度扩展到中间维度；gate 经 SiLU 后与 up 逐元素相乘。
+        # 这里不是 gate @ up，也不是把 SiLU 应用到两路乘积之后。
+        gate = torch.nn.functional.linear(mlp_input, mlp.gate_proj.weight, mlp.gate_proj.bias)
+        up = torch.nn.functional.linear(mlp_input, mlp.up_proj.weight, mlp.up_proj.bias)
+        gated = torch.nn.functional.silu(gate) * up
+        # down 投影还原隐藏维度；自建路径只使用权重，不调用 HF MLP 的 forward。
+        mlp_output = torch.nn.functional.linear(gated, mlp.down_proj.weight, mlp.down_proj.bias)
+        reference_mlp_output = mlp(reference_mlp_input)
+        # 第二次残差：加回第一次残差后的状态，不是最初输入，也不是 MLP 归一化输入。
+        layer_output = after_attention + mlp_output
+
+        # HF 从原始 Embedding 独立执行整层，不读取我们的缓存或中间结果。
+        # 当前是单请求、无填充 Prefill；SDPA 根据序列长度启用因果语义。
+        reference_layer_output = layer(
+            hidden_states=reference_hidden, attention_mask=None,
+            position_ids=full_positions, position_embeddings=position_embeddings,
+            past_key_value=None, use_cache=False, output_attentions=False,
+        )[0]
+        for stage, actual, expected in (
+            ("第一次残差", after_attention, reference_after_attention),
+            ("MLP 前 RMSNorm（Pre-Norm）", mlp_input, reference_mlp_input),
+            ("MLP 输出", mlp_output, reference_mlp_output),
+            ("完整 Decoder Layer 输出", layer_output, reference_layer_output),
+        ):
+            error = (actual.float() - expected.float()).abs().max().item()
+            print(f"{stage}：形状={tuple(actual.shape)}，类型={actual.dtype}，最大绝对误差={error:.8g}")
+            assert actual.dtype == torch.bfloat16
+            # 同精度、同运算顺序先要求完全一致；失败时定位差异，不自动放宽容差。
+            torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+        print("[PASS] 第一层完整 BF16 Prefill Decoder Layer 对照通过；未验证真实 Decode、多层模型或性能")
 
 
 if __name__ == "__main__":
