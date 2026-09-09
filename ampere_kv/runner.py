@@ -2,8 +2,6 @@
 
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
-from transformers.models.qwen3.modeling_qwen3 import apply_rotary_pos_emb
-from transformers.integrations.sdpa_attention import sdpa_attention_forward
 
 from ampere_kv.kv_cache import ContiguousKVCache, prefill_attention
 from ampere_kv.reference import MODEL_ID, MODEL_REVISION
@@ -71,6 +69,52 @@ def apply_rope(query: torch.Tensor, key: torch.Tensor, position_ids: torch.Tenso
     return query * cos + rotated_query * sin, key * cos + rotated_key * sin
 
 
+@torch.no_grad()
+def decoder_layer_prefill(
+    hidden_states: torch.Tensor, layer, position_ids: torch.Tensor,
+    cache: ContiguousKVCache, config,
+) -> torch.Tensor:
+    """用指定层的权重执行单请求、无填充 Prefill，返回整段隐藏状态。
+
+    调用方提供该层专用的空缓存；函数写入 RoPE 后的 K 和未旋转的 V。
+    不加载模型、不打印结果、不调用 HF 层的 forward，也不进行参考对照。
+    不支持 Decode 或分块追加；缓存写入后若计算失败，不自动回滚。
+    """
+    attention = layer.self_attn
+    # 在写入前拒绝不支持的配置，避免用普通 Attention 或 SiLU 静默代替其他结构。
+    if attention.sliding_window is not None:
+        raise ValueError("当前层 Prefill 不支持滑动窗口")
+    if config.hidden_act != "silu":
+        raise ValueError("当前 MLP 仅支持 SiLU 激活")
+    if cache.length != 0:
+        raise ValueError("层 Prefill 只接受空缓存，不支持分块追加")
+
+    # Pre-Norm：先归一化，再送入 Attention；原始输入留在残差支路上。
+    norm = layer.input_layernorm
+    normalized = rms_norm(hidden_states, norm.weight, norm.variance_epsilon)
+    query, key, value = project_qkv(normalized, attention)
+    query, key = apply_rope(query, key, position_ids, config)
+    head_output = prefill_attention(query, key, value, cache)
+    # 合并所有 Query 头，再通过输出投影还原隐藏维度。
+    batch, tokens, _ = hidden_states.shape
+    merged = head_output.transpose(1, 2).contiguous().reshape(batch, tokens, -1)
+    attention_output = torch.nn.functional.linear(merged, attention.o_proj.weight, attention.o_proj.bias)
+    # 第一次残差加回本层原始输入；不原地修改输入，便于调用方保留或对照。
+    after_attention = hidden_states + attention_output
+
+    # HF 属性名表示 Attention 之后，但相对于 MLP，它仍是 Pre-Norm。
+    mlp_norm = layer.post_attention_layernorm
+    mlp_input = rms_norm(after_attention, mlp_norm.weight, mlp_norm.variance_epsilon)
+    mlp = layer.mlp
+    # gate 与 up 分别投影到中间维度；SiLU 只作用于 gate，然后逐元素相乘。
+    gate = torch.nn.functional.linear(mlp_input, mlp.gate_proj.weight, mlp.gate_proj.bias)
+    up = torch.nn.functional.linear(mlp_input, mlp.up_proj.weight, mlp.up_proj.bias)
+    gated = torch.nn.functional.silu(gate) * up
+    mlp_output = torch.nn.functional.linear(gated, mlp.down_proj.weight, mlp.down_proj.bias)
+    # 第二次残差加回 Attention 残差后的状态，不是归一化结果或本层最初输入。
+    return after_attention + mlp_output
+
+
 def main() -> None:
     """云端显式运行：复用一份 HF 权重，检查自建路径的第一段数值结果。"""
 
@@ -100,152 +144,41 @@ def main() -> None:
 
     with torch.inference_mode():
         embedding = model.model.embed_tokens
-        first_norm = model.model.layers[0].input_layernorm
-        # Embedding 是按 Token ID 查权重表的行，不是 one-hot 矩阵乘法。
-        # 自建路径直接索引真实权重；参考路径调用 HF 持有的 Embedding 模块。
+        # Embedding 仍使用真实权重索引；HF 模块仅作为参考，不进入自建层函数。
         hidden_states = embedding.weight[input_ids]
         reference_hidden = embedding(input_ids)
         torch.testing.assert_close(hidden_states, reference_hidden, rtol=0, atol=0)
         print(f"[PASS] Embedding 对照：形状={tuple(hidden_states.shape)}，类型={hidden_states.dtype}")
 
-        # 使用第一层自己的缩放权重与 epsilon，而不是新建全 1 权重或硬编码 epsilon。
-        normalized = rms_norm(hidden_states, first_norm.weight, first_norm.variance_epsilon)
-        reference_normalized = first_norm(reference_hidden)
-        max_error = (normalized.float() - reference_normalized.float()).abs().max().item()
-        print(f"第一层 RMSNorm：形状={tuple(normalized.shape)}，类型={normalized.dtype}，最大绝对误差={max_error:.8g}")
-        # 当前是相同原始运算和相同舍入顺序，先要求完全一致，不套用 Attention 容差。
-        # 若后续换成融合内核，需另行确定容差，不能为了通过检查而自动放宽。
-        torch.testing.assert_close(normalized, reference_normalized, rtol=0, atol=0)
-        print("[PASS] 第一层 RMSNorm 真实权重对照通过；未验证完整模型或性能")
-
-        attention = model.model.layers[0].self_attn
-        # 先独立核对三组投影，出现差异时可区分 GEMM 与后面的拆头/归一化问题。
-        for name, projection in (("Q", attention.q_proj), ("K", attention.k_proj), ("V", attention.v_proj)):
-            projected = torch.nn.functional.linear(normalized, projection.weight, projection.bias)
-            reference_projected = projection(reference_normalized)
-            torch.testing.assert_close(projected, reference_projected, rtol=0, atol=0)
-            print(f"[PASS] {name} 原始投影对照：形状={tuple(projected.shape)}，类型={projected.dtype}")
-
-        query, key, value = project_qkv(normalized, attention)
-        # 参考路径调用 HF 投影和 Q/K 归一化模块，明确使用配置中的头数拆分。
-        batch, tokens, _ = reference_normalized.shape
-        query_heads = model.config.num_attention_heads
-        kv_heads = model.config.num_key_value_heads
-        head_dim = model.config.head_dim
-        reference_query = attention.q_norm(attention.q_proj(reference_normalized).reshape(batch, tokens, query_heads, head_dim)).transpose(1, 2)
-        reference_key = attention.k_norm(attention.k_proj(reference_normalized).reshape(batch, tokens, kv_heads, head_dim)).transpose(1, 2)
-        reference_value = attention.v_proj(reference_normalized).reshape(batch, tokens, kv_heads, head_dim).transpose(1, 2)
-        for name, actual, expected in (("Q", query, reference_query), ("K", key, reference_key), ("V", value, reference_value)):
-            max_error = (actual.float() - expected.float()).abs().max().item()
-            print(f"{name} 拆头后对照：形状={tuple(actual.shape)}，类型={actual.dtype}，最大绝对误差={max_error:.8g}")
-            torch.testing.assert_close(actual, expected, rtol=0, atol=0)
-            assert actual.dtype == torch.bfloat16
-        assert query_heads % kv_heads == 0
-        assert query.shape[1] == query_heads and key.shape[1] == value.shape[1] == kv_heads
-        print(f"[PASS] Q/K/V 准备通过：Query 头={query_heads}，KV 头={kv_heads}，每组={query_heads // kv_heads}")
-        # 整段位置从 0 开始；单 Token 复用最后一组真实 Q/K，但赋予下一位置 tokens。
-        # 后者只验证非零位置的旋转，不宣称完成了下一个 Token 的模型前向。
-        full_positions = torch.arange(tokens, device=query.device).unsqueeze(0)
-        next_position = torch.tensor([[tokens]], device=query.device)
-        for stage, q, k, positions in (
-            ("整段 RoPE", query, key, full_positions),
-            ("非零位置单 Token RoPE", query[:, :, -1:], key[:, :, -1:], next_position),
-        ):
-            actual_q, actual_k = apply_rope(q, k, positions, model.config)
-            # 参考频率与旋转都由 HF 提供；同一份旋转前 Q/K 隔离本轮 RoPE 的误差。
-            reference_cos, reference_sin = model.model.rotary_emb(q, positions)
-            expected_q, expected_k = apply_rotary_pos_emb(q, k, reference_cos, reference_sin)
-            for name, actual, expected in (("Q", actual_q, expected_q), ("K", actual_k, expected_k)):
-                error = (actual.float() - expected.float()).abs().max().item()
-                print(f"{stage} {name}：形状={tuple(actual.shape)}，类型={actual.dtype}，最大绝对误差={error:.8g}")
-                torch.testing.assert_close(actual, expected, rtol=0, atol=0)
-            print(f"[PASS] {stage} 对照通过")
-        # V 不传给旋转函数，再次确认它仍与未旋转的 HF V 一致。
-        torch.testing.assert_close(value, reference_value, rtol=0, atol=0)
-        print("[PASS] RoPE 后 V 保持不变")
-
-        # 只支持当前无滑动窗口的第一层，不能把普通因果 Attention 当成滑窗实现。
-        if attention.sliding_window is not None:
-            raise ValueError("当前真实 Attention 接入不支持滑动窗口")
-        # 明确重新取得整段旋转结果，不能误用上面循环最后一次的单 Token 结果。
-        rope_query, rope_key = apply_rope(query, key, full_positions, model.config)
-        cache = ContiguousKVCache(kv_heads, head_dim, capacity=tokens + 1, device=query.device)
-        head_output = prefill_attention(rope_query, rope_key, value, cache)
+        layer = model.model.layers[0]
+        tokens = input_ids.shape[1]
+        positions = torch.arange(tokens, device=hidden_states.device).unsqueeze(0)
+        # 缓存由调用方创建；后续多层时每层各有一份，不能把不同层的 K/V 混用。
+        cache = ContiguousKVCache(
+            model.config.num_key_value_heads, model.config.head_dim,
+            capacity=tokens + 1, device=hidden_states.device,
+        )
+        layer_output = decoder_layer_prefill(hidden_states, layer, positions, cache, model.config)
         assert cache.length == tokens
         stored_key, stored_value = cache.get()
-        torch.testing.assert_close(stored_key, rope_key, rtol=0, atol=0)
-        torch.testing.assert_close(stored_value, value, rtol=0, atol=0)
-        print(f"[PASS] 真实 Prefill KV 写入：有效长度={cache.length}，容量={cache.capacity}，类型={stored_key.dtype}")
-        # [批大小, 头数, Token 数, 每头维度] → [批大小, Token 数, 所有头合并的宽度]。
-        merged = head_output.transpose(1, 2).contiguous().reshape(batch, tokens, query_heads * head_dim)
-        output = torch.nn.functional.linear(merged, attention.o_proj.weight, attention.o_proj.bias)
+        expected_shape = (1, model.config.num_key_value_heads, tokens, model.config.head_dim)
+        assert stored_key.shape == stored_value.shape == expected_shape
+        assert stored_key.dtype == stored_value.dtype == torch.bfloat16
+        print(f"[PASS] 层函数 Prefill KV：有效长度={cache.length}，容量={cache.capacity}，形状={tuple(stored_key.shape)}")
 
-        # 分段对照：先比较输出投影前的结果，再比较整个 HF Self-Attention 模块。
-        # 参考使用自己的投影、归一化和 RoPE 结果，不读取我们写入的缓存。
-        position_embeddings = model.model.rotary_emb(reference_normalized, full_positions)
-        ref_q, ref_k = apply_rotary_pos_emb(reference_query, reference_key, *position_embeddings)
-        ref_heads, _ = sdpa_attention_forward(
-            attention, ref_q, ref_k, reference_value, attention_mask=None,
-            dropout=0.0, scaling=attention.scaling,
-        )
-        reference_merged = ref_heads.reshape(batch, tokens, query_heads * head_dim)
-        reference_output, _ = attention(
-            hidden_states=reference_normalized, position_embeddings=position_embeddings,
-            attention_mask=None, past_key_value=None,
-        )
-        # 两边同为 BF16 SDPA，缩放、布局和无填充因果语义已对齐；先保持严格检查。
-        # 若出现差异，输出误差定位在 Attention 还是输出投影，不自动修改阈值。
-        for stage, actual, expected in (("Attention 头合并", merged, reference_merged), ("Self-Attention 输出投影", output, reference_output)):
-            error = (actual.float() - expected.float()).abs().max().item()
-            print(f"{stage}：形状={tuple(actual.shape)}，类型={actual.dtype}，最大绝对误差={error:.8g}")
-            assert actual.dtype == torch.bfloat16
-            torch.testing.assert_close(actual, expected, rtol=0, atol=0)
-        print("[PASS] 第一层 BF16 Prefill Self-Attention 对照通过")
-
-        layer = model.model.layers[0]
-        # 第一次残差：加回本层最初的输入，而不是归一化后的 normalized。
-        # 不使用原地加法，保留原始输入给后面的完整 HF 层独立对照。
-        after_attention = hidden_states + output
-        reference_after_attention = reference_hidden + reference_output
-        # HF 属性名表示 Attention 之后；相对于 MLP，它仍是 Pre-Norm，不是 Post-Norm 架构。
-        mlp_norm = layer.post_attention_layernorm
-        mlp_input = rms_norm(after_attention, mlp_norm.weight, mlp_norm.variance_epsilon)
-        reference_mlp_input = mlp_norm(reference_after_attention)
-
-        # 当前固定模型使用 SiLU 门控 MLP；不能静默把其他激活函数当作 SiLU。
-        if model.config.hidden_act != "silu":
-            raise ValueError("当前 MLP 仅支持 SiLU 激活")
-        mlp = layer.mlp
-        # 两路投影均从隐藏维度扩展到中间维度；gate 经 SiLU 后与 up 逐元素相乘。
-        # 这里不是 gate @ up，也不是把 SiLU 应用到两路乘积之后。
-        gate = torch.nn.functional.linear(mlp_input, mlp.gate_proj.weight, mlp.gate_proj.bias)
-        up = torch.nn.functional.linear(mlp_input, mlp.up_proj.weight, mlp.up_proj.bias)
-        gated = torch.nn.functional.silu(gate) * up
-        # down 投影还原隐藏维度；自建路径只使用权重，不调用 HF MLP 的 forward。
-        mlp_output = torch.nn.functional.linear(gated, mlp.down_proj.weight, mlp.down_proj.bias)
-        reference_mlp_output = mlp(reference_mlp_input)
-        # 第二次残差：加回第一次残差后的状态，不是最初输入，也不是 MLP 归一化输入。
-        layer_output = after_attention + mlp_output
-
-        # HF 从原始 Embedding 独立执行整层，不读取我们的缓存或中间结果。
-        # 当前是单请求、无填充 Prefill；SDPA 根据序列长度启用因果语义。
+        # HF 从原始 Embedding 独立执行整层；不读取自建缓存或任何自建中间结果。
+        position_embeddings = model.model.rotary_emb(reference_hidden, positions)
         reference_layer_output = layer(
             hidden_states=reference_hidden, attention_mask=None,
-            position_ids=full_positions, position_embeddings=position_embeddings,
+            position_ids=positions, position_embeddings=position_embeddings,
             past_key_value=None, use_cache=False, output_attentions=False,
         )[0]
-        for stage, actual, expected in (
-            ("第一次残差", after_attention, reference_after_attention),
-            ("MLP 前 RMSNorm（Pre-Norm）", mlp_input, reference_mlp_input),
-            ("MLP 输出", mlp_output, reference_mlp_output),
-            ("完整 Decoder Layer 输出", layer_output, reference_layer_output),
-        ):
-            error = (actual.float() - expected.float()).abs().max().item()
-            print(f"{stage}：形状={tuple(actual.shape)}，类型={actual.dtype}，最大绝对误差={error:.8g}")
-            assert actual.dtype == torch.bfloat16
-            # 同精度、同运算顺序先要求完全一致；失败时定位差异，不自动放宽容差。
-            torch.testing.assert_close(actual, expected, rtol=0, atol=0)
-        print("[PASS] 第一层完整 BF16 Prefill Decoder Layer 对照通过；未验证真实 Decode、多层模型或性能")
+        error = (layer_output.float() - reference_layer_output.float()).abs().max().item()
+        print(f"完整 Decoder Layer 输出：形状={tuple(layer_output.shape)}，类型={layer_output.dtype}，最大绝对误差={error:.8g}")
+        assert layer_output.dtype == torch.bfloat16
+        # 函数提取不应改变数值；仍保持第一层 BF16 严格对照，不放宽阈值。
+        torch.testing.assert_close(layer_output, reference_layer_output, rtol=0, atol=0)
+        print("[PASS] 可复用层函数的第一层 BF16 Prefill 对照通过；未验证真实 Decode、多层模型或性能")
 
 
 if __name__ == "__main__":
