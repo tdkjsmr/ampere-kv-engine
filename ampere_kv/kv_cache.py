@@ -63,14 +63,17 @@ def prefill_attention(
 
 
 def decode_attention(
-    query: torch.Tensor, key: torch.Tensor, value: torch.Tensor, cache: ContiguousKVCache,
+    query: torch.Tensor, key: torch.Tensor, value: torch.Tensor, cache,
 ) -> torch.Tensor:
     """追加当前单 Token 的 BF16 K/V，返回 [1, Query 头数, 1, 每头维度] 的 BF16 输出。
 
-    调用前缓存只包含历史，调用方不要提前追加当前 K/V；重复调用会重复追加。
+    接受提供 length、append、get 的连续或分页缓存；无需继承公共基类。
+    调用前必须已有历史，调用方不要提前追加当前 K/V；重复调用会重复追加。
     输入检查在写入前完成；追加后若计算失败，不自动回滚缓存，不能盲目重试。
     这是推理参考计算，不包含 QKV 投影、位置编码、头合并或输出投影。
     """
+    if cache.length == 0:
+        raise ValueError("Decode 前必须已有历史 K/V")
     return _cached_attention(query, key, value, cache, is_causal=False)
 
 

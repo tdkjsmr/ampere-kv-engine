@@ -3,6 +3,9 @@
 import torch
 
 from ampere_kv.block_pool import BlockPool, BlockTable
+# 复用同一套检查、缓存追加、GQA 头映射和 SDPA 计算，不另写分页包装。
+# 分页 get() 会复制历史；这是参考路径，不是直接读取物理块的 CUDA 内核。
+from ampere_kv.kv_cache import decode_attention
 
 
 class PagedKVCache:
@@ -73,36 +76,6 @@ class PagedKVCache:
     def release(self) -> None:
         """归还请求占用的块；保留物理张量，不清零旧数据，不释放底层显存。"""
         self._table.release()
-
-
-@torch.no_grad()
-def decode_attention(query: torch.Tensor, key: torch.Tensor, value: torch.Tensor,
-                     cache: PagedKVCache) -> torch.Tensor:
-    """追加当前单 Token K/V，再用读回的连续历史计算 BF16 等头数 Attention。
-
-    调用前缓存必须已有历史，且不能提前追加当前 K/V；本接口不支持 GQA。
-    复制或计算失败后不回滚缓存；这不是直接访问分页存储的 CUDA 内核。
-    """
-    # Q 的检查必须在 append 前完成，防止非法 Query 已经改变缓存。
-    if any(t.ndim != 4 for t in (query, key, value)):
-        raise ValueError("Q/K/V 必须是四维张量")
-    if query.shape != key.shape or key.shape != value.shape:
-        raise ValueError("当前仅支持 Q/K/V 形状相同的等头数 Attention")
-    if query.shape[0] != 1 or query.shape[2] != 1:
-        raise ValueError("Decode 只支持单请求、单 Token")
-    if query.dtype != torch.bfloat16 or query.device != key.device:
-        raise ValueError("Query 必须使用 BF16 且与 K/V 位于同一设备")
-    if cache.length == 0:
-        raise ValueError("Decode 前必须已有历史 K/V")
-    # append 继续检查 K/V 与物理存储的维度、精度、设备及剩余容量。
-    cache.append(key, value)
-    cached_key, cached_value = cache.get()
-    # 当前 Query 对应最后一个有效位置，历史和当前 K/V 都可见，没有未来位置。
-    # 不用 is_causal=True：单 Query 与长历史的非方形掩码可能屏蔽有效历史。
-    return torch.nn.functional.scaled_dot_product_attention(
-        query.contiguous(), cached_key.contiguous(), cached_value.contiguous(),
-        dropout_p=0.0, is_causal=False, scale=query.shape[-1] ** -0.5,
-    )
 
 
 def main() -> None:
@@ -189,6 +162,15 @@ def main() -> None:
     query = torch.randn(1, 2, 1, 4, generator=generator).to(torch.bfloat16)
     keys = torch.randn(1, 2, 5, 4, generator=generator).to(torch.bfloat16)
     values = torch.randn(1, 2, 5, 4, generator=generator).to(torch.bfloat16)
+    # 合并后仍须拒绝空历史 Decode，且不能偷偷写入当前 K/V。
+    try:
+        decode_attention(query, keys[:, :, :1], values[:, :, :1], cache)
+    except ValueError:
+        assert cache.length == 0 and cache._pool.num_free_blocks == 3
+        assert cache._table.block_ids == ()
+        assert (cache._key == -100).all() and (cache._value == -200).all()
+    else:
+        raise AssertionError("空历史 Decode 未被拒绝")
     cache.append(keys[:, :, :4], values[:, :, :4])
     addresses = (cache._key.data_ptr(), cache._value.data_ptr())
     before = (cache.length, cache._table.block_ids, cache._pool._free_blocks.copy(),
