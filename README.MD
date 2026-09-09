@@ -9,8 +9,12 @@ AmpereKV Engine 是面向 NVIDIA Ampere `sm_86` 的最小单卡推理引擎。
 包含自建 Decoder Layers、Prefill、逐 Token Decode 和最多 32 个新 Token 的贪心生成。
 遇到 EOS 提前停止。权重加载与分词使用 Transformers，底层计算使用 PyTorch/SDPA。
 
-此前连续生成路径已有 RTX 3090 上逐步 logits 与 HF 对照通过的运行证据。
-当前新增的模式分离和性能测量代码仍待 GPU 验证；尚无性能收益结论，G2 尚未完成全部验收。
+已在 RTX 3090 上验证 check、generate 和 benchmark 三种模式：
+逐步 logits、完整 Token 序列与 HF 对照通过，纯生成输出与对照模式一致。
+单请求性能基线已完成 1 次预热和 3 次重复测量；重复输出一致，
+各次请求结束后的活跃张量显存均回到预热基线。
+这些结果仅覆盖本次输入与环境，不代表多输入回归、生成上限分支或长期无泄漏验证，
+也没有与其他框架比较的性能收益结论；G2 尚未完成全部验收。
 Paged KV、核心 Paged Decode CUDA 算子、INT8 KV 与融合反量化仍是后续工作。
 
 ## 运行
@@ -32,7 +36,7 @@ python -m ampere_kv.runner --mode benchmark --repeats 3
 
 先使用相同输入确认 check 通过、generate 的完整 Token ID 列表一致，再测量。
 benchmark 检查重复输出是否一致，但不能代替 HF 正确性对照。
-两种执行模式共用模型级前向和生成循环；不为测量另写一套计算。
+三种运行模式共用自建模型级前向和生成循环；不为测量另写一套计算。
 
 ## 性能测量口径
 
