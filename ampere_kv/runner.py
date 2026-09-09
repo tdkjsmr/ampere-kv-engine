@@ -1,4 +1,4 @@
-"""自建 Qwen3 路径：全部 Decoder Layers 的 BF16 Prefill 逐层对照；暂不生成文本。"""
+"""自建 Qwen3 路径：BF16 Prefill、末尾归一化与首个贪心 Token 对照；暂不执行 Decode。"""
 
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
@@ -134,7 +134,7 @@ def main() -> None:
     )["input_ids"].to("cuda")
 
     # 暂时沿用已跑通的加载方式，不新写权重下载器或分片读取器。
-    # 加载完整 BF16 模型，执行全部 Decoder Layers；暂不接 Final Norm、LM Head 或生成循环。
+    # 加载一份 BF16 权重，执行完整 Prefill 并选出首个 Token；暂不执行生成循环。
     print("正在从本地缓存加载固定版本 Qwen3-8B，用于真实权重对照……")
     model = AutoModelForCausalLM.from_pretrained(
         MODEL_ID, revision=MODEL_REVISION, torch_dtype=torch.bfloat16,
@@ -189,7 +189,44 @@ def main() -> None:
         addresses = [tensor.data_ptr() for cache in caches for tensor in cache.get()]
         assert len(set(addresses)) == 2 * len(layers)
         print(f"[PASS] 全部 {len(layers)} 层 BF16 Prefill 与独立 KV 缓存检查通过")
-        print("当前输出为最后一个 Decoder Layer 的隐藏状态；未接 Final Norm/LM Head，未验证真实 Decode、完整生成或性能")
+
+        # Final Norm 使用模型末尾独立的权重，不是最后一层内部的任意一个 RMSNorm。
+        final_norm = model.model.norm
+        normalized = rms_norm(hidden_states, final_norm.weight, final_norm.variance_epsilon)
+        reference_normalized = final_norm(reference_hidden)
+        error = (normalized.float() - reference_normalized.float()).abs().max().item()
+        print(f"Final RMSNorm：形状={tuple(normalized.shape)}，类型={normalized.dtype}，最大绝对误差={error:.8g}")
+        assert normalized.dtype == torch.bfloat16
+        torch.testing.assert_close(normalized, reference_normalized, rtol=0, atol=0)
+        print("[PASS] Final RMSNorm 严格对照通过")
+
+        # 只有最后一个输入位置预测首个输出 Token；保留长度为 1 的序列维度。
+        # LM Head 将隐藏维度映射到词表大小，使用自己的权重，不假定与 Embedding 共享。
+        logits = torch.nn.functional.linear(normalized[:, -1:, :], model.lm_head.weight, model.lm_head.bias)
+        # 再由 HF 完整 forward 从原始 Token IDs 独立计算，覆盖模型入口到词表输出。
+        # 两边都只投影最后一个位置，避免因 GEMM 形状不同引入额外比较差异。
+        # 不创建第二份模型，不传入我们的缓存，也不让 HF 保存参考 KV。
+        reference_logits = model(
+            input_ids=input_ids, position_ids=positions, use_cache=False,
+            logits_to_keep=1, return_dict=True,
+        ).logits
+        assert logits.shape == (1, 1, model.config.vocab_size)
+        assert logits.dtype == torch.bfloat16
+        error = (logits.float() - reference_logits.float()).abs().max().item()
+        print(f"首个 Token logits：形状={tuple(logits.shape)}，类型={logits.dtype}，最大绝对误差={error:.8g}")
+        torch.testing.assert_close(logits, reference_logits, rtol=0, atol=0)
+        print("[PASS] 自建 Prefill logits 与 HF 完整 forward 严格对照通过")
+
+        # 贪心选择直接取最大分数的索引，不需要 Softmax，也不使用采样配置。
+        next_token_id = logits[0, 0].argmax().item()
+        reference_token_id = reference_logits[0, 0].argmax().item()
+        print(f"first_token_id = {next_token_id}，reference_token_id = {reference_token_id}")
+        assert next_token_id == reference_token_id
+        # Token 可能只对应部分字符；显示仅供观察，正确性以 ID 和 logits 为准。
+        print(f"first_token_text = {tokenizer.decode([next_token_id], skip_special_tokens=True)!r}")
+        # 首个 Token 尚未送回模型，因此所有缓存仍只包含原始输入的 K/V。
+        assert all(cache.length == tokens for cache in caches)
+        print("[PASS] 自建 BF16 Prefill 首个贪心 Token 对照通过；未执行真实 Decode、连续生成或性能测量")
 
 
 if __name__ == "__main__":
