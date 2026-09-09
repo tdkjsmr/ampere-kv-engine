@@ -82,6 +82,19 @@ class BlockTable:
             self._block_ids.append(self._pool.allocate())
         self._length = new_length
 
+    def locate(self, token_position: int) -> tuple[int, int]:
+        """将从 0 开始的有效 Token 位置映射为（物理块编号，块内偏移）。
+
+        只查询元数据，不证明对应 K/V 已写入；返回值不是显存地址。
+        请求释放或块表重新使用后，调用方不能继续使用旧映射。
+        """
+        # 按有效长度检查，而不是按已分配容量检查，拒绝末块未使用的尾部。
+        if type(token_position) is not int or not 0 <= token_position < self._length:
+            raise ValueError("Token 位置必须是有效长度范围内的整数")
+        # 商确定请求内的逻辑块，余数确定块内偏移；再查表得到物理块编号。
+        logical_block, offset = divmod(token_position, self._block_size)
+        return self._block_ids[logical_block], offset
+
     def release(self) -> None:
         """请求结束后归还全部块并重置长度；空表重复调用无操作，可重新使用。"""
         for block_id in self._block_ids:
@@ -179,6 +192,34 @@ def main() -> None:
     assert not any(pool._allocated)
     print("[PASS] 块表释放、重复清理及重新使用通过，最终全部块归还")
     print("[PASS] 单请求块表元数据自检通过；未验证真实 KV、位置映射、多请求或 GPU")
+
+    # 通过正常分配与归还构造非连续、非递增的物理块顺序，不直接修改内部块表。
+    pool = BlockPool(4)
+    held = [pool.allocate() for _ in range(4)]
+    for block_id in (held[1], held[0], held[2]):
+        pool.free(block_id)
+    table = BlockTable(pool, block_size=4)
+    expect_rejected(lambda: table.locate(0), ValueError)  # 空表没有有效位置。
+    table.append_tokens(9)
+    assert table.block_ids == (2, 0, 1)
+    before = (table.length, table.block_ids, pool._free_blocks.copy(), pool._allocated.copy())
+    # 显式列出全部预期结果，不复用被测方法的除法公式，覆盖两处块边界。
+    expected = ((2, 0), (2, 1), (2, 2), (2, 3),
+                (0, 0), (0, 1), (0, 2), (0, 3), (1, 0))
+    assert tuple(table.locate(position) for position in range(9)) == expected
+    for position in (-1, 9, 11, 12, True, 1.0):
+        # 9、11 虽落在已分配的第三块里，却超出有效长度，仍必须拒绝。
+        expect_rejected(lambda: table.locate(position), ValueError)
+    assert (table.length, table.block_ids, pool._free_blocks, pool._allocated) == before
+    print("[PASS] 块表 (2, 0, 1) 的全部有效位置映射正确，查询不修改状态")
+    print("[PASS] 空表、非法位置及末块无效尾部查询被拒绝")
+    table.release()
+    expect_rejected(lambda: table.locate(0), ValueError)
+    assert table.length == 0 and table.block_ids == ()
+    pool.free(held[3])  # 归还构造场景时单独保留的块，不由块表代为释放。
+    assert pool.num_free_blocks == 4 and not any(pool._allocated)
+    print("[PASS] 释放后不能查询旧位置，全部块已归还")
+    print("[PASS] Token 位置映射自检通过；未验证真实 KV 读写、多请求或 GPU")
 
 
 if __name__ == "__main__":
