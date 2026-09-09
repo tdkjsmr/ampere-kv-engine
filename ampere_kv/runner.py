@@ -1,9 +1,9 @@
-"""自建 Qwen3 路径：BF16 Prefill、末尾归一化与首个贪心 Token 对照；暂不执行 Decode。"""
+"""自建 Qwen3 路径：BF16 Prefill 与一次真实 Decode 对照；暂不执行连续生成。"""
 
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
-from ampere_kv.kv_cache import ContiguousKVCache, prefill_attention
+from ampere_kv.kv_cache import ContiguousKVCache, prefill_attention, decode_attention
 from ampere_kv.reference import MODEL_ID, MODEL_REVISION
 
 
@@ -70,31 +70,39 @@ def apply_rope(query: torch.Tensor, key: torch.Tensor, position_ids: torch.Tenso
 
 
 @torch.no_grad()
-def decoder_layer_prefill(
+def decoder_layer_forward(
     hidden_states: torch.Tensor, layer, position_ids: torch.Tensor,
-    cache: ContiguousKVCache, config,
+    cache: ContiguousKVCache, config, *, is_prefill: bool,
 ) -> torch.Tensor:
-    """用指定层的权重执行单请求、无填充 Prefill，返回整段隐藏状态。
+    """执行单请求、无填充的整段 Prefill 或单 Token Decode，返回本次隐藏状态。
 
-    调用方提供该层专用的空缓存；函数写入 RoPE 后的 K 和未旋转的 V。
+    调用方提供该层专用缓存并显式选择阶段；写入 RoPE 后的 K 和未旋转的 V。
     不加载模型、不打印结果、不调用 HF 层的 forward，也不进行参考对照。
-    不支持 Decode 或分块追加；缓存写入后若计算失败，不自动回滚。
+    不支持分块 Prefill；缓存写入后若计算失败，不自动回滚。
     """
     attention = layer.self_attn
     # 在写入前拒绝不支持的配置，避免用普通 Attention 或 SiLU 静默代替其他结构。
     if attention.sliding_window is not None:
-        raise ValueError("当前层 Prefill 不支持滑动窗口")
+        raise ValueError("当前层计算不支持滑动窗口")
     if config.hidden_act != "silu":
         raise ValueError("当前 MLP 仅支持 SiLU 激活")
-    if cache.length != 0:
+    if is_prefill and cache.length != 0:
         raise ValueError("层 Prefill 只接受空缓存，不支持分块追加")
+    if not is_prefill:
+        if hidden_states.ndim != 3 or hidden_states.shape[:2] != (1, 1) or cache.length == 0:
+            raise ValueError("层 Decode 需要单 Token 输入和非空历史缓存")
+        # 单请求无填充场景：下一个 Token 的绝对位置等于当前缓存有效长度。
+        if position_ids.shape != (1, 1) or position_ids.item() != cache.length:
+            raise ValueError("Decode 位置必须等于缓存有效长度")
 
     # Pre-Norm：先归一化，再送入 Attention；原始输入留在残差支路上。
     norm = layer.input_layernorm
     normalized = rms_norm(hidden_states, norm.weight, norm.variance_epsilon)
     query, key, value = project_qkv(normalized, attention)
     query, key = apply_rope(query, key, position_ids, config)
-    head_output = prefill_attention(query, key, value, cache)
+    # 只有缓存 Attention 的阶段不同，归一化、投影、RoPE、残差与 MLP 共用原实现。
+    attention_fn = prefill_attention if is_prefill else decode_attention
+    head_output = attention_fn(query, key, value, cache)
     # 合并所有 Query 头，再通过输出投影还原隐藏维度。
     batch, tokens, _ = hidden_states.shape
     merged = head_output.transpose(1, 2).contiguous().reshape(batch, tokens, -1)
@@ -166,7 +174,7 @@ def main() -> None:
             )
             caches.append(cache)
             # 两条路径各自接收上一层输出；不能每层用 HF 状态重置自建输入。
-            hidden_states = decoder_layer_prefill(hidden_states, layer, positions, cache, model.config)
+            hidden_states = decoder_layer_forward(hidden_states, layer, positions, cache, model.config, is_prefill=True)
             reference_hidden = layer(
                 hidden_states=reference_hidden, attention_mask=None,
                 position_ids=positions, position_embeddings=position_embeddings,
@@ -205,11 +213,13 @@ def main() -> None:
         logits = torch.nn.functional.linear(normalized[:, -1:, :], model.lm_head.weight, model.lm_head.bias)
         # 再由 HF 完整 forward 从原始 Token IDs 独立计算，覆盖模型入口到词表输出。
         # 两边都只投影最后一个位置，避免因 GEMM 形状不同引入额外比较差异。
-        # 不创建第二份模型，不传入我们的缓存，也不让 HF 保存参考 KV。
-        reference_logits = model(
-            input_ids=input_ids, position_ids=positions, use_cache=False,
+        # 复用同一份权重，但让 HF 独立建立参考缓存，供后面一次 Decode 使用。
+        reference_outputs = model(
+            input_ids=input_ids, position_ids=positions, use_cache=True,
             logits_to_keep=1, return_dict=True,
-        ).logits
+        )
+        reference_logits = reference_outputs.logits
+        reference_cache = reference_outputs.past_key_values
         assert logits.shape == (1, 1, model.config.vocab_size)
         assert logits.dtype == torch.bfloat16
         error = (logits.float() - reference_logits.float()).abs().max().item()
@@ -226,7 +236,47 @@ def main() -> None:
         print(f"first_token_text = {tokenizer.decode([next_token_id], skip_special_tokens=True)!r}")
         # 首个 Token 尚未送回模型，因此所有缓存仍只包含原始输入的 K/V。
         assert all(cache.length == tokens for cache in caches)
-        print("[PASS] 自建 BF16 Prefill 首个贪心 Token 对照通过；未执行真实 Decode、连续生成或性能测量")
+        print("[PASS] 自建 BF16 Prefill 首个贪心 Token 对照通过")
+
+        # EOS 已经结束回答时不再送回模型；必须明确说明本次没有覆盖 Decode。
+        eos_ids = model.generation_config.eos_token_id
+        eos_ids = [eos_ids] if isinstance(eos_ids, int) else (eos_ids or [])
+        if next_token_id in eos_ids:
+            print("首个 Token 为 EOS，跳过 Decode；本次仅验证 Prefill")
+            return
+        next_input = torch.tensor([[next_token_id]], dtype=torch.long, device=input_ids.device)
+        decode_positions = torch.tensor([[tokens]], dtype=torch.long, device=input_ids.device)
+        hidden_states = embedding.weight[next_input]
+        # 只送入首个输出 Token，不重算原始输入；每层读取自己的 Prefill 缓存。
+        for layer, cache in zip(layers, caches):
+            hidden_states = decoder_layer_forward(
+                hidden_states, layer, decode_positions, cache, model.config, is_prefill=False,
+            )
+            assert cache.length == tokens + 1
+        assert hidden_states.shape == (1, 1, model.config.hidden_size)
+        # 保持全部 K/V 存储地址不变，确认使用的是原来的预分配缓存。
+        assert addresses == [tensor.data_ptr() for cache in caches for tensor in cache.get()]
+        normalized = rms_norm(hidden_states, final_norm.weight, final_norm.variance_epsilon)
+        decode_logits = torch.nn.functional.linear(normalized, model.lm_head.weight, model.lm_head.bias)
+        # HF 使用它自己的历史缓存和相同新 Token；不读取我们的缓存或中间状态。
+        reference_decode = model(
+            input_ids=next_input, position_ids=decode_positions,
+            cache_position=decode_positions[0], past_key_values=reference_cache,
+            use_cache=True, logits_to_keep=1, return_dict=True,
+        )
+        assert all(reference_cache.get_seq_length(i) == tokens + 1 for i in range(len(layers)))
+        assert decode_logits.shape == (1, 1, model.config.vocab_size)
+        assert decode_logits.dtype == torch.bfloat16
+        error = (decode_logits.float() - reference_decode.logits.float()).abs().max().item()
+        print(f"首次 Decode logits：形状={tuple(decode_logits.shape)}，最大绝对误差={error:.8g}")
+        torch.testing.assert_close(decode_logits, reference_decode.logits, rtol=0, atol=0)
+        second_token_id = decode_logits[0, 0].argmax().item()
+        reference_second_id = reference_decode.logits[0, 0].argmax().item()
+        print(f"second_token_id = {second_token_id}，reference_token_id = {reference_second_id}")
+        assert second_token_id == reference_second_id
+        print(f"two_token_text = {tokenizer.decode([next_token_id, second_token_id], skip_special_tokens=True)!r}")
+        # 第二个输出 Token 未再送入模型，因此各层缓存仅增长一次。
+        print(f"[PASS] 一次真实 Decode 对照通过：全部 {len(caches)} 层 KV 长度={tokens + 1}，自建存储地址不变；未验证连续生成或性能")
 
 
 if __name__ == "__main__":
