@@ -1,10 +1,13 @@
-"""自建 Qwen3 路径：BF16 Prefill 与一次真实 Decode 对照；暂不执行连续生成。"""
+"""自建 Qwen3 路径：BF16 Prefill 与最多 32 Token 贪心生成对照；暂不测量性能。"""
 
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from ampere_kv.kv_cache import ContiguousKVCache, prefill_attention, decode_attention
 from ampere_kv.reference import MODEL_ID, MODEL_REVISION
+
+# 本轮最多生成 32 个新 Token，包含 Prefill 选出的第一个；遇到 EOS 提前结束。
+MAX_NEW_TOKENS = 32
 
 
 def rms_norm(hidden_states: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.Tensor:
@@ -142,7 +145,7 @@ def main() -> None:
     )["input_ids"].to("cuda")
 
     # 暂时沿用已跑通的加载方式，不新写权重下载器或分片读取器。
-    # 加载一份 BF16 权重，执行完整 Prefill 并选出首个 Token；暂不执行生成循环。
+    # 加载一份 BF16 权重，执行 Prefill 和有限长度贪心循环；参考对照不作为性能基准。
     print("正在从本地缓存加载固定版本 Qwen3-8B，用于真实权重对照……")
     model = AutoModelForCausalLM.from_pretrained(
         MODEL_ID, revision=MODEL_REVISION, torch_dtype=torch.bfloat16,
@@ -170,7 +173,7 @@ def main() -> None:
         for layer_index, layer in enumerate(layers):
             cache = ContiguousKVCache(
                 model.config.num_key_value_heads, model.config.head_dim,
-                capacity=tokens + 1, device=hidden_states.device,
+                capacity=tokens + MAX_NEW_TOKENS, device=hidden_states.device,
             )
             caches.append(cache)
             # 两条路径各自接收上一层输出；不能每层用 HF 状态重置自建输入。
@@ -213,7 +216,7 @@ def main() -> None:
         logits = torch.nn.functional.linear(normalized[:, -1:, :], model.lm_head.weight, model.lm_head.bias)
         # 再由 HF 完整 forward 从原始 Token IDs 独立计算，覆盖模型入口到词表输出。
         # 两边都只投影最后一个位置，避免因 GEMM 形状不同引入额外比较差异。
-        # 复用同一份权重，但让 HF 独立建立参考缓存，供后面一次 Decode 使用。
+        # 复用同一份权重，但让 HF 独立建立参考缓存，供后面的 Decode 循环使用。
         reference_outputs = model(
             input_ids=input_ids, position_ids=positions, use_cache=True,
             logits_to_keep=1, return_dict=True,
@@ -238,45 +241,61 @@ def main() -> None:
         assert all(cache.length == tokens for cache in caches)
         print("[PASS] 自建 BF16 Prefill 首个贪心 Token 对照通过")
 
-        # EOS 已经结束回答时不再送回模型；必须明确说明本次没有覆盖 Decode。
         eos_ids = model.generation_config.eos_token_id
         eos_ids = [eos_ids] if isinstance(eos_ids, int) else (eos_ids or [])
-        if next_token_id in eos_ids:
-            print("首个 Token 为 EOS，跳过 Decode；本次仅验证 Prefill")
-            return
-        next_input = torch.tensor([[next_token_id]], dtype=torch.long, device=input_ids.device)
-        decode_positions = torch.tensor([[tokens]], dtype=torch.long, device=input_ids.device)
-        hidden_states = embedding.weight[next_input]
-        # 只送入首个输出 Token，不重算原始输入；每层读取自己的 Prefill 缓存。
-        for layer, cache in zip(layers, caches):
-            hidden_states = decoder_layer_forward(
-                hidden_states, layer, decode_positions, cache, model.config, is_prefill=False,
+        # 两条路径各自保存生成序列；HF 下一步读取自己的选择，不使用自建结果替换。
+        generated_ids = [next_token_id]
+        reference_ids = [reference_token_id]
+        used_tokens = tokens
+        while len(generated_ids) < MAX_NEW_TOKENS and generated_ids[-1] not in eos_ids:
+            next_input = torch.tensor([[generated_ids[-1]]], dtype=torch.long, device=input_ids.device)
+            reference_input = torch.tensor([[reference_ids[-1]]], dtype=torch.long, device=input_ids.device)
+            # 位置使用当前有效长度，不是固定的首轮位置，也不是已生成 Token 的数量。
+            decode_positions = torch.tensor([[used_tokens]], dtype=torch.long, device=input_ids.device)
+            hidden_states = embedding.weight[next_input]
+            for layer, cache in zip(layers, caches):
+                assert cache.length == used_tokens
+                hidden_states = decoder_layer_forward(
+                    hidden_states, layer, decode_positions, cache, model.config, is_prefill=False,
+                )
+                assert cache.length == used_tokens + 1
+            used_tokens += 1
+            assert hidden_states.shape == (1, 1, model.config.hidden_size)
+            # 每轮检查原来的预分配存储仍被复用，不因生成长度增加而重新分配 K/V。
+            assert addresses == [tensor.data_ptr() for cache in caches for tensor in cache.get()]
+            normalized = rms_norm(hidden_states, final_norm.weight, final_norm.variance_epsilon)
+            decode_logits = torch.nn.functional.linear(normalized, model.lm_head.weight, model.lm_head.bias)
+            reference_decode = model(
+                input_ids=reference_input, position_ids=decode_positions,
+                cache_position=decode_positions[0], past_key_values=reference_cache,
+                use_cache=True, logits_to_keep=1, return_dict=True,
             )
-            assert cache.length == tokens + 1
-        assert hidden_states.shape == (1, 1, model.config.hidden_size)
-        # 保持全部 K/V 存储地址不变，确认使用的是原来的预分配缓存。
-        assert addresses == [tensor.data_ptr() for cache in caches for tensor in cache.get()]
-        normalized = rms_norm(hidden_states, final_norm.weight, final_norm.variance_epsilon)
-        decode_logits = torch.nn.functional.linear(normalized, model.lm_head.weight, model.lm_head.bias)
-        # HF 使用它自己的历史缓存和相同新 Token；不读取我们的缓存或中间状态。
-        reference_decode = model(
-            input_ids=next_input, position_ids=decode_positions,
-            cache_position=decode_positions[0], past_key_values=reference_cache,
-            use_cache=True, logits_to_keep=1, return_dict=True,
-        )
-        assert all(reference_cache.get_seq_length(i) == tokens + 1 for i in range(len(layers)))
-        assert decode_logits.shape == (1, 1, model.config.vocab_size)
-        assert decode_logits.dtype == torch.bfloat16
-        error = (decode_logits.float() - reference_decode.logits.float()).abs().max().item()
-        print(f"首次 Decode logits：形状={tuple(decode_logits.shape)}，最大绝对误差={error:.8g}")
-        torch.testing.assert_close(decode_logits, reference_decode.logits, rtol=0, atol=0)
-        second_token_id = decode_logits[0, 0].argmax().item()
-        reference_second_id = reference_decode.logits[0, 0].argmax().item()
-        print(f"second_token_id = {second_token_id}，reference_token_id = {reference_second_id}")
-        assert second_token_id == reference_second_id
-        print(f"two_token_text = {tokenizer.decode([next_token_id, second_token_id], skip_special_tokens=True)!r}")
-        # 第二个输出 Token 未再送入模型，因此各层缓存仅增长一次。
-        print(f"[PASS] 一次真实 Decode 对照通过：全部 {len(caches)} 层 KV 长度={tokens + 1}，自建存储地址不变；未验证连续生成或性能")
+            reference_cache = reference_decode.past_key_values
+            assert all(reference_cache.get_seq_length(i) == used_tokens for i in range(len(layers)))
+            assert decode_logits.shape == (1, 1, model.config.vocab_size)
+            assert decode_logits.dtype == torch.bfloat16
+            error = (decode_logits.float() - reference_decode.logits.float()).abs().max().item()
+            print(f"Decode 第 {len(generated_ids)} 步：logits 最大绝对误差={error:.8g}，KV 长度={used_tokens}")
+            # 先比较完整词表分数，再检查选词；出现首个差异立即停止，不自动放宽阈值。
+            torch.testing.assert_close(decode_logits, reference_decode.logits, rtol=0, atol=0)
+            generated_ids.append(decode_logits[0, 0].argmax().item())
+            reference_ids.append(reference_decode.logits[0, 0].argmax().item())
+            assert generated_ids[-1] == reference_ids[-1]
+            print(f"[PASS] 第 {len(generated_ids)} 个 Token 对照通过：ID={generated_ids[-1]}")
+
+        # 选出最后一个 Token 后立即停止，EOS 也不再送回模型，因此缓存少于输入加输出总长一位。
+        assert generated_ids == reference_ids
+        assert used_tokens == tokens + len(generated_ids) - 1
+        assert all(cache.length == used_tokens for cache in caches)
+        assert all(reference_cache.get_seq_length(i) == used_tokens for i in range(len(layers)))
+        reason = "EOS" if generated_ids[-1] in eos_ids else "达到新 Token 上限"
+        print(f"generated_token_ids = {generated_ids}")
+        print(f"reference_token_ids = {reference_ids}")
+        print(f"generated_text = {tokenizer.decode(generated_ids, skip_special_tokens=True)!r}")
+        print(f"停止原因={reason}，生成数={len(generated_ids)}，Decode 次数={len(generated_ids) - 1}，KV 长度={used_tokens}，容量={tokens + MAX_NEW_TOKENS}")
+        if len(generated_ids) == 1:
+            print("首个 Token 为 EOS，本次未覆盖 Decode")
+        print("[PASS] 本次有界贪心生成的逐步 logits、Token ID 与缓存检查通过；不代表多输入回归或性能验证通过")
 
 
 if __name__ == "__main__":
