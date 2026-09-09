@@ -1,4 +1,4 @@
-"""自建 Qwen3 路径：第一层完整 BF16 Prefill Decoder Layer 对照；暂不生成文本。"""
+"""自建 Qwen3 路径：全部 Decoder Layers 的 BF16 Prefill 逐层对照；暂不生成文本。"""
 
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
@@ -116,7 +116,7 @@ def decoder_layer_prefill(
 
 
 def main() -> None:
-    """云端显式运行：复用一份 HF 权重，检查自建路径的第一段数值结果。"""
+    """云端显式运行：复用一份 HF 权重，检查自建多层 Prefill 的隐藏状态。"""
 
     if not torch.cuda.is_available():
         raise RuntimeError("真实权重对照需要在云端 CUDA 环境运行")
@@ -134,7 +134,7 @@ def main() -> None:
     )["input_ids"].to("cuda")
 
     # 暂时沿用已跑通的加载方式，不新写权重下载器或分片读取器。
-    # 加载完整 BF16 模型，但只执行第一层 Decoder Layer，不跑完整模型前向。
+    # 加载完整 BF16 模型，执行全部 Decoder Layers；暂不接 Final Norm、LM Head 或生成循环。
     print("正在从本地缓存加载固定版本 Qwen3-8B，用于真实权重对照……")
     model = AutoModelForCausalLM.from_pretrained(
         MODEL_ID, revision=MODEL_REVISION, torch_dtype=torch.bfloat16,
@@ -150,35 +150,46 @@ def main() -> None:
         torch.testing.assert_close(hidden_states, reference_hidden, rtol=0, atol=0)
         print(f"[PASS] Embedding 对照：形状={tuple(hidden_states.shape)}，类型={hidden_states.dtype}")
 
-        layer = model.model.layers[0]
         tokens = input_ids.shape[1]
         positions = torch.arange(tokens, device=hidden_states.device).unsqueeze(0)
-        # 缓存由调用方创建；后续多层时每层各有一份，不能把不同层的 K/V 混用。
-        cache = ContiguousKVCache(
-            model.config.num_key_value_heads, model.config.head_dim,
-            capacity=tokens + 1, device=hidden_states.device,
-        )
-        layer_output = decoder_layer_prefill(hidden_states, layer, positions, cache, model.config)
-        assert cache.length == tokens
-        stored_key, stored_value = cache.get()
-        expected_shape = (1, model.config.num_key_value_heads, tokens, model.config.head_dim)
-        assert stored_key.shape == stored_value.shape == expected_shape
-        assert stored_key.dtype == stored_value.dtype == torch.bfloat16
-        print(f"[PASS] 层函数 Prefill KV：有效长度={cache.length}，容量={cache.capacity}，形状={tuple(stored_key.shape)}")
-
-        # HF 从原始 Embedding 独立执行整层；不读取自建缓存或任何自建中间结果。
+        layers = model.model.layers
+        assert len(layers) == model.config.num_hidden_layers
+        # 当前各层使用相同位置；HF 参考频率只生成一次，不依赖自建路径的中间结果。
         position_embeddings = model.model.rotary_emb(reference_hidden, positions)
-        reference_layer_output = layer(
-            hidden_states=reference_hidden, attention_mask=None,
-            position_ids=positions, position_embeddings=position_embeddings,
-            past_key_value=None, use_cache=False, output_attentions=False,
-        )[0]
-        error = (layer_output.float() - reference_layer_output.float()).abs().max().item()
-        print(f"完整 Decoder Layer 输出：形状={tuple(layer_output.shape)}，类型={layer_output.dtype}，最大绝对误差={error:.8g}")
-        assert layer_output.dtype == torch.bfloat16
-        # 函数提取不应改变数值；仍保持第一层 BF16 严格对照，不放宽阈值。
-        torch.testing.assert_close(layer_output, reference_layer_output, rtol=0, atol=0)
-        print("[PASS] 可复用层函数的第一层 BF16 Prefill 对照通过；未验证真实 Decode、多层模型或性能")
+        # 列表下标对应层号；保留全部缓存，不能反复覆盖或复用第一层的存储。
+        caches = []
+        expected_shape = (1, model.config.num_key_value_heads, tokens, model.config.head_dim)
+        for layer_index, layer in enumerate(layers):
+            cache = ContiguousKVCache(
+                model.config.num_key_value_heads, model.config.head_dim,
+                capacity=tokens + 1, device=hidden_states.device,
+            )
+            caches.append(cache)
+            # 两条路径各自接收上一层输出；不能每层用 HF 状态重置自建输入。
+            hidden_states = decoder_layer_prefill(hidden_states, layer, positions, cache, model.config)
+            reference_hidden = layer(
+                hidden_states=reference_hidden, attention_mask=None,
+                position_ids=positions, position_embeddings=position_embeddings,
+                past_key_value=None, use_cache=False, output_attentions=False,
+            )[0]
+            # 每层都检查缓存与隐藏状态；出现首个差异立即停止，不放宽容差。
+            assert cache.length == tokens
+            stored_key, stored_value = cache.get()
+            assert stored_key.shape == stored_value.shape == expected_shape
+            assert stored_key.dtype == stored_value.dtype == torch.bfloat16
+            assert hidden_states.dtype == torch.bfloat16
+            error = (hidden_states.float() - reference_hidden.float()).abs().max().item()
+            print(f"第 {layer_index} 层：输出形状={tuple(hidden_states.shape)}，最大绝对误差={error:.8g}，KV 长度={cache.length}，容量={cache.capacity}")
+            torch.testing.assert_close(hidden_states, reference_hidden, rtol=0, atol=0)
+            print(f"[PASS] 第 {layer_index} 层 BF16 Prefill 严格对照通过")
+
+        # 循环结束后仍保留每层自己的缓存，并确认后续层没有改变前面层的有效长度。
+        assert len(caches) == len(layers) and all(cache.length == tokens for cache in caches)
+        # 所有缓存同时存活，K/V 起始地址必须各不相同，排除意外共享存储。
+        addresses = [tensor.data_ptr() for cache in caches for tensor in cache.get()]
+        assert len(set(addresses)) == 2 * len(layers)
+        print(f"[PASS] 全部 {len(layers)} 层 BF16 Prefill 与独立 KV 缓存检查通过")
+        print("当前输出为最后一个 Decoder Layer 的隐藏状态；未接 Final Norm/LM Head，未验证真实 Decode、完整生成或性能")
 
 
 if __name__ == "__main__":
