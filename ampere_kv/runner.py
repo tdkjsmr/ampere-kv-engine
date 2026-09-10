@@ -187,18 +187,19 @@ def model_forward(model, input_ids, position_ids, caches, *, is_prefill: bool, c
 
 
 @torch.inference_mode()
-def generate_tokens(model, input_ids, *, max_new_tokens: int = MAX_NEW_TOKENS, verify: bool = False, timings: dict | None = None, cache_kind: str = "contiguous") -> list[int]:
+def generate_tokens(model, input_ids, *, max_new_tokens: int = MAX_NEW_TOKENS, verify: bool = False, timings: dict | None = None, cache_kind: str = "contiguous", cuda_decode: bool = False) -> list[int]:
     """返回新 Token IDs；每次请求创建独立缓存，不向调用方保留 GPU 张量。
 
     两种模式共用自建前向和循环；verify 只额外执行 HF 参考和诊断。
     纯生成不调用 HF forward、不创建 HF 缓存、不逐步打印，仍保留必要输入检查。
     timings 非空时写入请求级墙钟指标；不允许同时开启 HF 对照。
     两种存储共用生成循环；分页每层独占块池，尚非多请求共享池。
+    cuda_decode 仅切换 Decode，Prefill 始终使用 SDPA；默认后端不变。
     """
     if cache_kind not in ("contiguous", "paged"):
         raise ValueError("缓存类型必须是 contiguous 或 paged")
-    if timings is not None and cache_kind == "paged":
-        raise ValueError("分页参考暂不支持性能测量")
+    if cuda_decode and (cache_kind != "paged" or verify):
+        raise ValueError("CUDA Decode 仅支持分页纯生成；逐步对照请使用 cuda-check")
     if timings is not None and verify:
         raise ValueError("计时不能包含 HF 对照，请使用纯生成路径")
     if max_new_tokens <= 0:
@@ -247,7 +248,7 @@ def generate_tokens(model, input_ids, *, max_new_tokens: int = MAX_NEW_TOKENS, v
     for step in range(max_new_tokens):
         # 首轮处理整段输入，后续只处理一个 Token；绝对位置从历史有效长度继续。
         positions = torch.arange(used_tokens, used_tokens + current_input.shape[1], device=input_ids.device).unsqueeze(0)
-        logits = model_forward(model, current_input, positions, caches, is_prefill=(step == 0))
+        logits = model_forward(model, current_input, positions, caches, is_prefill=(step == 0), cuda_decode=cuda_decode and step > 0)
         used_tokens += current_input.shape[1]
         next_id = logits[0, 0].argmax().item()
         if timings is not None:
@@ -326,14 +327,28 @@ def generate_tokens(model, input_ids, *, max_new_tokens: int = MAX_NEW_TOKENS, v
     return generated_ids
 
 
-def benchmark(model, input_ids, *, repeats: int = 3) -> list[int]:
+def benchmark(model, input_ids, *, repeats: int = 3, cache_kind: str = "contiguous", cuda_decode: bool = False, reference_ids: list[int] | None = None) -> list[int]:
     """同一模型预热一次、重复纯生成；只打印基础统计，不保存输入或结果文件。"""
     if repeats < 1:
         raise ValueError("测量次数必须为正数")
+    if cuda_decode and reference_ids is None:
+        raise ValueError("CUDA 基线需要先提供相同输入的 SDPA 参考序列")
+    backend = "CUDA V0" if cuda_decode else "SDPA"
+    print(f"\n基线路径：缓存={cache_kind}，Decode={backend}，Prefill=SDPA")
     print(f"基线：预热=1 次，测量={repeats} 次，输入 Token={input_ids.shape[1]}，输出上限={MAX_NEW_TOKENS}")
     print("范围：模型与输入已就绪，包含 KV 分配和选词；无 HF 对照、分词、文本解码或终端打印")
+    print("终点为最后一个 Token ID 可用；不计随后缓存归还。保留实现必需的输入检查和同步，不是内核单独计时。")
+    if cache_kind == "paged":
+        print("分页 SDPA 包含逻辑读回与 GQA 临时复制；CUDA Decode 包含块表创建/上传和块号检查同步；两边均包含 KV 追加。")
     # 预热不计入结果；每次调用都新建请求缓存，不复用上个请求的有效内容。
-    expected_ids = generate_tokens(model, input_ids)
+    expected_ids = generate_tokens(model, input_ids, cache_kind=cache_kind, cuda_decode=cuda_decode)
+    if reference_ids is not None:
+        if expected_ids != reference_ids:
+            raise RuntimeError("CUDA 预热序列与 SDPA 不一致，取消 CUDA 测量；请运行 cuda-check 定位")
+        print("[PASS] 计时外完整 Token 序列与 SDPA 一致；不代表 logits 精度验收通过")
+    if cuda_decode and len(expected_ids) == 1:
+        print("[未覆盖] 首个 Token 为 EOS，取消 CUDA 测量；请换输入覆盖 Decode")
+        return expected_ids
     device = input_ids.device
     torch.cuda.synchronize(device)
     baseline_allocated = torch.cuda.memory_allocated(device)
@@ -343,7 +358,7 @@ def benchmark(model, input_ids, *, repeats: int = 3) -> list[int]:
         # 重置峰值与读取显存放在生成计时区间外；不调用 empty_cache 改变分配器状态。
         torch.cuda.reset_peak_memory_stats(device)
         metrics = {}
-        generated_ids = generate_tokens(model, input_ids, timings=metrics)
+        generated_ids = generate_tokens(model, input_ids, timings=metrics, cache_kind=cache_kind, cuda_decode=cuda_decode)
         torch.cuda.synchronize(device)
         allocated = torch.cuda.memory_allocated(device)
         reserved = torch.cuda.memory_reserved(device)
@@ -476,8 +491,6 @@ def main() -> None:
     args = parser.parse_args()
     if args.repeats < 1:
         parser.error("--repeats 必须为正数")
-    if args.mode == "benchmark" and args.cache == "paged":
-        parser.error("分页参考暂不支持 benchmark；请使用 check 或 generate")
     if args.mode == "cuda-check" and args.cache != "paged":
         parser.error("cuda-check 需要显式指定 --cache paged")
     if not torch.cuda.is_available():
@@ -502,7 +515,14 @@ def main() -> None:
         check_cuda_decode(model, input_ids)
         return  # 对照入口自行汇总，不能落入下面的普通生成结果打印。
     if args.mode == "benchmark":
-        generated_ids = benchmark(model, input_ids, repeats=args.repeats)
+        generated_ids = benchmark(model, input_ids, repeats=args.repeats, cache_kind=args.cache)
+        if args.cache == "paged":
+            # 一次加载、同一输入、同一上限；两条路径仍分别创建并归还自己的缓存。
+            # 先 SDPA 后 CUDA 仅用于初步基线，固定顺序和少量重复不能代表稳定加速比。
+            generated_ids = benchmark(
+                model, input_ids, repeats=args.repeats, cache_kind="paged",
+                cuda_decode=True, reference_ids=generated_ids,
+            )
     else:
         generated_ids = generate_tokens(model, input_ids, verify=(args.mode == "check"), cache_kind=args.cache)
     eos_ids = model.generation_config.eos_token_id
