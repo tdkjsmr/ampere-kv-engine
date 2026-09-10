@@ -16,11 +16,14 @@ __global__ void paged_decode_kernel(
     const c10::BFloat16* value, const int64_t* table,
     c10::BFloat16* output, int64_t length, int kv_heads, int group_size) {
   const int dim = threadIdx.x;
+  const int lane = dim % 32;
+  const int warp = dim / 32;
   const int query_head = blockIdx.x;
   const int kv_head = query_head / group_size;
   const float q = static_cast<float>(query[query_head * kDim + dim]);
   float accumulator = 0.0f;  // 当前维度的加权 V 分子，始终保留 FP32。
-  __shared__ float partial[kDim];
+  // 固定 128 线程，即 4 个完整 warp；共享内存只保存各 warp 的部分和。
+  __shared__ float warp_sums[kDim / 32];
   __shared__ float maximum, denominator, old_scale, new_weight;
   if (dim == 0) {
     maximum = -INFINITY;
@@ -33,15 +36,25 @@ __global__ void paged_decode_kernel(
     const int64_t physical = table[token / kBlockSize];
     const int offset = token % kBlockSize;
     const int64_t index = ((physical * kv_heads + kv_head) * kBlockSize + offset) * kDim + dim;
-    partial[dim] = q * static_cast<float>(key[index]);
+    float sum = q * static_cast<float>(key[index]);
+    // 所有 lane 都参与洗牌，不在 lane == 0 分支中调用全掩码 shuffle。
+    // warp 内通过寄存器交换归约，只有 lane 0 的最终和用于跨 warp 合并。
+    for (int delta = 16; delta > 0; delta /= 2) {
+      sum += __shfl_down_sync(0xffffffffu, sum, delta);
+    }
+    if (lane == 0) warp_sums[warp] = sum;
+    // shuffle 只同步同一 warp；读其他 warp 的共享部分和前仍须块级屏障。
     __syncthreads();
-    // 最直接的共享内存树形归约，所有线程都经过每一个同步点。
-    for (int stride = kDim / 2; stride > 0; stride /= 2) {
-      if (dim < stride) partial[dim] += partial[dim + stride];
-      __syncthreads();
+    if (warp == 0) {
+      // 第一个完整 warp 合并 4 个部分和，其余 lane 补零；全掩码仍然有效。
+      sum = lane < kDim / 32 ? warp_sums[lane] : 0.0f;
+      for (int delta = 16; delta > 0; delta /= 2) {
+        sum += __shfl_down_sync(0xffffffffu, sum, delta);
+      }
     }
     if (dim == 0) {
-      const float score = partial[0] * rsqrtf(static_cast<float>(kDim));
+      // 浮点加法次序与原树形归约不同，必须重新跑数值与模型对照。
+      const float score = sum * rsqrtf(static_cast<float>(kDim));
       // 在线 softmax：最大分数变化时，旧分子和分母都乘同一个缩放系数。
       // 无需保存所有分数；减去最大值避免直接 exp(score) 溢出。
       const float next_maximum = fmaxf(maximum, score);
