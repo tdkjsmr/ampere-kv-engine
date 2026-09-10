@@ -8,7 +8,7 @@ import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from ampere_kv.kv_cache import ContiguousKVCache, prefill_attention, decode_attention
-from ampere_kv.paged_cache import PagedKVCache
+from ampere_kv.paged_cache import PagedKVCache, PagedKVStorage
 from ampere_kv.reference import MODEL_ID, MODEL_REVISION
 
 # 本轮最多生成 32 个新 Token，包含 Prefill 选出的第一个；遇到 EOS 提前结束。
@@ -192,11 +192,12 @@ def generate_tokens(model, input_ids, *, max_new_tokens: int = MAX_NEW_TOKENS, v
     for _ in model.model.layers:
         if cache_kind == "paged":
             # 整块向上取整；仅选择存储实现，不复制前向或生成循环。
-            cache = PagedKVCache(
+            # Runner 仍是单请求：每层创建独立存储，再创建该请求的块表。
+            cache = PagedKVCache(PagedKVStorage(
                 model.config.num_key_value_heads, model.config.head_dim,
                 num_blocks=(capacity + PAGED_BLOCK_SIZE - 1) // PAGED_BLOCK_SIZE,
                 block_size=PAGED_BLOCK_SIZE, device=input_ids.device,
-            )
+            ))
         else:
             cache = ContiguousKVCache(
                 model.config.num_key_value_heads, model.config.head_dim,

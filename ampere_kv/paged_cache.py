@@ -1,4 +1,4 @@
-"""单请求、单层 BF16 分页 K/V 与 Prefill/Decode 参考；尚未接入完整模型。"""
+"""单层 BF16 分页共享存储与请求缓存；共享生命周期仅做 CPU 参考验证。"""
 
 import torch
 
@@ -8,12 +8,8 @@ from ampere_kv.block_pool import BlockPool, BlockTable
 from ampere_kv.kv_cache import decode_attention, prefill_attention
 
 
-class PagedKVCache:
-    """固定大小的物理存储，按需分配块编号；当前每个实例独占一个块池。
-
-    这是单线程参考实现，不支持多请求共享、量化或高性能批量写入。
-    外部不能修改内部张量、块池或块表；输入 K/V 也不能与内部存储共享内存。
-    """
+class PagedKVStorage:
+    """同一模型层的共享物理 K/V 与块池；所有请求使用相同布局和设备。"""
 
     def __init__(self, num_kv_heads: int, head_dim: int, num_blocks: int,
                  block_size: int, device="cpu"):
@@ -21,16 +17,30 @@ class PagedKVCache:
                for size in (num_kv_heads, head_dim, num_blocks, block_size)):
             raise ValueError("KV 头数、每头维度、块数量和块大小必须是正整数")
         self._pool = BlockPool(num_blocks)
-        self._table = BlockTable(self._pool, block_size)
         # K、V 各自布局为 [物理块数, KV 头数, 每块 Token 数, 每头维度]。
         # 一次分配全部物理空间；申请编号不会再次分配张量，空闲区域内容无效。
         shape = (num_blocks, num_kv_heads, block_size, head_dim)
         self._key = torch.empty(shape, dtype=torch.bfloat16, device=device)
         self._value = torch.empty(shape, dtype=torch.bfloat16, device=device)
 
+
+class PagedKVCache:
+    """一个请求的块表与共享存储引用；已分配的块仍由该请求独占。
+
+    单线程使用，不支持共享同一已分配块、引用计数或前缀复用。
+    请求结束必须显式 release；丢弃请求对象不会自动向共享池归还编号。
+    外部不能修改内部状态，输入 K/V 不能与物理存储共享内存。
+    """
+
+    def __init__(self, storage: PagedKVStorage):
+        # 这里只复制 Python 引用，不分配或复制 K/V 张量，也不重新创建块池。
+        self._pool = storage._pool
+        self._key, self._value = storage._key, storage._value
+        self._table = BlockTable(self._pool, self._key.shape[2])
+
     @property
     def capacity(self) -> int:
-        """返回整块物理空间可容纳的 Token 数，可能大于请求预留的长度。"""
+        """返回整个共享池的 Token 容量，不保证本请求可全部占用；追加另查空闲块。"""
         return self._key.shape[0] * self._key.shape[2]
 
     @property
@@ -85,7 +95,7 @@ class PagedKVCache:
 
 def main() -> None:
     """CPU 小张量自检：检查实际数据，不加载模型、不使用 GPU。"""
-    cache = PagedKVCache(num_kv_heads=2, head_dim=4, num_blocks=3, block_size=4)
+    cache = PagedKVCache(PagedKVStorage(num_kv_heads=2, head_dim=4, num_blocks=3, block_size=4))
     assert cache.length == 0 and all(t.shape == (1, 2, 0, 4) for t in cache.get())
     addresses = (cache._key.data_ptr(), cache._value.data_ptr())
     # 自检专用：用哨兵填满物理存储，便于发现未使用位置被错误写入。
@@ -158,7 +168,7 @@ def main() -> None:
 
     # 等头数与 GQA 共用一个场景：Prefill 4 个 Token，Decode 跨块追加第 5 个。
     for label, mapping in (("等头数", [0, 1]), ("GQA", [0, 0, 1, 1])):
-        cache = PagedKVCache(num_kv_heads=2, head_dim=4, num_blocks=3, block_size=4)
+        cache = PagedKVCache(PagedKVStorage(num_kv_heads=2, head_dim=4, num_blocks=3, block_size=4))
         cache._key.fill_(-100)
         cache._value.fill_(-200)
         held = [cache._pool.allocate() for _ in range(3)]
@@ -243,6 +253,65 @@ def main() -> None:
         assert cache.length == 0 and cache._pool.num_free_blocks == 3
         assert not any(cache._pool._allocated)
     print("[PASS] CPU 分页等头数/GQA Prefill + Decode 自检通过；未验证原生分页内核、多请求、模型或 GPU")
+
+    # 两个请求交错占用同一层存储，不运行多请求 Attention 或调度器。
+    storage = PagedKVStorage(num_kv_heads=2, head_dim=4, num_blocks=3, block_size=4)
+    storage._key.fill_(-100)
+    storage._value.fill_(-200)
+    a, b = PagedKVCache(storage), PagedKVCache(storage)
+    assert a._key is b._key is storage._key and a._value is b._value is storage._value
+    assert a._pool is b._pool is storage._pool and a._table is not b._table
+    keys = torch.arange(40, dtype=torch.float32).reshape(1, 2, 5, 4).to(torch.bfloat16)
+    a.append(keys[:, :, :3], keys[:, :, :3] + 64)
+    b.append(-keys[:, :, :3], -keys[:, :, :3] - 64)
+    a.append(keys[:, :, 3:], keys[:, :, 3:] + 64)
+    assert a._table.block_ids == (0, 2) and b._table.block_ids == (1,)
+    assert set(a._table.block_ids).isdisjoint(b._table.block_ids)
+    assert a.length == 5 and b.length == 3 and storage._pool.num_free_blocks == 0
+    for actual, expected in zip(a.get(), (keys, keys + 64)):
+        assert torch.equal(actual, expected)
+    for actual, expected in zip(b.get(), (-keys[:, :, :3], -keys[:, :, :3] - 64)):
+        assert torch.equal(actual, expected)
+    print("[PASS] 两请求共享物理张量，交错追加后块不重叠、数据互不混写")
+
+    # 总容量为 12，但其他请求占用了块；B 从 3 增至 5 需要新块，必须失败。
+    saved_key, saved_value = storage._key.clone(), storage._value.clone()
+    before = (a.length, a._table.block_ids, b.length, b._table.block_ids,
+              storage._pool._free_blocks.copy(), storage._pool._allocated.copy())
+    try:
+        b.append(-keys[:, :, 3:], -keys[:, :, 3:] - 64)
+    except RuntimeError:
+        assert (a.length, a._table.block_ids, b.length, b._table.block_ids,
+                storage._pool._free_blocks, storage._pool._allocated) == before
+        assert torch.equal(storage._key, saved_key) and torch.equal(storage._value, saved_value)
+    else:
+        raise AssertionError("共享块池耗尽时仍允许跨块追加")
+    print("[PASS] 共享池耗尽时拒绝追加，两个请求与物理数据均不变")
+
+    released = set(a._table.block_ids)
+    a.release()
+    assert a.length == 0 and a._table.block_ids == () and storage._pool.num_free_blocks == 2
+    assert all(t.shape == (1, 2, 0, 4) for t in a.get())
+    assert b.length == 3 and b._table.block_ids == (1,)
+    c = PagedKVCache(storage)
+    c.append(keys[:, :, :1] + 128, keys[:, :, :1] + 192)
+    assert set(c._table.block_ids).issubset(released) and c.length == 1
+    for actual, expected in zip(c.get(), (keys[:, :, :1] + 128, keys[:, :, :1] + 192)):
+        assert torch.equal(actual, expected)
+    a.release()  # A 的旧块已被 C 复用，重复清理 A 不能误释放 C 的块。
+    assert all(storage._pool._allocated[block] for block in c._table.block_ids)
+    b.append(-keys[:, :, 3:], -keys[:, :, 3:] - 64)
+    for actual, expected in zip(b.get(), (-keys, -keys - 64)):
+        assert torch.equal(actual, expected)
+    for actual, expected in zip(c.get(), (keys[:, :, :1] + 128, keys[:, :, :1] + 192)):
+        assert torch.equal(actual, expected)
+    assert set(b._table.block_ids).isdisjoint(c._table.block_ids)
+    b.release()
+    c.release()
+    assert storage._pool.num_free_blocks == 3 and not any(storage._pool._allocated)
+    assert b.length == c.length == 0 and b._table.block_ids == c._table.block_ids == ()
+    print("[PASS] 释放 A 后新请求复用旧块，B 可继续追加且数据隔离，最终全部块归还")
+    print("[PASS] CPU 共享分页存储生命周期自检通过；未验证并发线程、多请求模型或 GPU")
 
 
 if __name__ == "__main__":
