@@ -113,6 +113,16 @@ def decoder_layer_forward(
     # 只有缓存 Attention 的阶段不同，归一化、投影、RoPE、残差与 MLP 共用原实现。
     attention_fn = prefill_attention if is_prefill else decode_attention
     head_output = attention_fn(query, key, value, cache)
+    return finish_decoder_layer(hidden_states, head_output, layer)[1]
+
+
+def finish_decoder_layer(hidden_states: torch.Tensor, head_output: torch.Tensor, layer):
+    """共用层后半段，返回输出投影与完整层输出；不读写缓存，不进行对照。
+
+    原始隐藏状态走残差支路，不能替换成归一化后的状态。
+    同时返回投影结果仅为诊断复用已有中间量，不重复执行 GEMM。
+    """
+    attention = layer.self_attn
     # 合并所有 Query 头，再通过输出投影还原隐藏维度。
     batch, tokens, _ = hidden_states.shape
     merged = head_output.transpose(1, 2).contiguous().reshape(batch, tokens, -1)
@@ -130,7 +140,7 @@ def decoder_layer_forward(
     gated = torch.nn.functional.silu(gate) * up
     mlp_output = torch.nn.functional.linear(gated, mlp.down_proj.weight, mlp.down_proj.bias)
     # 第二次残差加回 Attention 残差后的状态，不是归一化结果或本层最初输入。
-    return after_attention + mlp_output
+    return attention_output, after_attention + mlp_output
 
 
 @torch.no_grad()
@@ -341,7 +351,7 @@ def benchmark(model, input_ids, *, repeats: int = 3) -> list[int]:
 
 @torch.inference_mode()
 def check_cuda_decode(model, input_ids) -> None:
-    """仅对照第一层的一次真实 Decode Attention；不替换正式生成路径。"""
+    """对照第一层真实 Decode Attention，并观测误差经过完整层后的变化。"""
     # 延迟导入：普通生成不因这个可选检查而依赖已编译的扩展。
     from ampere_kv import _C
 
@@ -351,6 +361,8 @@ def check_cuda_decode(model, input_ids) -> None:
     layer = model.model.layers[0]
     if layer.self_attn.sliding_window is not None:
         raise ValueError("本次对照不支持滑动窗口")
+    if config.hidden_act != "silu":
+        raise ValueError("当前 MLP 仅支持 SiLU 激活")
     tokens = input_ids.shape[1]
     # HF 完整 Prefill 只用于选出真实的首个贪心 Token；不保留第二套模型缓存。
     first_id = model(input_ids=input_ids, use_cache=False, logits_to_keep=1).logits[:, -1:].argmax(dim=-1)
@@ -397,6 +409,24 @@ def check_cuda_decode(model, input_ids) -> None:
         assert torch.isfinite(actual).all() and torch.isfinite(expected).all()
         # 暂沿用算子自检容差；失败先看诊断，不自动放宽，也不作为模型 logits 标准。
         torch.testing.assert_close(actual, expected, rtol=0.01, atol=0.002)
+        # 两条路径只替换 Attention 输出，使用同一个原始输入和同一份层权重。
+        # 共用正式层函数的后半段，避免为了检查再抄写一套残差与 MLP。
+        actual_stages = finish_decoder_layer(hidden, actual, layer)
+        reference_stages = finish_decoder_layer(hidden, expected, layer)
+        for label, result, reference in zip(("O 输出投影", "完整第一层输出"), actual_stages, reference_stages):
+            assert result.shape == reference.shape == hidden.shape
+            assert result.dtype == reference.dtype == torch.bfloat16
+            assert torch.isfinite(result).all() and torch.isfinite(reference).all()
+            # 用 FP32 统计 BF16 输出间的误差；统计精度不是模型计算精度。
+            difference = result.float() - reference.float()
+            max_error = difference.abs().max().item()
+            difference_norm = torch.linalg.vector_norm(difference).item()
+            reference_norm = torch.linalg.vector_norm(reference.float()).item()
+            # 相对 L2 = 整个差值张量的 L2 范数 / 参考张量的 L2 范数。
+            # 参考全零时不伪造一个分母，也不打印具有误导性的相对误差。
+            relative_l2 = f"{difference_norm / reference_norm:.8g}" if reference_norm != 0 else "N/A（参考全零）"
+            print(f"[观测] {label}：形状={tuple(result.shape)}，最大绝对误差={max_error:.8g}，相对 L2 误差={relative_l2}")
+        # 不把 Attention 容差直接用于整层；此处不设未经验证的整层数值阈值。
         assert cache.length == tokens + 1 and cache._table.block_ids == blocks
         assert addresses == (storage._key.data_ptr(), storage._value.data_ptr())
         after_key, after_value = cache.get()
@@ -406,7 +436,8 @@ def check_cuda_decode(model, input_ids) -> None:
         # 失败也归还本次检查占用的块；不把检查缓存交给后续生成复用。
         cache.release()
     assert storage._pool.num_free_blocks == storage._key.shape[0]
-    print("[PASS] 第一层一次真实 CUDA Decode Attention 对照与缓存检查通过；未验证输出投影、完整层、多层生成或性能")
+    print("[PASS] 第一层一次真实 CUDA Decode Attention 对照与缓存检查通过")
+    print("[观测] 输出投影与完整层误差统计完成；未设整层精度验收阈值，未验证 HF 完整层对照、多层生成或性能")
 
 
 def main() -> None:
