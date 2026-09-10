@@ -1,5 +1,7 @@
 """单层 BF16 分页共享存储与请求缓存；共享生命周期仅做 CPU 参考验证。"""
 
+import random
+
 import torch
 
 from ampere_kv.block_pool import BlockPool, BlockTable
@@ -91,6 +93,101 @@ class PagedKVCache:
     def release(self) -> None:
         """归还请求占用的块；保留物理张量，不清零旧数据，不释放底层显存。"""
         self._table.release()
+
+
+def check_random_lifecycle() -> None:
+    """固定种子的 1000 次 CPU 操作；最多四个活动请求，不测试并发线程。"""
+    seed, operations, num_blocks, block_size = 0, 1000, 5, 4
+    rng = random.Random(seed)
+    generator = torch.Generator().manual_seed(seed)
+    storage = PagedKVStorage(2, 4, num_blocks, block_size)
+    storage._key.fill_(-100)
+    storage._value.fill_(-200)
+    # 每个请求同时保存独立的连续 K/V 作为预期数据，不从被测缓存构建参考。
+    requests = {}
+    next_id = 0
+    counts = dict(create=0, append=0, release=0, rejected=0)
+    addresses = (storage._key.data_ptr(), storage._value.data_ptr())
+
+    def snapshot():
+        # 复制元数据，避免引用同一列表导致前后比较失效；仅用于失败操作检查。
+        return ([(rid, cache.length, cache._table.block_ids) for rid, (cache, _, _) in requests.items()],
+                storage._pool._free_blocks.copy(), storage._pool._allocated.copy())
+
+    for step in range(1, operations + 1):
+        action, request_id, tokens = "create", None, 0
+        try:
+            if requests:
+                # 追加权重较高，让小块池反复进入耗尽状态；不让活动请求数无限增长。
+                choices = ["append", "append", "append", "release"]
+                if len(requests) < 4:
+                    choices.append("create")
+                action = rng.choice(choices)
+            if action == "create":
+                request_id = next_id
+                next_id += 1
+                empty = torch.empty(1, 2, 0, 4, dtype=torch.bfloat16)
+                requests[request_id] = (PagedKVCache(storage), empty, empty.clone())
+                counts["create"] += 1
+            else:
+                request_id = rng.choice(list(requests))
+                cache, expected_key, expected_value = requests[request_id]
+                if action == "release":
+                    cache.release()
+                    assert cache.length == 0 and cache._table.block_ids == ()
+                    del requests[request_id]
+                    counts["release"] += 1
+                else:
+                    tokens = rng.randint(1, 7)
+                    key = torch.randint(-64, 65, (1, 2, tokens, 4), generator=generator).to(torch.bfloat16)
+                    value = torch.randint(-64, 65, (1, 2, tokens, 4), generator=generator).to(torch.bfloat16)
+                    # 用独立参考长度预测容量，不相信被测块表或空闲计数给出的结果。
+                    length = expected_key.shape[2]
+                    used = sum((k.shape[2] + block_size - 1) // block_size for _, k, _ in requests.values())
+                    needed = (length + tokens + block_size - 1) // block_size - (length + block_size - 1) // block_size
+                    before = snapshot()
+                    saved_key, saved_value = storage._key.clone(), storage._value.clone()
+                    try:
+                        cache.append(key, value)
+                    except RuntimeError:
+                        assert needed > num_blocks - used, "空间足够却拒绝追加"
+                        assert snapshot() == before, "失败追加改变了元数据"
+                        assert torch.equal(storage._key, saved_key) and torch.equal(storage._value, saved_value)
+                        counts["rejected"] += 1
+                    else:
+                        assert needed <= num_blocks - used, "空间不足却接受追加"
+                        requests[request_id] = (cache, torch.cat((expected_key, key), dim=2),
+                                               torch.cat((expected_value, value), dim=2))
+                        counts["append"] += 1
+
+            # 每步检查所有活动请求，而非只检查被操作的请求，才能发现相互污染。
+            occupied = []
+            for cache, expected_key, expected_value in requests.values():
+                assert cache.length == expected_key.shape[2]
+                assert len(cache._table.block_ids) == (cache.length + block_size - 1) // block_size
+                occupied.extend(cache._table.block_ids)
+                actual_key, actual_value = cache.get()
+                assert torch.equal(actual_key, expected_key) and torch.equal(actual_value, expected_value)
+            free = storage._pool._free_blocks
+            assert len(occupied) == len(set(occupied)), "请求占用块重复"
+            assert len(free) == len(set(free)), "空闲块重复"
+            assert set(occupied).isdisjoint(free), "已用块同时出现在空闲列表"
+            assert set(occupied) | set(free) == set(range(num_blocks)), "块丢失或出现非法编号"
+            assert storage._pool._allocated == [block in occupied for block in range(num_blocks)]
+            assert (storage._key.data_ptr(), storage._value.data_ptr()) == addresses
+        except Exception as error:
+            raise AssertionError(f"随机自检失败：种子={seed}，操作序号={step}，操作={action}，请求={request_id}，追加数={tokens}") from error
+
+    # 操作次数不等于请求数；必须实际覆盖创建、成功追加、释放和容量拒绝四类事件。
+    assert sum(counts.values()) == operations and all(count > 0 for count in counts.values()), counts
+    for cache, _, _ in requests.values():
+        cache.release()
+        assert cache.length == 0 and cache._table.block_ids == ()
+    requests.clear()
+    assert sorted(storage._pool._free_blocks) == list(range(num_blocks))
+    assert not any(storage._pool._allocated)
+    print(f"[PASS] 随机生命周期：种子={seed}，操作={operations}，创建请求={counts['create']}，成功追加={counts['append']}，释放={counts['release']}，容量拒绝={counts['rejected']}")
+    print("[PASS] 每步数据与块归属检查通过，收尾全部块归还；不代表所有序列、并发线程或 GPU 验证通过")
 
 
 def main() -> None:
@@ -312,6 +409,7 @@ def main() -> None:
     assert b.length == c.length == 0 and b._table.block_ids == c._table.block_ids == ()
     print("[PASS] 释放 A 后新请求复用旧块，B 可继续追加且数据隔离，最终全部块归还")
     print("[PASS] CPU 共享分页存储生命周期自检通过；未验证并发线程、多请求模型或 GPU")
+    check_random_lifecycle()
 
 
 if __name__ == "__main__":
