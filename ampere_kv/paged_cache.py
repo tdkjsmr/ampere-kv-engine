@@ -1,11 +1,11 @@
-"""单请求、单层 BF16 分页 K/V 与等头数 Decode 参考；尚未接入完整模型。"""
+"""单请求、单层 BF16 分页 K/V 与 Prefill/Decode 参考；尚未接入完整模型。"""
 
 import torch
 
 from ampere_kv.block_pool import BlockPool, BlockTable
 # 复用同一套检查、缓存追加、GQA 头映射和 SDPA 计算，不另写分页包装。
 # 分页 get() 会复制历史；这是参考路径，不是直接读取物理块的 CUDA 内核。
-from ampere_kv.kv_cache import decode_attention
+from ampere_kv.kv_cache import decode_attention, prefill_attention
 
 
 class PagedKVCache:
@@ -151,7 +151,7 @@ def main() -> None:
     print("[PASS] 释放后可复用物理存储，读回不包含旧请求历史")
     print("[PASS] CPU 单层 BF16 分页 K/V 存储自检通过；未验证 Attention、多请求、模型或 GPU")
 
-    # 等头数与 GQA 共用一个场景：历史 4 个 Token，Decode 跨块追加第 5 个。
+    # 等头数与 GQA 共用一个场景：Prefill 4 个 Token，Decode 跨块追加第 5 个。
     for label, mapping in (("等头数", [0, 1]), ("GQA", [0, 0, 1, 1])):
         cache = PagedKVCache(num_kv_heads=2, head_dim=4, num_blocks=3, block_size=4)
         cache._key.fill_(-100)
@@ -163,6 +163,11 @@ def main() -> None:
         query = torch.randn(1, len(mapping), 1, 4, generator=generator).to(torch.bfloat16)
         keys = torch.randn(1, 2, 5, 4, generator=generator).to(torch.bfloat16)
         values = torch.randn(1, 2, 5, 4, generator=generator).to(torch.bfloat16)
+        prefix_query = torch.randn(1, len(mapping), 4, 4, generator=generator).to(torch.bfloat16)
+        # 两阶段对照都从原始 K/V 显式选头，不读缓存、不复用 repeat_interleave。
+        head_indices = torch.tensor(mapping, dtype=torch.long)
+        reference_key = keys.index_select(1, head_indices)
+        reference_value = values.index_select(1, head_indices)
         # 合并后仍须拒绝空历史 Decode，且不能偷偷写入当前 K/V。
         try:
             decode_attention(query, keys[:, :, :1], values[:, :, :1], cache)
@@ -172,11 +177,35 @@ def main() -> None:
             assert (cache._key == -100).all() and (cache._value == -200).all()
         else:
             raise AssertionError("空历史 Decode 未被拒绝")
-        cache.append(keys[:, :, :4], values[:, :, :4])
         addresses = (cache._key.data_ptr(), cache._value.data_ptr())
+        # 共用 Prefill 自己负责写入 K/V，不能在调用前再 append 一次。
+        prefix_output = prefill_attention(prefix_query, keys[:, :, :4], values[:, :, :4], cache)
+        expected_prefix = torch.nn.functional.scaled_dot_product_attention(
+            prefix_query.contiguous(), reference_key[:, :, :4].contiguous(),
+            reference_value[:, :, :4].contiguous(), dropout_p=0.0, is_causal=True,
+            scale=prefix_query.shape[-1] ** -0.5,
+        )
+        assert prefix_output.shape == (1, len(mapping), 4, 4)
+        assert prefix_output.dtype == torch.bfloat16 and torch.isfinite(prefix_output).all()
+        torch.testing.assert_close(prefix_output, expected_prefix, rtol=0, atol=0)
+        assert cache.length == 4 and cache._table.block_ids == (2,)
+        actual_key, actual_value = cache.get()
+        assert torch.equal(actual_key, keys[:, :, :4]) and torch.equal(actual_value, values[:, :, :4])
+        assert (cache._key.data_ptr(), cache._value.data_ptr()) == addresses
+        print(f"[PASS] {label} BF16 Prefill：因果输出完全一致，长度=4，块表=(2,)")
         before = (cache.length, cache._table.block_ids, cache._pool._free_blocks.copy(),
                   cache._pool._allocated.copy())
         saved_key, saved_value = cache._key.clone(), cache._value.clone()
+        # 当前 Prefill 只允许空缓存；拒绝后必须保留刚写入的全部数据和元数据。
+        try:
+            prefill_attention(prefix_query, keys[:, :, :4], values[:, :, :4], cache)
+        except ValueError:
+            assert (cache.length, cache._table.block_ids, cache._pool._free_blocks,
+                    cache._pool._allocated) == before
+            assert torch.equal(cache._key, saved_key) and torch.equal(cache._value, saved_value)
+        else:
+            raise AssertionError("非空分页缓存接受了重复 Prefill")
+        print(f"[PASS] {label}：非空缓存 Prefill 被拒绝，分页数据与元数据不变")
         # 非法头数和精度都必须在写入当前 Token 之前拒绝，保留全部原始状态。
         for invalid_query in (query[:, :1], query[:, :1].expand(1, 3, 1, 4), query.float()):
             try:
@@ -189,10 +218,7 @@ def main() -> None:
                 raise AssertionError("非法 Query 未在写入前被拒绝")
         print(f"[PASS] {label}：非法 Decode Query 被拒绝，分页数据与元数据不变")
         actual = decode_attention(query, keys[:, :, 4:], values[:, :, 4:], cache)
-        # 显式索引原始 KV 头，不复用被测路径的 repeat_interleave；不读取缓存。
-        head_indices = torch.tensor(mapping, dtype=torch.long)
-        reference_key = keys.index_select(1, head_indices)
-        reference_value = values.index_select(1, head_indices)
+        # 最后一个 Query 可见全部 5 个有效 K/V，与 Prefill 的因果设置不同。
         expected = torch.nn.functional.scaled_dot_product_attention(
             query.contiguous(), reference_key.contiguous(), reference_value.contiguous(),
             dropout_p=0.0, is_causal=False, scale=query.shape[-1] ** -0.5,
@@ -211,7 +237,7 @@ def main() -> None:
         cache.release()
         assert cache.length == 0 and cache._pool.num_free_blocks == 3
         assert not any(cache._pool._allocated)
-    print("[PASS] CPU 分页等头数/GQA Decode 自检通过；未验证原生分页内核、多请求、模型或 GPU")
+    print("[PASS] CPU 分页等头数/GQA Prefill + Decode 自检通过；未验证原生分页内核、多请求、模型或 GPU")
 
 
 if __name__ == "__main__":

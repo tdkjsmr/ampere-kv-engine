@@ -53,10 +53,11 @@ class ContiguousKVCache:
 
 
 def prefill_attention(
-    query: torch.Tensor, key: torch.Tensor, value: torch.Tensor, cache: ContiguousKVCache,
+    query: torch.Tensor, key: torch.Tensor, value: torch.Tensor, cache,
 ) -> torch.Tensor:
     """仅向空缓存写入整段 BF16 K/V，返回全部输入位置的 BF16 因果 Attention 输出。
 
+    接受提供 length、append、get 的连续或分页缓存，不另写存储专用包装。
     不支持分块 Prefill 或填充输入；追加后若计算失败，不自动回滚缓存。
     """
     return _cached_attention(query, key, value, cache, is_causal=True)
