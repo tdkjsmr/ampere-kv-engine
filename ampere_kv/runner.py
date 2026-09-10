@@ -8,10 +8,13 @@ import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from ampere_kv.kv_cache import ContiguousKVCache, prefill_attention, decode_attention
+from ampere_kv.paged_cache import PagedKVCache
 from ampere_kv.reference import MODEL_ID, MODEL_REVISION
 
 # 本轮最多生成 32 个新 Token，包含 Prefill 选出的第一个；遇到 EOS 提前结束。
 MAX_NEW_TOKENS = 32
+# 分页参考先固定块大小，不在本轮引入调优参数。
+PAGED_BLOCK_SIZE = 16
 
 
 def rms_norm(hidden_states: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.Tensor:
@@ -79,7 +82,7 @@ def apply_rope(query: torch.Tensor, key: torch.Tensor, position_ids: torch.Tenso
 @torch.no_grad()
 def decoder_layer_forward(
     hidden_states: torch.Tensor, layer, position_ids: torch.Tensor,
-    cache: ContiguousKVCache, config, *, is_prefill: bool,
+    cache: ContiguousKVCache | PagedKVCache, config, *, is_prefill: bool,
 ) -> torch.Tensor:
     """执行单请求、无填充的整段 Prefill 或单 Token Decode，返回本次隐藏状态。
 
@@ -156,13 +159,18 @@ def model_forward(model, input_ids, position_ids, caches, *, is_prefill: bool):
 
 
 @torch.inference_mode()
-def generate_tokens(model, input_ids, *, max_new_tokens: int = MAX_NEW_TOKENS, verify: bool = False, timings: dict | None = None) -> list[int]:
+def generate_tokens(model, input_ids, *, max_new_tokens: int = MAX_NEW_TOKENS, verify: bool = False, timings: dict | None = None, cache_kind: str = "contiguous") -> list[int]:
     """返回新 Token IDs；每次请求创建独立缓存，不向调用方保留 GPU 张量。
 
     两种模式共用自建前向和循环；verify 只额外执行 HF 参考和诊断。
     纯生成不调用 HF forward、不创建 HF 缓存、不逐步打印，仍保留必要输入检查。
     timings 非空时写入请求级墙钟指标；不允许同时开启 HF 对照。
+    两种存储共用生成循环；分页每层独占块池，尚非多请求共享池。
     """
+    if cache_kind not in ("contiguous", "paged"):
+        raise ValueError("缓存类型必须是 contiguous 或 paged")
+    if timings is not None and cache_kind == "paged":
+        raise ValueError("分页参考暂不支持性能测量")
     if timings is not None and verify:
         raise ValueError("计时不能包含 HF 对照，请使用纯生成路径")
     if max_new_tokens <= 0:
@@ -179,13 +187,22 @@ def generate_tokens(model, input_ids, *, max_new_tokens: int = MAX_NEW_TOKENS, v
         torch.cuda.synchronize(input_ids.device)
         started = time.perf_counter()
     # 请求计时包含缓存分配，不是仅测某个 CUDA 内核。
-    caches = [
-        ContiguousKVCache(
-            model.config.num_key_value_heads, model.config.head_dim,
-            capacity=tokens + max_new_tokens, device=input_ids.device,
-        )
-        for _ in model.model.layers
-    ]
+    capacity = tokens + max_new_tokens
+    caches = []
+    for _ in model.model.layers:
+        if cache_kind == "paged":
+            # 整块向上取整；仅选择存储实现，不复制前向或生成循环。
+            cache = PagedKVCache(
+                model.config.num_key_value_heads, model.config.head_dim,
+                num_blocks=(capacity + PAGED_BLOCK_SIZE - 1) // PAGED_BLOCK_SIZE,
+                block_size=PAGED_BLOCK_SIZE, device=input_ids.device,
+            )
+        else:
+            cache = ContiguousKVCache(
+                model.config.num_key_value_heads, model.config.head_dim,
+                capacity=capacity, device=input_ids.device,
+            )
+        caches.append(cache)
     eos_ids = model.generation_config.eos_token_id
     eos_ids = [eos_ids] if isinstance(eos_ids, int) else (eos_ids or [])
     generated_ids = []
@@ -196,6 +213,7 @@ def generate_tokens(model, input_ids, *, max_new_tokens: int = MAX_NEW_TOKENS, v
         reference_input, reference_cache, reference_ids = input_ids, None, []
         addresses = [tensor.data_ptr() for cache in caches for tensor in (cache._key, cache._value)]
         assert len(set(addresses)) == 2 * len(caches)
+        print(f"缓存={cache_kind}，预留长度={capacity}，每层物理容量={caches[0].capacity}")
 
     for step in range(max_new_tokens):
         # 首轮处理整段输入，后续只处理一个 Token；绝对位置从历史有效长度继续。
@@ -229,7 +247,16 @@ def generate_tokens(model, input_ids, *, max_new_tokens: int = MAX_NEW_TOKENS, v
                 key, value = cache.get()
                 assert key.shape == value.shape == (1, model.config.num_key_value_heads, used_tokens, model.config.head_dim)
                 assert key.dtype == value.dtype == torch.bfloat16
-            assert addresses == [tensor.data_ptr() for cache in caches for tensor in cache.get()]
+                if cache_kind == "paged":
+                    # 检查实际占用块数，而不是误把整块容量等同于有效长度。
+                    blocks = cache._table.block_ids
+                    expected_blocks = (used_tokens + PAGED_BLOCK_SIZE - 1) // PAGED_BLOCK_SIZE
+                    assert len(blocks) == len(set(blocks)) == expected_blocks
+                    assert cache.capacity == ((capacity + PAGED_BLOCK_SIZE - 1) // PAGED_BLOCK_SIZE) * PAGED_BLOCK_SIZE
+                    assert cache._pool.num_free_blocks + len(blocks) == cache.capacity // PAGED_BLOCK_SIZE
+                    assert all(cache._pool._allocated[block] for block in blocks)
+            # 分页 get() 会产生副本；这里只比较底层存储地址，两种缓存均适用。
+            assert addresses == [tensor.data_ptr() for cache in caches for tensor in (cache._key, cache._value)]
             print(f"[PASS] 第 {step + 1} 个 Token、logits 与缓存检查通过：ID={next_id}")
 
         # 先判断停止，再准备下一次输入；最终 Token（包括 EOS）不再写入 KV。
@@ -245,6 +272,20 @@ def generate_tokens(model, input_ids, *, max_new_tokens: int = MAX_NEW_TOKENS, v
         assert all(cache.length == used_tokens for cache in caches)
         print(f"reference_token_ids = {reference_ids}")
         print("[PASS] 本次逐步 logits、完整 Token 序列与缓存检查通过；不代表性能验证通过")
+        if cache_kind == "paged":
+            crossed = (used_tokens - 1) // PAGED_BLOCK_SIZE > (tokens - 1) // PAGED_BLOCK_SIZE
+            print(f"分页块大小={PAGED_BLOCK_SIZE}，Prefill 长度={tokens}，最终 KV 长度={used_tokens}，Decode 跨块={crossed}")
+            if not crossed:
+                print("[未覆盖] 本次 Decode 未跨块，需换输入补验；不能据此宣称跨块生成验证通过")
+    if cache_kind == "paged":
+        for cache in caches:
+            cache.release()
+            if verify:
+                assert cache.length == 0 and cache._table.block_ids == ()
+                assert cache._pool.num_free_blocks == cache.capacity // PAGED_BLOCK_SIZE
+                assert not any(cache._pool._allocated)
+        if verify:
+            print("[PASS] 全部层分页块已归还；底层张量随本次函数退出释放引用，不代表长期无泄漏")
     if timings is not None:
         # 终点为最后一个 Token ID 可用；不包含文本解码、打印和函数退出时的缓存释放。
         total = token_ready - started
@@ -303,9 +344,12 @@ def main() -> None:
     # 默认保留对照行为；纯生成须显式选择，避免把输出文本误认为验证通过。
     parser.add_argument("--mode", choices=("check", "generate", "benchmark"), default="check", help="check：HF 对照；generate：纯生成；benchmark：纯生成基线")
     parser.add_argument("--repeats", type=int, default=3, help="benchmark 模式测量次数，默认 3，另有 1 次预热")
+    parser.add_argument("--cache", choices=("contiguous", "paged"), default="contiguous", help="默认连续缓存；paged 为每块 16 Token 的分页参考")
     args = parser.parse_args()
     if args.repeats < 1:
         parser.error("--repeats 必须为正数")
+    if args.mode == "benchmark" and args.cache == "paged":
+        parser.error("分页参考暂不支持 benchmark；请使用 check 或 generate")
     if not torch.cuda.is_available():
         raise RuntimeError("模型生成需要在云端 CUDA 环境运行")
     text = input("请输入一段文本：")
@@ -318,7 +362,7 @@ def main() -> None:
         tokenize=False, add_generation_prompt=True, enable_thinking=False,
     )
     input_ids = tokenizer(formatted_text, add_special_tokens=False, return_tensors="pt")["input_ids"].to("cuda")
-    print(f"正在从本地缓存加载固定版本 Qwen3-8B，模式={args.mode}……")
+    print(f"正在从本地缓存加载固定版本 Qwen3-8B，模式={args.mode}，缓存={args.cache}……")
     model = AutoModelForCausalLM.from_pretrained(
         MODEL_ID, revision=MODEL_REVISION, torch_dtype=torch.bfloat16,
         attn_implementation="sdpa", local_files_only=True,
@@ -327,7 +371,7 @@ def main() -> None:
     if args.mode == "benchmark":
         generated_ids = benchmark(model, input_ids, repeats=args.repeats)
     else:
-        generated_ids = generate_tokens(model, input_ids, verify=(args.mode == "check"))
+        generated_ids = generate_tokens(model, input_ids, verify=(args.mode == "check"), cache_kind=args.cache)
     eos_ids = model.generation_config.eos_token_id
     eos_ids = [eos_ids] if isinstance(eos_ids, int) else (eos_ids or [])
     reason = "EOS" if generated_ids[-1] in eos_ids else "达到新 Token 上限"

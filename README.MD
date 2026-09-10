@@ -15,7 +15,9 @@ AmpereKV Engine 是面向 NVIDIA Ampere `sm_86` 的最小单卡推理引擎。
 各次请求结束后的活跃张量显存均回到预热基线。
 这些结果仅覆盖本次输入与环境，不代表多输入回归、生成上限分支或长期无泄漏验证，
 也没有与其他框架比较的性能收益结论；G2 尚未完成全部验收。
-Paged KV、核心 Paged Decode CUDA 算子、INT8 KV 与融合反量化仍是后续工作。
+单层分页 BF16 存储及等头数/GQA Prefill、Decode 已通过 CPU 小张量自检。
+Runner 新增分页参考选择，尚待真实模型 GPU 验证；默认仍使用连续缓存。
+多请求共享块池、核心 Paged Decode CUDA 算子、INT8 KV 与融合反量化仍是后续工作。
 
 ## 运行
 
@@ -32,7 +34,13 @@ python -m ampere_kv.runner --mode generate
 
 # 基础测量：先预热 1 次，再对同一输入测量 3 次；可调整重复次数。
 python -m ampere_kv.runner --mode benchmark --repeats 3
+
+# 分页参考对照：固定每块 16 Token；待 GPU 验证，不支持 benchmark。
+python -m ampere_kv.runner --mode check --cache paged
 ```
+
+分页也可配合 `--mode generate`；其读回会复制历史，不代表高性能分页内核。
+分页 check 会报告 Decode 是否跨块，未覆盖时应更换输入补验；每层目前独占块池。
 
 先使用相同输入确认 check 通过、generate 的完整 Token ID 列表一致，再测量。
 benchmark 检查重复输出是否一致，但不能代替 HF 正确性对照。

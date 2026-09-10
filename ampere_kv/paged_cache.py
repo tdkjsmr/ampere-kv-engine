@@ -29,6 +29,11 @@ class PagedKVCache:
         self._value = torch.empty(shape, dtype=torch.bfloat16, device=device)
 
     @property
+    def capacity(self) -> int:
+        """返回整块物理空间可容纳的 Token 数，可能大于请求预留的长度。"""
+        return self._key.shape[0] * self._key.shape[2]
+
+    @property
     def length(self) -> int:
         """返回有效 Token 数；仅在 append 正常完成后才保证对应数据完整。"""
         return self._table.length
