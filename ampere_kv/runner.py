@@ -82,15 +82,18 @@ def apply_rope(query: torch.Tensor, key: torch.Tensor, position_ids: torch.Tenso
 @torch.no_grad()
 def decoder_layer_forward(
     hidden_states: torch.Tensor, layer, position_ids: torch.Tensor,
-    cache: ContiguousKVCache | PagedKVCache, config, *, is_prefill: bool,
+    cache: ContiguousKVCache | PagedKVCache, config, *, is_prefill: bool, cuda_decode: bool = False,
 ) -> torch.Tensor:
     """执行单请求、无填充的整段 Prefill 或单 Token Decode，返回本次隐藏状态。
 
     调用方提供该层专用缓存并显式选择阶段；写入 RoPE 后的 K 和未旋转的 V。
     不加载模型、不打印结果、不调用 HF 层的 forward，也不进行参考对照。
     不支持分块 Prefill；缓存写入后若计算失败，不自动回滚。
+    cuda_decode 仅用于可选对照，默认仍走 SDPA；当前 CUDA 分支不支持 Graph。
     """
     attention = layer.self_attn
+    if cuda_decode and (is_prefill or not isinstance(cache, PagedKVCache)):
+        raise ValueError("CUDA Decode 只接受分页缓存的单 Token Decode")
     # 在写入前拒绝不支持的配置，避免用普通 Attention 或 SiLU 静默代替其他结构。
     if attention.sliding_window is not None:
         raise ValueError("当前层计算不支持滑动窗口")
@@ -111,8 +114,17 @@ def decoder_layer_forward(
     query, key, value = project_qkv(normalized, attention)
     query, key = apply_rope(query, key, position_ids, config)
     # 只有缓存 Attention 的阶段不同，归一化、投影、RoPE、残差与 MLP 共用原实现。
-    attention_fn = prefill_attention if is_prefill else decode_attention
-    head_output = attention_fn(query, key, value, cache)
+    if cuda_decode:
+        # 可选后端仅由 cuda-check 开启；普通生成不导入扩展。
+        from ampere_kv import _C
+
+        # 单 Token K/V 只追加一次；CUDA 直接读物理存储，不调用 get 或复制 GQA 头。
+        cache.append(key, value)
+        table = torch.tensor(cache._table.block_ids, dtype=torch.long, device=query.device)
+        head_output = _C.paged_decode(query.contiguous(), cache._key, cache._value, table, cache.length)
+    else:
+        attention_fn = prefill_attention if is_prefill else decode_attention
+        head_output = attention_fn(query, key, value, cache)
     return finish_decoder_layer(hidden_states, head_output, layer)[1]
 
 
@@ -144,7 +156,7 @@ def finish_decoder_layer(hidden_states: torch.Tensor, head_output: torch.Tensor,
 
 
 @torch.no_grad()
-def model_forward(model, input_ids, position_ids, caches, *, is_prefill: bool):
+def model_forward(model, input_ids, position_ids, caches, *, is_prefill: bool, cuda_decode: bool = False):
     """自建模型级前向：返回本次最后一个位置的 logits，并更新各层缓存。
 
     只读取 HF 对象持有的权重，不调用 HF 模型、层或输出头的 forward。
@@ -153,6 +165,12 @@ def model_forward(model, input_ids, position_ids, caches, *, is_prefill: bool):
     layers = model.model.layers
     if len(caches) != len(layers):
         raise ValueError("缓存数量必须与模型层数一致")
+    if cuda_decode:
+        # 全部层写入前拒绝不支持的后端配置；后续 GPU 故障仍不提供事务回滚。
+        if is_prefill or model.config.head_dim != 128 or any(
+            not isinstance(cache, PagedKVCache) or cache._key.shape[2] != 16 for cache in caches
+        ):
+            raise ValueError("CUDA V0 仅支持分页 Decode、块大小 16、每头 128 维")
     # 写入前检查全部层的长度和容量，避免后面某层才发现容量不足。
     used_tokens = caches[0].length
     if any(cache.length != used_tokens or used_tokens + input_ids.shape[1] > cache.capacity for cache in caches):
@@ -160,7 +178,7 @@ def model_forward(model, input_ids, position_ids, caches, *, is_prefill: bool):
     hidden_states = model.model.embed_tokens.weight[input_ids]
     for layer, cache in zip(layers, caches):
         hidden_states = decoder_layer_forward(
-            hidden_states, layer, position_ids, cache, model.config, is_prefill=is_prefill,
+            hidden_states, layer, position_ids, cache, model.config, is_prefill=is_prefill, cuda_decode=cuda_decode,
         )
     # Prefill 和 Decode 共用末尾归一化与输出投影，不另写一套生成计算。
     norm = model.model.norm
@@ -351,100 +369,86 @@ def benchmark(model, input_ids, *, repeats: int = 3) -> list[int]:
 
 @torch.inference_mode()
 def check_cuda_decode(model, input_ids) -> None:
-    """对照第一层真实 Decode Attention，并观测误差经过完整层后的变化。"""
-    # 延迟导入：普通生成不因这个可选检查而依赖已编译的扩展。
-    from ampere_kv import _C
-
+    """两套独立分页缓存：SDPA Prefill 后只做一次全层 Decode，不连续生成。"""
     config = model.config
-    if config.head_dim != 128:
-        raise ValueError("CUDA V0 只支持每头 128 维")
-    layer = model.model.layers[0]
-    if layer.self_attn.sliding_window is not None:
-        raise ValueError("本次对照不支持滑动窗口")
-    if config.hidden_act != "silu":
-        raise ValueError("当前 MLP 仅支持 SiLU 激活")
+    if config.head_dim != 128 or PAGED_BLOCK_SIZE != 16:
+        raise ValueError("CUDA V0 只支持每头 128 维和块大小 16")
     tokens = input_ids.shape[1]
-    # HF 完整 Prefill 只用于选出真实的首个贪心 Token；不保留第二套模型缓存。
-    first_id = model(input_ids=input_ids, use_cache=False, logits_to_keep=1).logits[:, -1:].argmax(dim=-1)
-    norm = layer.input_layernorm
-    hidden = model.model.embed_tokens.weight[input_ids]
-    query, key, value = project_qkv(rms_norm(hidden, norm.weight, norm.variance_epsilon), layer.self_attn)
-    positions = torch.arange(tokens, device=input_ids.device).unsqueeze(0)
-    query, key = apply_rope(query, key, positions, config)
-    storage = PagedKVStorage(
-        config.num_key_value_heads, config.head_dim,
-        num_blocks=(tokens + 1 + PAGED_BLOCK_SIZE - 1) // PAGED_BLOCK_SIZE,
-        block_size=PAGED_BLOCK_SIZE, device=input_ids.device,
-    )
-    cache = PagedKVCache(storage)
-    addresses = (storage._key.data_ptr(), storage._value.data_ptr())
+    num_blocks = (tokens + 1 + PAGED_BLOCK_SIZE - 1) // PAGED_BLOCK_SIZE
+    # 两条路径共享只读权重，但不共享缓存张量或请求元数据。
+    actual_caches, reference_caches = [], []
     try:
-        # Prefill 沿用原来的分页写入与 SDPA；第一层输入只依赖 Embedding。
-        prefill_attention(query, key, value, cache)
-        assert cache.length == tokens
-        hidden = model.model.embed_tokens.weight[first_id]
-        query, new_key, new_value = project_qkv(rms_norm(hidden, norm.weight, norm.variance_epsilon), layer.self_attn)
-        positions = torch.tensor([[tokens]], device=input_ids.device)
-        query, new_key = apply_rope(query, new_key, positions, config)
-        # 只追加这一次。下面两条计算路径都只读，不调用会再次追加的 Decode 包装。
-        cache.append(new_key, new_value)
-        assert cache.length == tokens + 1
-        cached_key, cached_value = cache.get()
-        torch.testing.assert_close(cached_key, torch.cat((key, new_key), dim=2), rtol=0, atol=0)
-        torch.testing.assert_close(cached_value, torch.cat((value, new_value), dim=2), rtol=0, atol=0)
-        blocks = cache._table.block_ids
-        assert len(blocks) == len(set(blocks)) == (tokens + 1 + PAGED_BLOCK_SIZE - 1) // PAGED_BLOCK_SIZE
-        table = torch.tensor(blocks, dtype=torch.long, device=input_ids.device)
-        actual = _C.paged_decode(query.contiguous(), storage._key, storage._value, table, cache.length)
-        group = query.shape[1] // cached_key.shape[1]
-        expected = torch.nn.functional.scaled_dot_product_attention(
-            query.contiguous(), cached_key.repeat_interleave(group, dim=1).contiguous(),
-            cached_value.repeat_interleave(group, dim=1).contiguous(),
-            dropout_p=0.0, is_causal=False, scale=config.head_dim ** -0.5,
-        )
-        error = (actual.float() - expected.float()).abs().max().item()
-        print(f"[诊断] 第一层真实 Decode：Token ID={first_id.item()}，位置={tokens}，输出形状={tuple(actual.shape)}")
-        print(f"[诊断] KV 长度={cache.length}，块表={blocks}，CUDA / SDPA 最大绝对误差={error:.8g}，rtol=0.01，atol=0.002")
-        assert actual.shape == expected.shape and actual.dtype == expected.dtype == torch.bfloat16
-        assert torch.isfinite(actual).all() and torch.isfinite(expected).all()
-        # 暂沿用算子自检容差；失败先看诊断，不自动放宽，也不作为模型 logits 标准。
-        torch.testing.assert_close(actual, expected, rtol=0.01, atol=0.002)
-        # 两条路径只替换 Attention 输出，使用同一个原始输入和同一份层权重。
-        # 共用正式层函数的后半段，避免为了检查再抄写一套残差与 MLP。
-        actual_stages = finish_decoder_layer(hidden, actual, layer)
-        reference_stages = finish_decoder_layer(hidden, expected, layer)
-        for label, result, reference in zip(("O 输出投影", "完整第一层输出"), actual_stages, reference_stages):
-            assert result.shape == reference.shape == hidden.shape
-            assert result.dtype == reference.dtype == torch.bfloat16
-            assert torch.isfinite(result).all() and torch.isfinite(reference).all()
-            # 用 FP32 统计 BF16 输出间的误差；统计精度不是模型计算精度。
-            difference = result.float() - reference.float()
-            max_error = difference.abs().max().item()
-            difference_norm = torch.linalg.vector_norm(difference).item()
-            reference_norm = torch.linalg.vector_norm(reference.float()).item()
-            # 相对 L2 = 整个差值张量的 L2 范数 / 参考张量的 L2 范数。
-            # 参考全零时不伪造一个分母，也不打印具有误导性的相对误差。
-            relative_l2 = f"{difference_norm / reference_norm:.8g}" if reference_norm != 0 else "N/A（参考全零）"
-            print(f"[观测] {label}：形状={tuple(result.shape)}，最大绝对误差={max_error:.8g}，相对 L2 误差={relative_l2}")
-        # 不把 Attention 容差直接用于整层；此处不设未经验证的整层数值阈值。
-        assert cache.length == tokens + 1 and cache._table.block_ids == blocks
-        assert addresses == (storage._key.data_ptr(), storage._value.data_ptr())
-        after_key, after_value = cache.get()
-        torch.testing.assert_close(after_key, cached_key, rtol=0, atol=0)
-        torch.testing.assert_close(after_value, cached_value, rtol=0, atol=0)
+        for caches in (actual_caches, reference_caches):
+            for _ in model.model.layers:
+                caches.append(PagedKVCache(PagedKVStorage(
+                    config.num_key_value_heads, config.head_dim, num_blocks,
+                    PAGED_BLOCK_SIZE, device=input_ids.device,
+                )))
+        all_caches = actual_caches + reference_caches
+        addresses = [tensor.data_ptr() for cache in all_caches for tensor in (cache._key, cache._value)]
+        assert len(set(addresses)) == len(addresses)
+        current_input = input_ids
+        for step in range(2):
+            is_prefill = step == 0
+            positions = torch.arange(tokens, device=input_ids.device).unsqueeze(0) if is_prefill else torch.tensor([[tokens]], device=input_ids.device)
+            # 各自完整走一遍模型，上一层自己的输出直接进入下一层，不能换回参考状态。
+            actual = model_forward(model, current_input, positions, actual_caches, is_prefill=is_prefill, cuda_decode=not is_prefill)
+            reference = model_forward(model, current_input, positions, reference_caches, is_prefill=is_prefill)
+            assert actual.shape == reference.shape == (1, 1, config.vocab_size)
+            assert actual.dtype == reference.dtype == torch.bfloat16
+            assert torch.isfinite(actual).all() and torch.isfinite(reference).all()
+            used = tokens + step
+            for cache in all_caches:
+                blocks = cache._table.block_ids
+                assert cache.length == used
+                assert len(blocks) == len(set(blocks)) == (used + PAGED_BLOCK_SIZE - 1) // PAGED_BLOCK_SIZE
+                assert all(cache._pool._allocated[block] for block in blocks)
+                assert cache._pool.num_free_blocks + len(blocks) == num_blocks
+                key, value = cache.get()
+                assert key.shape == value.shape == (1, config.num_key_value_heads, used, config.head_dim)
+                assert key.dtype == value.dtype == torch.bfloat16
+                assert torch.isfinite(key).all() and torch.isfinite(value).all()
+            assert addresses == [tensor.data_ptr() for cache in all_caches for tensor in (cache._key, cache._value)]
+            actual_id, reference_id = actual.argmax(dim=-1).item(), reference.argmax(dim=-1).item()
+            if is_prefill:
+                # 起点必须相同，防止把 Prefill 的差异误归因于 CUDA Decode。
+                torch.testing.assert_close(actual, reference, rtol=0, atol=0)
+                for left, right in zip(actual_caches, reference_caches):
+                    for left_tensor, right_tensor in zip(left.get(), right.get()):
+                        torch.testing.assert_close(left_tensor, right_tensor, rtol=0, atol=0)
+                print(f"[PASS] 两套 SDPA Prefill logits 与全部层有效 K/V 完全一致：首个 Token={actual_id}，KV 长度={used}")
+                eos_ids = model.generation_config.eos_token_id
+                eos_ids = [eos_ids] if isinstance(eos_ids, int) else (eos_ids or [])
+                if actual_id in eos_ids:
+                    print("[未覆盖] 首个 Token 为 EOS，不强行追加 EOS 做 Decode；请换一个输入")
+                    return
+                current_input = torch.tensor([[actual_id]], dtype=torch.long, device=input_ids.device)
+            else:
+                # BF16 logits 的差值转 FP32 统计；不直接套用 Attention 算子的容差。
+                difference = actual.float() - reference.float()
+                reference_norm = torch.linalg.vector_norm(reference.float()).item()
+                relative_l2 = f"{torch.linalg.vector_norm(difference).item() / reference_norm:.8g}" if reference_norm != 0 else "N/A（参考全零）"
+                print(f"[观测] 全部 {len(actual_caches)} 层一次 Decode logits：最大绝对误差={difference.abs().max().item():.8g}，相对 L2 误差={relative_l2}")
+                print(f"[诊断] 第二个 Token：CUDA={actual_id}，SDPA={reference_id}；全部层 KV 长度={used}，存储地址不变")
+                print(f"[诊断] 本次 Decode 跨块={tokens // PAGED_BLOCK_SIZE != (tokens - 1) // PAGED_BLOCK_SIZE}")
+                # 选词不一致时明确失败，但一致也不意味着整个 logits 向量通过精度验收。
+                assert actual_id == reference_id, "第二个贪心 Token 不一致，请保留上述 logits 误差诊断"
     finally:
-        # 失败也归还本次检查占用的块；不把检查缓存交给后续生成复用。
-        cache.release()
-    assert storage._pool.num_free_blocks == storage._key.shape[0]
-    print("[PASS] 第一层一次真实 CUDA Decode Attention 对照与缓存检查通过")
-    print("[观测] 输出投影与完整层误差统计完成；未设整层精度验收阈值，未验证 HF 完整层对照、多层生成或性能")
+        # 成功、断言失败或首个 Token 为 EOS，都归还已经建立的两套缓存。
+        for cache in actual_caches + reference_caches:
+            cache.release()
+            assert cache.length == 0 and cache._table.block_ids == ()
+            assert cache._pool.num_free_blocks == num_blocks and not any(cache._pool._allocated)
+        print("[PASS] 本次两套分页缓存的全部块已归还；不代表长期无泄漏")
+    print("[PASS] 全层一次 CUDA Decode 的第二个 Token 与自建 SDPA 参考一致，缓存检查通过")
+    print("[观测] 未设完整 logits 精度阈值；未验证本入口的独立 HF 对照、连续生成、多输入或性能")
 
 
 def main() -> None:
     """加载与分词只做一次；选择对照或纯生成模式，最后统一展示结果。"""
     parser = argparse.ArgumentParser(description="Qwen3 自建 BF16 生成与正确性对照")
     # 默认保留对照行为；纯生成须显式选择，避免把输出文本误认为验证通过。
-    parser.add_argument("--mode", choices=("check", "generate", "benchmark", "cuda-check"), default="check", help="check：HF 对照；generate：纯生成；benchmark：纯生成基线；cuda-check：第一层 CUDA Decode 对照")
+    parser.add_argument("--mode", choices=("check", "generate", "benchmark", "cuda-check"), default="check", help="check：HF 对照；generate：纯生成；benchmark：纯生成基线；cuda-check：全层一次 CUDA Decode 对照")
     parser.add_argument("--repeats", type=int, default=3, help="benchmark 模式测量次数，默认 3，另有 1 次预热")
     parser.add_argument("--cache", choices=("contiguous", "paged"), default="contiguous", help="默认连续缓存；paged 为每块 16 Token 的分页参考")
     args = parser.parse_args()
@@ -474,7 +478,7 @@ def main() -> None:
     model.eval()
     if args.mode == "cuda-check":
         check_cuda_decode(model, input_ids)
-        return  # 算子对照不继续生成，也不打印完整生成通过的结论。
+        return  # 单次 Decode 对照不继续生成，也不打印完整生成通过的结论。
     if args.mode == "benchmark":
         generated_ids = benchmark(model, input_ids, repeats=args.repeats)
     else:
