@@ -151,60 +151,67 @@ def main() -> None:
     print("[PASS] 释放后可复用物理存储，读回不包含旧请求历史")
     print("[PASS] CPU 单层 BF16 分页 K/V 存储自检通过；未验证 Attention、多请求、模型或 GPU")
 
-    # 独立 Decode 场景：先写 4 个历史 Token，再追加 1 个，恰好跨越块边界。
-    cache = PagedKVCache(num_kv_heads=2, head_dim=4, num_blocks=3, block_size=4)
-    cache._key.fill_(-100)
-    cache._value.fill_(-200)
-    held = [cache._pool.allocate() for _ in range(3)]
-    for block_id in (held[1], held[0], held[2]):
-        cache._pool.free(block_id)
-    generator = torch.Generator().manual_seed(0)
-    query = torch.randn(1, 2, 1, 4, generator=generator).to(torch.bfloat16)
-    keys = torch.randn(1, 2, 5, 4, generator=generator).to(torch.bfloat16)
-    values = torch.randn(1, 2, 5, 4, generator=generator).to(torch.bfloat16)
-    # 合并后仍须拒绝空历史 Decode，且不能偷偷写入当前 K/V。
-    try:
-        decode_attention(query, keys[:, :, :1], values[:, :, :1], cache)
-    except ValueError:
-        assert cache.length == 0 and cache._pool.num_free_blocks == 3
-        assert cache._table.block_ids == ()
-        assert (cache._key == -100).all() and (cache._value == -200).all()
-    else:
-        raise AssertionError("空历史 Decode 未被拒绝")
-    cache.append(keys[:, :, :4], values[:, :, :4])
-    addresses = (cache._key.data_ptr(), cache._value.data_ptr())
-    before = (cache.length, cache._table.block_ids, cache._pool._free_blocks.copy(),
-              cache._pool._allocated.copy())
-    saved_key, saved_value = cache._key.clone(), cache._value.clone()
-    # 非法头数和精度都必须在写入当前 Token 之前拒绝，保留全部原始状态。
-    for invalid_query in (query[:, :1], query.float()):
+    # 等头数与 GQA 共用一个场景：历史 4 个 Token，Decode 跨块追加第 5 个。
+    for label, mapping in (("等头数", [0, 1]), ("GQA", [0, 0, 1, 1])):
+        cache = PagedKVCache(num_kv_heads=2, head_dim=4, num_blocks=3, block_size=4)
+        cache._key.fill_(-100)
+        cache._value.fill_(-200)
+        held = [cache._pool.allocate() for _ in range(3)]
+        for block_id in (held[1], held[0], held[2]):
+            cache._pool.free(block_id)
+        generator = torch.Generator().manual_seed(0)
+        query = torch.randn(1, len(mapping), 1, 4, generator=generator).to(torch.bfloat16)
+        keys = torch.randn(1, 2, 5, 4, generator=generator).to(torch.bfloat16)
+        values = torch.randn(1, 2, 5, 4, generator=generator).to(torch.bfloat16)
+        # 合并后仍须拒绝空历史 Decode，且不能偷偷写入当前 K/V。
         try:
-            decode_attention(invalid_query, keys[:, :, 4:], values[:, :, 4:], cache)
+            decode_attention(query, keys[:, :, :1], values[:, :, :1], cache)
         except ValueError:
-            assert (cache.length, cache._table.block_ids, cache._pool._free_blocks,
-                    cache._pool._allocated) == before
-            assert torch.equal(cache._key, saved_key) and torch.equal(cache._value, saved_value)
+            assert cache.length == 0 and cache._pool.num_free_blocks == 3
+            assert cache._table.block_ids == ()
+            assert (cache._key == -100).all() and (cache._value == -200).all()
         else:
-            raise AssertionError("非法 Query 未在写入前被拒绝")
-    print("[PASS] 非法 Decode Query 被拒绝，分页数据与元数据不变")
-    actual = decode_attention(query, keys[:, :, 4:], values[:, :, 4:], cache)
-    # 独立对照直接使用原始 K/V，不读缓存；精度、形状和 SDPA 参数保持相同。
-    expected = torch.nn.functional.scaled_dot_product_attention(
-        query.contiguous(), keys.contiguous(), values.contiguous(),
-        dropout_p=0.0, is_causal=False, scale=query.shape[-1] ** -0.5,
-    )
-    assert actual.shape == (1, 2, 1, 4) and actual.dtype == torch.bfloat16
-    assert torch.isfinite(actual).all()
-    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
-    assert cache.length == 5 and cache._table.block_ids == (2, 0)
-    assert (cache._key.data_ptr(), cache._value.data_ptr()) == addresses
-    actual_key, actual_value = cache.get()
-    assert torch.equal(actual_key, keys) and torch.equal(actual_value, values)
-    print("[PASS] 等头数 BF16 Decode：分页读回与原始连续 K/V 的 SDPA 输出完全一致")
-    print("[PASS] Decode 跨块追加后长度=5，块表=(2, 0)，缓存内容正确且存储地址不变")
-    cache.release()
-    assert cache.length == 0 and cache._pool.num_free_blocks == 3
-    print("[PASS] CPU 分页 Decode 参考自检通过；未验证 GQA、原生分页内核、模型或 GPU")
+            raise AssertionError("空历史 Decode 未被拒绝")
+        cache.append(keys[:, :, :4], values[:, :, :4])
+        addresses = (cache._key.data_ptr(), cache._value.data_ptr())
+        before = (cache.length, cache._table.block_ids, cache._pool._free_blocks.copy(),
+                  cache._pool._allocated.copy())
+        saved_key, saved_value = cache._key.clone(), cache._value.clone()
+        # 非法头数和精度都必须在写入当前 Token 之前拒绝，保留全部原始状态。
+        for invalid_query in (query[:, :1], query[:, :1].expand(1, 3, 1, 4), query.float()):
+            try:
+                decode_attention(invalid_query, keys[:, :, 4:], values[:, :, 4:], cache)
+            except ValueError:
+                assert (cache.length, cache._table.block_ids, cache._pool._free_blocks,
+                        cache._pool._allocated) == before
+                assert torch.equal(cache._key, saved_key) and torch.equal(cache._value, saved_value)
+            else:
+                raise AssertionError("非法 Query 未在写入前被拒绝")
+        print(f"[PASS] {label}：非法 Decode Query 被拒绝，分页数据与元数据不变")
+        actual = decode_attention(query, keys[:, :, 4:], values[:, :, 4:], cache)
+        # 显式索引原始 KV 头，不复用被测路径的 repeat_interleave；不读取缓存。
+        head_indices = torch.tensor(mapping, dtype=torch.long)
+        reference_key = keys.index_select(1, head_indices)
+        reference_value = values.index_select(1, head_indices)
+        expected = torch.nn.functional.scaled_dot_product_attention(
+            query.contiguous(), reference_key.contiguous(), reference_value.contiguous(),
+            dropout_p=0.0, is_causal=False, scale=query.shape[-1] ** -0.5,
+        )
+        assert actual.shape == (1, len(mapping), 1, 4) and actual.dtype == torch.bfloat16
+        assert torch.isfinite(actual).all()
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+        assert cache.length == 5 and cache._table.block_ids == (2, 0)
+        assert (cache._key.data_ptr(), cache._value.data_ptr()) == addresses
+        # Query 头增加只影响参考计算的临时数据，物理缓存仍然只有两个 KV 头。
+        assert cache._key.shape == cache._value.shape == (3, 2, 4, 4)
+        actual_key, actual_value = cache.get()
+        assert torch.equal(actual_key, keys) and torch.equal(actual_value, values)
+        print(f"[PASS] {label} BF16 Decode：头映射={mapping}，输出形状={tuple(actual.shape)}，与原始 K/V 对照完全一致")
+        print(f"[PASS] {label}：跨块后长度=5，块表=(2, 0)，只存两个 KV 头且地址不变")
+        cache.release()
+        assert cache.length == 0 and cache._pool.num_free_blocks == 3
+        assert not any(cache._pool._allocated)
+    print("[PASS] CPU 分页等头数/GQA Decode 自检通过；未验证原生分页内核、多请求、模型或 GPU")
 
 
 if __name__ == "__main__":
