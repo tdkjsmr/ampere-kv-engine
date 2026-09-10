@@ -18,7 +18,7 @@ def benchmark() -> None:
     print(f"调用基线：Q头=32，KV头=8，每头128维，块大小16；预热={warmup} 次，测量={repeats} 组，每组={iterations} 次")
     print("计时前准备 Q/K/V、GQA 展开和 GPU 块表；计时包含 Python/扩展调用、输出分配、CUDA V0 块号检查同步及组末等待。")
     print("同一份数据反复读取，可能受硬件缓存影响；SDPA 后端自动选择，本结果不是纯内核时间、请求 TPOT 或原生 GQA 性能。")
-    print("CUDA 段长=256；长度超过 256 时启用分段，临时结果分配与合并调用均计时。")
+    print("CUDA 段长=64；长度超过 64 时启用分段，临时结果分配与合并调用均计时；修改段长后须重新编译扩展。")
     for length in (64, 256, 1024):
         query = torch.randn(1, 32, 1, 128, generator=generator).to(device="cuda", dtype=torch.bfloat16)
         key = torch.randn(1, 8, length, 128, generator=generator).to(device="cuda", dtype=torch.bfloat16)
@@ -91,7 +91,9 @@ def main() -> None:
              # 追加场景不改变前七项随机输入；覆盖单段末端、整段和不足一段的尾部。
              ("分段边界", 32, 8, 256), ("分段边界", 32, 8, 512),
              ("分段边界", 32, 8, 513), ("均匀权重", 32, 8, 513),
-             ("大分数", 32, 8, 513))
+             ("大分数", 32, 8, 513),
+             # 放在末尾，保留前十二项随机输入；检查新段长的单段末端及第二段首个 Token。
+             ("分段边界", 32, 8, 64), ("分段边界", 32, 8, 65))
     for label, q_heads, kv_heads, length in cases:
         num_blocks = max(3, (length + 15) // 16)
         storage = PagedKVStorage(kv_heads, 128, num_blocks, 16, device="cuda")

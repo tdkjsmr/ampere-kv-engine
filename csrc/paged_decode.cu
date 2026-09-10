@@ -8,7 +8,7 @@
 namespace {
 constexpr int kDim = 128;
 constexpr int kBlockSize = 16;
-constexpr int kSegmentSize = 256;  // 初始实验段长，不代表最优调优结果。
+constexpr int kSegmentSize = 64;  // 与此前 256 段长做单变量实验，不代表最终最优值。
 
 // 每个线程块负责一个 Query 头的一段历史，每个线程负责该头的一个维度。
 // 不创建连续历史副本，不展开 GQA 的 K/V，不使用 Tensor Core 或异步搬运。
