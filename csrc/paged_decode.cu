@@ -8,13 +8,15 @@
 namespace {
 constexpr int kDim = 128;
 constexpr int kBlockSize = 16;
+constexpr int kSegmentSize = 256;  // 初始实验段长，不代表最优调优结果。
 
-// 每个线程块负责一个 Query 头，每个线程负责该头的一个维度。
+// 每个线程块负责一个 Query 头的一段历史，每个线程负责该头的一个维度。
 // 不创建连续历史副本，不展开 GQA 的 K/V，不使用 Tensor Core 或异步搬运。
 __global__ void paged_decode_kernel(
     const c10::BFloat16* query, const c10::BFloat16* key,
     const c10::BFloat16* value, const int64_t* table,
-    c10::BFloat16* output, int64_t length, int kv_heads, int group_size) {
+    c10::BFloat16* output, float* partials, int64_t length,
+    int kv_heads, int group_size, int segments) {
   const int dim = threadIdx.x;
   const int lane = dim % 32;
   const int warp = dim / 32;
@@ -31,7 +33,9 @@ __global__ void paged_decode_kernel(
   }
   __syncthreads();
 
-  for (int64_t token = 0; token < length; ++token) {
+  const int64_t begin = static_cast<int64_t>(blockIdx.y) * kSegmentSize;
+  const int64_t end = length < begin + kSegmentSize ? length : begin + kSegmentSize;
+  for (int64_t token = begin; token < end; ++token) {
     // 布局 [物理块, KV 头, 块内 Token, 维度]；索引使用 64 位避免乘法溢出。
     const int64_t physical = table[token / kBlockSize];
     const int offset = token % kBlockSize;
@@ -68,7 +72,38 @@ __global__ void paged_decode_kernel(
     // 保证所有线程读完本轮系数，下一轮线程 0 才能覆盖它们。
     __syncthreads();
   }
-  output[query_head * kDim + dim] = c10::BFloat16(accumulator / denominator);
+  if (partials == nullptr) {
+    // 单段保留原路径：不分配临时张量，也不启动合并内核。
+    output[query_head * kDim + dim] = c10::BFloat16(accumulator / denominator);
+  } else {
+    // 布局 [Query头, 段, 128维分子 + 最大值 + 分母]，全程保存 FP32。
+    // 不能先转 BF16，也不能只保存每段归一化后的输出再取平均。
+    const int64_t base = (static_cast<int64_t>(query_head) * segments + blockIdx.y) * (kDim + 2);
+    partials[base + dim] = accumulator;
+    if (dim == 0) {
+      partials[base + kDim] = maximum;
+      partials[base + kDim + 1] = denominator;
+    }
+  }
+}
+
+// 同一 CUDA 流上的第二次启动保证所有局部结果已写好，不需要 CPU 同步。
+__global__ void merge_decode_kernel(const float* partials, c10::BFloat16* output, int segments) {
+  const int dim = threadIdx.x;
+  const int64_t base = static_cast<int64_t>(blockIdx.x) * segments * (kDim + 2);
+  float maximum = -INFINITY;
+  for (int segment = 0; segment < segments; ++segment) {
+    maximum = fmaxf(maximum, partials[base + static_cast<int64_t>(segment) * (kDim + 2) + kDim]);
+  }
+  float numerator = 0.0f, denominator = 0.0f;
+  for (int segment = 0; segment < segments; ++segment) {
+    const int64_t offset = base + static_cast<int64_t>(segment) * (kDim + 2);
+    // 各段使用各自最大值计算过指数；重新缩放到共同最大值后才能相加。
+    const float scale = expf(partials[offset + kDim] - maximum);
+    numerator += scale * partials[offset + dim];
+    denominator += scale * partials[offset + kDim + 1];
+  }
+  output[blockIdx.x * kDim + dim] = c10::BFloat16(numerator / denominator);
 }
 }  // 匿名命名空间：内部实现不暴露给其他编译单元。
 
@@ -85,6 +120,9 @@ at::Tensor paged_decode_cuda(const at::Tensor& query, const at::Tensor& key,
   const int64_t q_heads = query.size(1), kv_heads = key.size(1);
   TORCH_CHECK(q_heads > 0 && q_heads <= 1024 && kv_heads > 0 && q_heads % kv_heads == 0, "V0 要求 Query 头数不超过 1024 且是 KV 头数的正整数倍");
   TORCH_CHECK(length > 0 && (length - 1) / kBlockSize < table.numel(), "有效长度必须为正且块表必须足够长");
+  const int64_t segment_count = (length - 1) / kSegmentSize + 1;
+  TORCH_CHECK(segment_count <= 65535, "分段数超过二维 CUDA 网格上限");
+  const int segments = static_cast<int>(segment_count);
   const c10::cuda::CUDAGuard guard(query.device());
   // V0 为安全先检查有效块号。这两次 item 会同步，不支持 CUDA Graph 捕获。
   // 只检查使用到的块表前缀，不读取未使用的尾部；块归属仍由调用方保证。
@@ -92,11 +130,24 @@ at::Tensor paged_decode_cuda(const at::Tensor& query, const at::Tensor& key,
   TORCH_CHECK(used_table.min().item<int64_t>() >= 0 && used_table.max().item<int64_t>() < key.size(0), "物理块编号越界");
   auto output = at::empty_like(query);
   const auto stream = c10::cuda::getCurrentCUDAStream(query.get_device()).stream();
-  paged_decode_kernel<<<static_cast<unsigned int>(q_heads), kDim, 0, stream>>>(
+  // 长历史才建立局部结果；临时存储分配和额外启动均计入现有调用基线。
+  at::Tensor partials;
+  float* partial_ptr = nullptr;
+  if (segments > 1) {
+    partials = at::empty({q_heads, segment_count, kDim + 2}, query.options().dtype(at::kFloat));
+    partial_ptr = partials.data_ptr<float>();
+  }
+  const dim3 grid(static_cast<unsigned int>(q_heads), static_cast<unsigned int>(segments));
+  paged_decode_kernel<<<grid, kDim, 0, stream>>>(
       query.data_ptr<c10::BFloat16>(), key.data_ptr<c10::BFloat16>(),
       value.data_ptr<c10::BFloat16>(), table.data_ptr<int64_t>(),
-      output.data_ptr<c10::BFloat16>(), length, static_cast<int>(kv_heads),
-      static_cast<int>(q_heads / kv_heads));
+      output.data_ptr<c10::BFloat16>(), partial_ptr, length, static_cast<int>(kv_heads),
+      static_cast<int>(q_heads / kv_heads), segments);
   C10_CUDA_KERNEL_LAUNCH_CHECK();
+  if (segments > 1) {
+    merge_decode_kernel<<<static_cast<unsigned int>(q_heads), kDim, 0, stream>>>(
+        partial_ptr, output.data_ptr<c10::BFloat16>(), segments);
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+  }
   return output;
 }

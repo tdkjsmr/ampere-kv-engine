@@ -18,6 +18,7 @@ def benchmark() -> None:
     print(f"调用基线：Q头=32，KV头=8，每头128维，块大小16；预热={warmup} 次，测量={repeats} 组，每组={iterations} 次")
     print("计时前准备 Q/K/V、GQA 展开和 GPU 块表；计时包含 Python/扩展调用、输出分配、CUDA V0 块号检查同步及组末等待。")
     print("同一份数据反复读取，可能受硬件缓存影响；SDPA 后端自动选择，本结果不是纯内核时间、请求 TPOT 或原生 GQA 性能。")
+    print("CUDA 段长=256；长度超过 256 时启用分段，临时结果分配与合并调用均计时。")
     for length in (64, 256, 1024):
         query = torch.randn(1, 32, 1, 128, generator=generator).to(device="cuda", dtype=torch.bfloat16)
         key = torch.randn(1, 8, length, 128, generator=generator).to(device="cuda", dtype=torch.bfloat16)
@@ -75,7 +76,7 @@ def benchmark() -> None:
 def main() -> None:
     """检查直接分页读取、块边界、GQA 和独立数学参考；必须在云端 GPU 执行。"""
     parser = argparse.ArgumentParser(description="CUDA Paged Decode 对照与调用基线")
-    parser.add_argument("--benchmark", action="store_true", help="测量预先准备好数据的 SDPA 与 CUDA V0 调用；默认运行原有七个对照")
+    parser.add_argument("--benchmark", action="store_true", help="测量预先准备好数据的 SDPA 与 CUDA V0 调用；默认运行数值与分段边界对照")
     args = parser.parse_args()
     if not torch.cuda.is_available():
         raise RuntimeError("此自检需要 CUDA GPU 和重新编译后的扩展")
@@ -86,7 +87,11 @@ def main() -> None:
     # 原有四个场景保持在前面，保留固定种子下原来的随机输入。
     cases = (("随机", 2, 2, 1), ("随机", 32, 8, 16), ("随机", 32, 8, 17),
              ("随机", 32, 8, 33), ("较长历史", 32, 8, 257),
-             ("均匀权重", 32, 8, 33), ("大分数", 32, 8, 33))
+             ("均匀权重", 32, 8, 33), ("大分数", 32, 8, 33),
+             # 追加场景不改变前七项随机输入；覆盖单段末端、整段和不足一段的尾部。
+             ("分段边界", 32, 8, 256), ("分段边界", 32, 8, 512),
+             ("分段边界", 32, 8, 513), ("均匀权重", 32, 8, 513),
+             ("大分数", 32, 8, 513))
     for label, q_heads, kv_heads, length in cases:
         num_blocks = max(3, (length + 15) // 16)
         storage = PagedKVStorage(kv_heads, 128, num_blocks, 16, device="cuda")
@@ -160,7 +165,7 @@ def main() -> None:
         cache.release()
         assert storage._pool.num_free_blocks == num_blocks
         print(f"[PASS] {label}：数值对照、非法块号拒绝与块归还通过")
-    print("[PASS] CUDA V0 七个场景通过（最长 257 Token）；不代表完整长上下文、模型、性能或 CUDA Graph 验证通过")
+    print(f"[PASS] CUDA 分页 Decode {len(cases)} 个场景通过（最长 513 Token）；不代表完整长上下文、模型、性能或 CUDA Graph 验证通过")
 
 
 if __name__ == "__main__":
