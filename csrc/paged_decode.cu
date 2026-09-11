@@ -10,14 +10,17 @@ constexpr int kDim = 128;
 constexpr int kBlockSize = 16;
 constexpr int kSegmentSize = 64;  // 与此前 256 段长做单变量实验，不代表最终最优值。
 
-// 一个线程块只有一个完整 warp，负责一个 Query 头的一段历史；每线程负责四维。
+// 一个线程块的四个 warp 分别处理段内不同 Token；每线程仍负责四维。
 // 不创建连续历史副本，不展开 GQA 的 K/V，不使用 Tensor Core 或异步搬运。
 __global__ void paged_decode_kernel(
     const c10::BFloat16* query, const c10::BFloat16* key,
     const c10::BFloat16* value, const int64_t* table,
     c10::BFloat16* output, float* partials, int64_t length,
     int kv_heads, int group_size, int segments) {
-  const int lane = threadIdx.x;  // 固定启动 32 线程，全部 lane 参与每次 shuffle。
+  const int lane = threadIdx.x % 32;
+  const int warp = threadIdx.x / 32;  // 固定启动四个完整 warp，shuffle 只在各自 warp 内执行。
+  // 只暂存局部结果，不搬运 K/V：四份 FP32 分子、最大值和分母，共 2080 字节。
+  __shared__ float local[4][kDim + 2];
   const int query_head = blockIdx.x;
   const int kv_head = query_head / group_size;
   // 固定四元素数组配合展开供编译器标量化；实际寄存器占用以编译结果为准。
@@ -32,7 +35,9 @@ __global__ void paged_decode_kernel(
 
   const int64_t begin = static_cast<int64_t>(blockIdx.y) * kSegmentSize;
   const int64_t end = length < begin + kSegmentSize ? length : begin + kSegmentSize;
-  for (int64_t token = begin; token < end; ++token) {
+  // 交错分工：warp 0 处理 0、4、8……，warp 1 处理 1、5、9……。
+  // 完整 64 Token 段中，每个 warp 只串行处理 16 个 Token。
+  for (int64_t token = begin + warp; token < end; token += 4) {
     // 布局 [物理块, KV 头, 块内 Token, 维度]；索引使用 64 位避免乘法溢出。
     const int64_t physical = table[token / kBlockSize];
     const int offset = token % kBlockSize;
@@ -66,11 +71,43 @@ __global__ void paged_decode_kernel(
     for (int i = 0; i < 4; ++i) {
       accumulator[i] = accumulator[i] * old_scale + new_weight * static_cast<float>(value[index + i * 32]);
     }
-    // 每个 lane 保存私有累加器与系数，无跨 warp 共享读写，不需要块级屏障。
+    // Token 循环内仍只有私有状态与 warp shuffle，没有块级屏障。
+  }
+  // 即使没有分到 Token，也写出初始值：分子和分母为零，最大值为负无穷。
+#pragma unroll
+  for (int i = 0; i < 4; ++i) {
+    local[warp][lane + i * 32] = accumulator[i];
+  }
+  if (lane == 0) {
+    local[warp][kDim] = maximum;
+    local[warp][kDim + 1] = denominator;
+  }
+  // 所有线程都必须到达这里；保证四份结果可见后，只有 warp 0 负责合并。
+  __syncthreads();
+  if (warp != 0) return;
+
+  maximum = -INFINITY;
+#pragma unroll
+  for (int w = 0; w < 4; ++w) {
+    maximum = fmaxf(maximum, local[w][kDim]);
+  }
+  denominator = 0.0f;
+#pragma unroll
+  for (int i = 0; i < 4; ++i) accumulator[i] = 0.0f;
+#pragma unroll
+  for (int w = 0; w < 4; ++w) {
+    // 空 warp 不参与指数计算；尤其长度为 1 或末段不足四个 Token 时不可遗漏。
+    if (local[w][kDim + 1] > 0.0f) {
+      const float scale = expf(local[w][kDim] - maximum);
+      denominator += scale * local[w][kDim + 1];
+#pragma unroll
+      for (int i = 0; i < 4; ++i) {
+        accumulator[i] += scale * local[w][lane + i * 32];
+      }
+    }
   }
   if (partials == nullptr) {
     // 单段保留原路径：不分配临时张量，也不启动合并内核。
-    denominator = __shfl_sync(0xffffffffu, denominator, 0);
 #pragma unroll
     for (int i = 0; i < 4; ++i) {
       output[query_head * kDim + lane + i * 32] = c10::BFloat16(accumulator[i] / denominator);
@@ -141,8 +178,8 @@ at::Tensor paged_decode_cuda(const at::Tensor& query, const at::Tensor& key,
     partial_ptr = partials.data_ptr<float>();
   }
   const dim3 grid(static_cast<unsigned int>(q_heads), static_cast<unsigned int>(segments));
-  // 仅分段计算改为一个 warp；合并内核仍保留 128 线程。
-  paged_decode_kernel<<<grid, 32, 0, stream>>>(
+  // 四个 warp 独立计算，段末才合并；跨段合并内核保持原样。
+  paged_decode_kernel<<<grid, 128, 0, stream>>>(
       query.data_ptr<c10::BFloat16>(), key.data_ptr<c10::BFloat16>(),
       value.data_ptr<c10::BFloat16>(), table.data_ptr<int64_t>(),
       output.data_ptr<c10::BFloat16>(), partial_ptr, length, static_cast<int>(kv_heads),
