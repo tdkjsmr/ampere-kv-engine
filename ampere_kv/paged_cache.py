@@ -1,4 +1,4 @@
-"""单层 BF16/INT8 分页存储；INT8 目前仅作存储与反量化参考。"""
+"""单层 BF16/INT8 分页存储与 Attention 参考；INT8 尚未接入模型或融合内核。"""
 
 import random
 
@@ -94,7 +94,7 @@ class PagedKVCache:
     def get(self) -> tuple[torch.Tensor, torch.Tensor]:
         """按逻辑顺序复制有效 K/V，返回 [1, KV 头数, 有效 Token 数, 每头维度]。
 
-        BF16 返回 BF16；INT8 读取有效整数和 scale 后还原为 FP32，不接现有 Attention。
+        BF16 返回 BF16；INT8 读取有效整数和 scale 后还原为 FP32，供参考 Attention 使用。
         返回独立副本，不是底层视图；高性能分页 Attention 不应这样读回历史。
         """
         if self.length == 0:
@@ -157,11 +157,11 @@ def check_int8_storage() -> None:
     assert cache._table.block_ids == (2, 0, 1)
     before = (cache.length, cache._table.block_ids, storage._pool._free_blocks.copy(), storage._pool._allocated.copy())
     try:
-        decode_attention(keys[:, :, :1], keys[:, :, :1], values[:, :, :1], cache)
+        decode_attention(keys[:, :1, :1], keys[:, :, :1], values[:, :, :1], cache)
     except ValueError:
         assert cache.length == before[0] and all(torch.equal(a, b) for a, b in zip(tensors, expected))
     else:
-        raise AssertionError("未接入的 INT8 Attention 应在写入前被拒绝")
+        raise AssertionError("非法头数应在 INT8 缓存写入前被拒绝")
     # V 量化失败和容量不足都必须保留四份存储与元数据，不能只检查 K 数据。
     for key, value, error_type in ((keys[:, :, :1], torch.full_like(values[:, :, :1], float("nan")), ValueError),
                                    (keys[:, :, :4], values[:, :, :4], RuntimeError)):
@@ -196,6 +196,64 @@ def check_int8_storage() -> None:
     assert actual_bytes == 6240 and bf16_bytes == 12288
     print(f"[PASS] INT8 失败追加、尾部、读回副本、释放复用与块归还通过；物理张量={actual_bytes} 字节，BF16 同容量={bf16_bytes} 字节")
     print("[PASS] CPU INT8 分页存储自检通过；未验证 INT8 Attention、多请求交错、模型、GPU 或性能")
+
+
+def check_int8_attention() -> None:
+    """分开验证分页接入一致性与量化误差；不以量化前后的完全一致作为通过条件。"""
+    for label, mapping in (("等头数", [0, 1]), ("GQA", [0, 0, 1, 1])):
+        storage = PagedKVStorage(2, 128, 3, 4, kv_dtype=torch.int8)
+        cache = PagedKVCache(storage)
+        tensors = (storage._key, storage._value, storage._key_scale, storage._value_scale)
+        addresses = tuple(t.data_ptr() for t in tensors)
+        # 尾部整数与 scale 均为非法哨兵；若错误读取未写区域，反量化检查会拒绝。
+        for tensor in tensors:
+            tensor.fill_(-128 if tensor.dtype == torch.int8 else -1)
+        held = [storage._pool.allocate() for _ in range(3)]
+        for block in (held[1], held[0], held[2]):
+            storage._pool.free(block)
+        generator = torch.Generator().manual_seed(1)
+        query = torch.randn(1, len(mapping), 5, 128, generator=generator).to(torch.bfloat16)
+        keys = torch.randn(1, 2, 5, 128, generator=generator).to(torch.bfloat16)
+        values = torch.randn(1, 2, 5, 128, generator=generator).to(torch.bfloat16)
+        # 从原始数据独立量化，不从分页读回构造预期值；显式索引头，不复用 GQA 展开。
+        key_data, key_scale = quantize_kv(keys)
+        value_data, value_scale = quantize_kv(values)
+        indices = torch.tensor(mapping, dtype=torch.long)
+        restored_key = dequantize_kv(key_data, key_scale).index_select(1, indices)
+        restored_value = dequantize_kv(value_data, value_scale).index_select(1, indices)
+        original_key, original_value = keys.float().index_select(1, indices), values.float().index_select(1, indices)
+        try:
+            for stage, start, end in (("Prefill", 0, 4), ("Decode", 4, 5)):
+                operation = prefill_attention if start == 0 else decode_attention
+                actual = operation(query[:, :, start:end], keys[:, :, start:end], values[:, :, start:end], cache)
+
+                def reference(key, value):
+                    return torch.nn.functional.scaled_dot_product_attention(
+                        query[:, :, start:end].float().contiguous(), key[:, :, :end].contiguous(),
+                        value[:, :, :end].contiguous(), dropout_p=0.0,
+                        is_causal=start == 0, scale=128 ** -0.5,
+                    )
+
+                expected = reference(restored_key, restored_value)
+                assert actual.dtype == torch.float32 and torch.isfinite(actual).all().item()
+                torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+                assert cache.length == end and cache._table.block_ids == ((2,) if end == 4 else (2, 0))
+                assert tuple(t.data_ptr() for t in tensors) == addresses
+                # 末块无效位置不可被写入，scale 与整数数据都要检查。
+                for tensor in tensors:
+                    sentinel = -128 if tensor.dtype == torch.int8 else -1
+                    assert (tensor[0, :, 1:] == sentinel).all().item()
+                print(f"[PASS] {label} INT8 {stage}：分页/连续反量化 FP32 Attention 完全一致，长度={end}")
+                # 两边均为 FP32 SDPA，区别仅在 K/V 是否量化；这不是 BF16/FP32 后端对比。
+                original = reference(original_key, original_value)
+                difference = actual - original
+                relative_l2 = difference.norm() / original.norm().clamp_min(1e-12)
+                cosine = torch.nn.functional.cosine_similarity(actual, original, dim=-1).mean()
+                print(f"[观测] {label} {stage} 量化影响：最大绝对误差={difference.abs().max().item():.8g}，相对L2={relative_l2.item():.8g}，逐头逐Token平均余弦={cosine.item():.8g}；不代表模型精度验收")
+        finally:
+            cache.release()
+        assert storage._pool.num_free_blocks == 3 and not any(storage._pool._allocated)
+    print("[PASS] CPU INT8 等头数/GQA Prefill 与跨块 Decode 参考通过；未验证融合内核、模型、GPU 或性能")
 
 
 def check_random_lifecycle() -> None:
@@ -514,6 +572,7 @@ def main() -> None:
     print("[PASS] CPU 共享分页存储生命周期自检通过；未验证并发线程、多请求模型或 GPU")
     check_random_lifecycle()
     check_int8_storage()
+    check_int8_attention()
 
 
 if __name__ == "__main__":

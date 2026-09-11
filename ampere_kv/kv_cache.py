@@ -55,9 +55,9 @@ class ContiguousKVCache:
 def prefill_attention(
     query: torch.Tensor, key: torch.Tensor, value: torch.Tensor, cache,
 ) -> torch.Tensor:
-    """仅向空缓存写入整段 BF16 K/V，返回全部输入位置的 BF16 因果 Attention 输出。
+    """向空缓存写入整段 BF16 K/V，返回全部输入位置的因果 Attention 输出。
 
-    接受提供 length、append、get 的连续或分页缓存，不另写存储专用包装。
+    BF16 缓存输出 BF16；INT8 分页缓存反量化后用 FP32 计算并输出，仅作参考。
     不支持分块 Prefill 或填充输入；追加后若计算失败，不自动回滚缓存。
     """
     return _cached_attention(query, key, value, cache, is_causal=True)
@@ -66,7 +66,9 @@ def prefill_attention(
 def decode_attention(
     query: torch.Tensor, key: torch.Tensor, value: torch.Tensor, cache,
 ) -> torch.Tensor:
-    """追加当前单 Token 的 BF16 K/V，返回 [1, Query 头数, 1, 每头维度] 的 BF16 输出。
+    """追加当前单 Token 的 BF16 K/V，返回 [1, Query 头数, 1, 每头维度]。
+
+    BF16 缓存输出 BF16；INT8 分页缓存的反量化参考输出 FP32。
 
     接受提供 length、append、get 的连续或分页缓存；无需继承公共基类。
     调用前必须已有历史，调用方不要提前追加当前 K/V；重复调用会重复追加。
@@ -103,14 +105,17 @@ def _cached_attention(query, key, value, cache, *, is_causal: bool) -> torch.Ten
     if query.device != key.device or key.device != value.device:
         raise ValueError("Q/K/V 必须位于同一设备")
 
-    # INT8 当前只验证存储；必须在追加前拒绝，避免写入后才发现 SDPA 精度不匹配。
-    if cache._key.dtype != torch.bfloat16:
-        raise ValueError("当前 Attention 入口只支持 BF16 缓存")
+    if cache._key.dtype not in (torch.bfloat16, torch.int8):
+        raise ValueError("Attention 参考只支持 BF16 或 INT8 缓存")
+    quantized = cache._key.dtype == torch.int8
+    if quantized and not torch.isfinite(query).all().item():
+        raise ValueError("INT8 Attention 参考的 Query 不能含 NaN 或 Inf")
     # append 继续负责检查 K/V 与缓存的形状、设备及容量是否匹配。
     cache.append(key, value)
     cached_key, cached_value = cache.get()
-    # 与模型路径对齐：Q/K/V 直接以 BF16 交给 SDPA，输出也是 BF16。
-    # 张量类型不等于底层累加类型；不再创建整段 FP32 历史副本。
+    # BF16 路径不变；INT8 get 已还原 FP32 历史，Query 也转 FP32，避免精度混用。
+    # 这是独立反量化参考，不是融合 CUDA 路径，也不代表模型已支持 INT8。
+    compute_query = query.float() if quantized else query
     compute_key, compute_value = cached_key, cached_value
     group_size = query.shape[1] // key.shape[1]
     if group_size > 1:
@@ -122,7 +127,7 @@ def _cached_attention(query, key, value, cache, *, is_causal: bool) -> torch.Ten
     # Decode 的 Q 只对应最后一个位置，有效 K/V 全部可见，不额外加三角掩码。
     return torch.nn.functional.scaled_dot_product_attention(
         # HF 4.51 的 SDPA 包装也先整理为连续布局；此处可能产生 BF16 临时副本。
-        query.contiguous(), compute_key.contiguous(), compute_value.contiguous(),
+        compute_query.contiguous(), compute_key.contiguous(), compute_value.contiguous(),
         dropout_p=0.0, is_causal=is_causal and query.shape[2] > 1,
         scale=query.shape[-1] ** -0.5,
     )
