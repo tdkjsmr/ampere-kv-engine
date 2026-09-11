@@ -1,10 +1,11 @@
-"""单层 BF16 分页共享存储与请求缓存；共享生命周期仅做 CPU 参考验证。"""
+"""单层 BF16/INT8 分页存储；INT8 目前仅作存储与反量化参考。"""
 
 import random
 
 import torch
 
 from ampere_kv.block_pool import BlockPool, BlockTable
+from ampere_kv.quantization import quantize_kv, dequantize_kv
 # 复用同一套检查、缓存追加、GQA 头映射和 SDPA 计算，不另写分页包装。
 # 分页 get() 会复制历史；这是参考路径，不是直接读取物理块的 CUDA 内核。
 from ampere_kv.kv_cache import decode_attention, prefill_attention
@@ -14,16 +15,23 @@ class PagedKVStorage:
     """同一模型层的共享物理 K/V 与块池；所有请求使用相同布局和设备。"""
 
     def __init__(self, num_kv_heads: int, head_dim: int, num_blocks: int,
-                 block_size: int, device="cpu"):
+                 block_size: int, device="cpu", *, kv_dtype=torch.bfloat16):
         if any(type(size) is not int or size <= 0
                for size in (num_kv_heads, head_dim, num_blocks, block_size)):
             raise ValueError("KV 头数、每头维度、块数量和块大小必须是正整数")
+        if kv_dtype not in (torch.bfloat16, torch.int8):
+            raise ValueError("分页存储只支持 BF16 或 INT8")
         self._pool = BlockPool(num_blocks)
         # K、V 各自布局为 [物理块数, KV 头数, 每块 Token 数, 每头维度]。
         # 一次分配全部物理空间；申请编号不会再次分配张量，空闲区域内容无效。
         shape = (num_blocks, num_kv_heads, block_size, head_dim)
-        self._key = torch.empty(shape, dtype=torch.bfloat16, device=device)
-        self._value = torch.empty(shape, dtype=torch.bfloat16, device=device)
+        self._key = torch.empty(shape, dtype=kv_dtype, device=device)
+        self._value = torch.empty(shape, dtype=kv_dtype, device=device)
+        # INT8 每个物理位置、每个 KV 头分别保存 K/V scale，不常驻 BF16 历史副本。
+        self._key_scale = self._value_scale = None
+        if kv_dtype == torch.int8:
+            self._key_scale = torch.empty(shape[:-1] + (1,), dtype=torch.float16, device=device)
+            self._value_scale = torch.empty_like(self._key_scale)
 
 
 class PagedKVCache:
@@ -38,6 +46,7 @@ class PagedKVCache:
         # 这里只复制 Python 引用，不分配或复制 K/V 张量，也不重新创建块池。
         self._pool = storage._pool
         self._key, self._value = storage._key, storage._value
+        self._key_scale, self._value_scale = storage._key_scale, storage._value_scale
         self._table = BlockTable(self._pool, self._key.shape[2])
 
     @property
@@ -63,6 +72,11 @@ class PagedKVCache:
         if key.device != self._key.device or value.device != self._value.device:
             raise ValueError("新 K/V 必须与缓存位于同一设备")
         start = self.length
+        if self._key_scale is not None:
+            # K/V 全部量化成功后才申请块；例如 V 含 NaN 时，不能留下只写入 K 的状态。
+            # 这里只产生本次追加数据的临时结果，不重新量化旧历史。
+            key, key_scale = quantize_kv(key)
+            value, value_scale = quantize_kv(value)
         # 块表拒绝空追加和容量不足；以上可预检错误均在修改存储前拒绝。
         # 先登记才能用 locate 查询新位置。若后续复制失败，不提供事务回滚；
         # 调用方应丢弃本次缓存状态，不能继续读取或盲目重试追加。
@@ -72,27 +86,116 @@ class PagedKVCache:
             # 一次复制一个 Token 的全部 KV 头；这里只追求语义清晰，不追求速度。
             self._key[physical_block, :, offset, :].copy_(key[0, :, index, :])
             self._value[physical_block, :, offset, :].copy_(value[0, :, index, :])
+            if self._key_scale is not None:
+                self._key_scale[physical_block, :, offset, :].copy_(key_scale[0, :, index, :])
+                self._value_scale[physical_block, :, offset, :].copy_(value_scale[0, :, index, :])
 
     @torch.no_grad()
     def get(self) -> tuple[torch.Tensor, torch.Tensor]:
         """按逻辑顺序复制有效 K/V，返回 [1, KV 头数, 有效 Token 数, 每头维度]。
 
-        返回的是独立副本，不是底层视图；后续高性能分页 Attention 不应这样读回历史。
+        BF16 返回 BF16；INT8 读取有效整数和 scale 后还原为 FP32，不接现有 Attention。
+        返回独立副本，不是底层视图；高性能分页 Attention 不应这样读回历史。
         """
         if self.length == 0:
             shape = (1, self._key.shape[1], 0, self._key.shape[3])
-            return self._key.new_empty(shape), self._value.new_empty(shape)
-        keys, values = [], []
-        for position in range(self.length):
-            physical_block, offset = self._table.locate(position)
-            keys.append(self._key[physical_block, :, offset, :])
-            values.append(self._value[physical_block, :, offset, :])
-        # 每个切片形状为 [KV 头数, 每头维度]，在中间插入 Token 维，再加批维。
-        return torch.stack(keys, dim=1).unsqueeze(0), torch.stack(values, dim=1).unsqueeze(0)
+            dtype = torch.float32 if self._key_scale is not None else torch.bfloat16
+            return self._key.new_empty(shape, dtype=dtype), self._value.new_empty(shape, dtype=dtype)
+        # 数据与 scale 共用一份有效位置列表，末块未写入部分不会被读取。
+        slots = [self._table.locate(position) for position in range(self.length)]
+
+        def gather(tensor):
+            return torch.stack([tensor[block, :, offset, :] for block, offset in slots], dim=1).unsqueeze(0)
+
+        key, value = gather(self._key), gather(self._value)
+        if self._key_scale is not None:
+            return (dequantize_kv(key, gather(self._key_scale)),
+                    dequantize_kv(value, gather(self._value_scale)))
+        return key, value
 
     def release(self) -> None:
         """归还请求占用的块；保留物理张量，不清零旧数据，不释放底层显存。"""
         self._table.release()
+
+
+def check_int8_storage() -> None:
+    """只检查 INT8 分页存储；与量化后的连续参考比较，不要求还原成原 BF16。"""
+    storage = PagedKVStorage(2, 128, 3, 4, kv_dtype=torch.int8)
+    cache = PagedKVCache(storage)
+    tensors = (storage._key, storage._value, storage._key_scale, storage._value_scale)
+    assert [t.dtype for t in tensors] == [torch.int8, torch.int8, torch.float16, torch.float16]
+    addresses = tuple(t.data_ptr() for t in tensors)
+    # 有限哨兵支持全张量精确比较，同时检查未写入尾部；数据与 scale 用不同值。
+    for tensor, sentinel in zip(tensors, (-128, -128, -1, -2)):
+        tensor.fill_(sentinel)
+    expected = [t.clone() for t in tensors]
+    held = [storage._pool.allocate() for _ in range(3)]
+    for block in (held[1], held[0], held[2]):
+        storage._pool.free(block)
+    slots = ((2, 0), (2, 1), (2, 2), (2, 3), (0, 0), (0, 1), (0, 2), (0, 3), (1, 0))
+    generator = torch.Generator().manual_seed(0)
+    keys = torch.randn(1, 2, 9, 128, generator=generator).to(torch.bfloat16)
+    values = (torch.randn(1, 2, 9, 128, generator=generator) * 7).to(torch.bfloat16)
+    keys[:, :, 0].zero_()
+    key_data, key_scale = quantize_kv(keys)
+    value_data, value_scale = quantize_kv(values)
+    reference = (dequantize_kv(key_data, key_scale), dequantize_kv(value_data, value_scale))
+    start = 0
+    for count in (3, 2, 4):
+        end = start + count
+        cache.append(keys[:, :, start:end], values[:, :, start:end])
+        for position in range(start, end):
+            block, offset = slots[position]
+            for target, source in zip(expected, (key_data, value_data, key_scale, value_scale)):
+                target[block, :, offset] = source[0, :, position]
+        assert cache.length == end
+        assert all(torch.equal(a, b) for a, b in zip(tensors, expected))
+        assert all(torch.equal(a, b[:, :, :end]) for a, b in zip(cache.get(), reference))
+        assert tuple(t.data_ptr() for t in tensors) == addresses
+        print(f"[PASS] INT8 分页追加 {count} Token：长度={end}，整数/scale 物理布局、反量化读回与地址检查通过")
+        start = end
+    assert cache._table.block_ids == (2, 0, 1)
+    before = (cache.length, cache._table.block_ids, storage._pool._free_blocks.copy(), storage._pool._allocated.copy())
+    try:
+        decode_attention(keys[:, :, :1], keys[:, :, :1], values[:, :, :1], cache)
+    except ValueError:
+        assert cache.length == before[0] and all(torch.equal(a, b) for a, b in zip(tensors, expected))
+    else:
+        raise AssertionError("未接入的 INT8 Attention 应在写入前被拒绝")
+    # V 量化失败和容量不足都必须保留四份存储与元数据，不能只检查 K 数据。
+    for key, value, error_type in ((keys[:, :, :1], torch.full_like(values[:, :, :1], float("nan")), ValueError),
+                                   (keys[:, :, :4], values[:, :, :4], RuntimeError)):
+        try:
+            cache.append(key, value)
+        except error_type:
+            assert (cache.length, cache._table.block_ids, storage._pool._free_blocks, storage._pool._allocated) == before
+            assert all(torch.equal(a, b) for a, b in zip(tensors, expected))
+        else:
+            raise AssertionError("INT8 非法追加未被拒绝")
+    for tensor in cache.get():
+        tensor.zero_()
+    assert all(torch.equal(a, b) for a, b in zip(tensors, expected))
+    cache.release()
+    cache.release()
+    assert storage._pool.num_free_blocks == 3
+    assert all(t.shape == (1, 2, 0, 128) and t.dtype == torch.float32 for t in cache.get())
+    # 新请求使用同一份物理张量：数据与 scale 都须更新，不读回旧请求历史。
+    reused = PagedKVCache(storage)
+    reused.append(-keys[:, :, 1:2], -values[:, :, 1:2])
+    assert reused.length == 1 and reused._table.block_ids[0] in (2, 0, 1)
+    for actual, source in zip(reused.get(), (-keys[:, :, 1:2], -values[:, :, 1:2])):
+        data, scale = quantize_kv(source)
+        assert torch.equal(actual, dequantize_kv(data, scale))
+    cache.release()  # 重复清理旧请求不能释放新请求的块。
+    assert storage._pool._allocated[reused._table.block_ids[0]]
+    assert tuple(t.data_ptr() for t in tensors) == addresses
+    reused.release()
+    assert storage._pool.num_free_blocks == 3 and not any(storage._pool._allocated)
+    actual_bytes = sum(t.numel() * t.element_size() for t in tensors)
+    bf16_bytes = 2 * storage._key.numel() * 2
+    assert actual_bytes == 6240 and bf16_bytes == 12288
+    print(f"[PASS] INT8 失败追加、尾部、读回副本、释放复用与块归还通过；物理张量={actual_bytes} 字节，BF16 同容量={bf16_bytes} 字节")
+    print("[PASS] CPU INT8 分页存储自检通过；未验证 INT8 Attention、多请求交错、模型、GPU 或性能")
 
 
 def check_random_lifecycle() -> None:
@@ -410,6 +513,7 @@ def main() -> None:
     print("[PASS] 释放 A 后新请求复用旧块，B 可继续追加且数据隔离，最终全部块归还")
     print("[PASS] CPU 共享分页存储生命周期自检通过；未验证并发线程、多请求模型或 GPU")
     check_random_lifecycle()
+    check_int8_storage()
 
 
 if __name__ == "__main__":

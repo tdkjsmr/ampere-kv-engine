@@ -103,6 +103,9 @@ def _cached_attention(query, key, value, cache, *, is_causal: bool) -> torch.Ten
     if query.device != key.device or key.device != value.device:
         raise ValueError("Q/K/V 必须位于同一设备")
 
+    # INT8 当前只验证存储；必须在追加前拒绝，避免写入后才发现 SDPA 精度不匹配。
+    if cache._key.dtype != torch.bfloat16:
+        raise ValueError("当前 Attention 入口只支持 BF16 缓存")
     # append 继续负责检查 K/V 与缓存的形状、设备及容量是否匹配。
     cache.append(key, value)
     cached_key, cached_value = cache.get()
