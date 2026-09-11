@@ -10,28 +10,25 @@ constexpr int kDim = 128;
 constexpr int kBlockSize = 16;
 constexpr int kSegmentSize = 64;  // 与此前 256 段长做单变量实验，不代表最终最优值。
 
-// 每个线程块负责一个 Query 头的一段历史，每个线程负责该头的一个维度。
+// 一个线程块只有一个完整 warp，负责一个 Query 头的一段历史；每线程负责四维。
 // 不创建连续历史副本，不展开 GQA 的 K/V，不使用 Tensor Core 或异步搬运。
 __global__ void paged_decode_kernel(
     const c10::BFloat16* query, const c10::BFloat16* key,
     const c10::BFloat16* value, const int64_t* table,
     c10::BFloat16* output, float* partials, int64_t length,
     int kv_heads, int group_size, int segments) {
-  const int dim = threadIdx.x;
-  const int lane = dim % 32;
-  const int warp = dim / 32;
+  const int lane = threadIdx.x;  // 固定启动 32 线程，全部 lane 参与每次 shuffle。
   const int query_head = blockIdx.x;
   const int kv_head = query_head / group_size;
-  const float q = static_cast<float>(query[query_head * kDim + dim]);
-  float accumulator = 0.0f;  // 当前维度的加权 V 分子，始终保留 FP32。
-  // 固定 128 线程，即 4 个完整 warp；共享内存只保存各 warp 的部分和。
-  __shared__ float warp_sums[kDim / 32];
-  __shared__ float maximum, denominator, old_scale, new_weight;
-  if (dim == 0) {
-    maximum = -INFINITY;
-    denominator = 0.0f;
+  // 固定四元素数组配合展开供编译器标量化；实际寄存器占用以编译结果为准。
+  float q[4];
+  float accumulator[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+#pragma unroll
+  for (int i = 0; i < 4; ++i) {
+    q[i] = static_cast<float>(query[query_head * kDim + lane + i * 32]);
   }
-  __syncthreads();
+  // 仅 lane 0 更新段内最大值与分母，其他 lane 通过 shuffle 获取所需数据。
+  float maximum = -INFINITY, denominator = 0.0f;
 
   const int64_t begin = static_cast<int64_t>(blockIdx.y) * kSegmentSize;
   const int64_t end = length < begin + kSegmentSize ? length : begin + kSegmentSize;
@@ -39,24 +36,19 @@ __global__ void paged_decode_kernel(
     // 布局 [物理块, KV 头, 块内 Token, 维度]；索引使用 64 位避免乘法溢出。
     const int64_t physical = table[token / kBlockSize];
     const int offset = token % kBlockSize;
-    const int64_t index = ((physical * kv_heads + kv_head) * kBlockSize + offset) * kDim + dim;
-    float sum = q * static_cast<float>(key[index]);
-    // 所有 lane 都参与洗牌，不在 lane == 0 分支中调用全掩码 shuffle。
-    // warp 内通过寄存器交换归约，只有 lane 0 的最终和用于跨 warp 合并。
+    const int64_t index = ((physical * kv_heads + kv_head) * kBlockSize + offset) * kDim + lane;
+    float sum = 0.0f;
+    // 每轮 i 中相邻 lane 读取相邻维度：lane、lane+32、lane+64、lane+96。
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+      sum += q[i] * static_cast<float>(key[index + i * 32]);
+    }
+    // 先合并线程内四项，再做 warp 归约；只使用 lane 0 的最终和。
     for (int delta = 16; delta > 0; delta /= 2) {
       sum += __shfl_down_sync(0xffffffffu, sum, delta);
     }
-    if (lane == 0) warp_sums[warp] = sum;
-    // shuffle 只同步同一 warp；读其他 warp 的共享部分和前仍须块级屏障。
-    __syncthreads();
-    if (warp == 0) {
-      // 第一个完整 warp 合并 4 个部分和，其余 lane 补零；全掩码仍然有效。
-      sum = lane < kDim / 32 ? warp_sums[lane] : 0.0f;
-      for (int delta = 16; delta > 0; delta /= 2) {
-        sum += __shfl_down_sync(0xffffffffu, sum, delta);
-      }
-    }
-    if (dim == 0) {
+    float old_scale = 0.0f, new_weight = 0.0f;
+    if (lane == 0) {
       // 浮点加法次序与原树形归约不同，必须重新跑数值与模型对照。
       const float score = sum * rsqrtf(static_cast<float>(kDim));
       // 在线 softmax：最大分数变化时，旧分子和分母都乘同一个缩放系数。
@@ -67,20 +59,31 @@ __global__ void paged_decode_kernel(
       denominator = denominator * old_scale + new_weight;
       maximum = next_maximum;
     }
-    __syncthreads();
-    accumulator = accumulator * old_scale + new_weight * static_cast<float>(value[index]);
-    // 保证所有线程读完本轮系数，下一轮线程 0 才能覆盖它们。
-    __syncthreads();
+    // 分支外由全部 lane 广播系数，不依赖隐式锁步或共享内存。
+    old_scale = __shfl_sync(0xffffffffu, old_scale, 0);
+    new_weight = __shfl_sync(0xffffffffu, new_weight, 0);
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+      accumulator[i] = accumulator[i] * old_scale + new_weight * static_cast<float>(value[index + i * 32]);
+    }
+    // 每个 lane 保存私有累加器与系数，无跨 warp 共享读写，不需要块级屏障。
   }
   if (partials == nullptr) {
     // 单段保留原路径：不分配临时张量，也不启动合并内核。
-    output[query_head * kDim + dim] = c10::BFloat16(accumulator / denominator);
+    denominator = __shfl_sync(0xffffffffu, denominator, 0);
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+      output[query_head * kDim + lane + i * 32] = c10::BFloat16(accumulator[i] / denominator);
+    }
   } else {
     // 布局 [Query头, 段, 128维分子 + 最大值 + 分母]，全程保存 FP32。
     // 不能先转 BF16，也不能只保存每段归一化后的输出再取平均。
     const int64_t base = (static_cast<int64_t>(query_head) * segments + blockIdx.y) * (kDim + 2);
-    partials[base + dim] = accumulator;
-    if (dim == 0) {
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+      partials[base + lane + i * 32] = accumulator[i];
+    }
+    if (lane == 0) {
       partials[base + kDim] = maximum;
       partials[base + kDim + 1] = denominator;
     }
@@ -138,7 +141,8 @@ at::Tensor paged_decode_cuda(const at::Tensor& query, const at::Tensor& key,
     partial_ptr = partials.data_ptr<float>();
   }
   const dim3 grid(static_cast<unsigned int>(q_heads), static_cast<unsigned int>(segments));
-  paged_decode_kernel<<<grid, kDim, 0, stream>>>(
+  // 仅分段计算改为一个 warp；合并内核仍保留 128 线程。
+  paged_decode_kernel<<<grid, 32, 0, stream>>>(
       query.data_ptr<c10::BFloat16>(), key.data_ptr<c10::BFloat16>(),
       value.data_ptr<c10::BFloat16>(), table.data_ptr<int64_t>(),
       output.data_ptr<c10::BFloat16>(), partial_ptr, length, static_cast<int>(kv_heads),
