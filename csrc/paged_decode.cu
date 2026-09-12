@@ -1,5 +1,7 @@
 #include <ATen/ATen.h>
 #include <c10/util/BFloat16.h>
+#include <c10/util/Half.h>
+#include <type_traits>
 #include <c10/cuda/CUDAGuard.h>
 #include <c10/cuda/CUDAStream.h>
 #include <c10/cuda/CUDAException.h>
@@ -12,9 +14,12 @@ constexpr int kSegmentSize = 64;  // 与此前 256 段长做单变量实验，�
 
 // 一个线程块的四个 warp 分别处理段内不同 Token；每线程仍负责四维。
 // 不创建连续历史副本，不展开 GQA 的 K/V，不使用 Tensor Core 或异步搬运。
+// 只实例化 BF16 与 INT8 两种读取方式，归约和分段合并共用；不是通用类型派发框架。
+template <typename KV>
 __global__ void paged_decode_kernel(
-    const c10::BFloat16* query, const c10::BFloat16* key,
-    const c10::BFloat16* value, const int64_t* table,
+    const c10::BFloat16* query, const KV* key,
+    const KV* value, const int64_t* table,
+    const c10::Half* key_scale, const c10::Half* value_scale,
     c10::BFloat16* output, float* partials, int64_t length,
     int kv_heads, int group_size, int segments) {
   const int lane = threadIdx.x % 32;
@@ -42,11 +47,24 @@ __global__ void paged_decode_kernel(
     const int64_t physical = table[token / kBlockSize];
     const int offset = token % kBlockSize;
     const int64_t index = ((physical * kv_heads + kv_head) * kBlockSize + offset) * kDim + lane;
+    float k_scale = 1.0f, v_scale = 1.0f;
+    if constexpr (std::is_same_v<KV, int8_t>) {
+      // scale 布局 [物理块, KV头, 块内Token, 1]，必须使用 KV 头而非 Query 头。
+      const int64_t scale_index = (physical * kv_heads + kv_head) * kBlockSize + offset;
+      if (lane == 0) {
+        k_scale = static_cast<float>(key_scale[scale_index]);
+        v_scale = static_cast<float>(value_scale[scale_index]);
+      }
+      k_scale = __shfl_sync(0xffffffffu, k_scale, 0);
+      v_scale = __shfl_sync(0xffffffffu, v_scale, 0);
+    }
     float sum = 0.0f;
     // 每轮 i 中相邻 lane 读取相邻维度：lane、lane+32、lane+64、lane+96。
 #pragma unroll
     for (int i = 0; i < 4; ++i) {
-      sum += q[i] * static_cast<float>(key[index + i * 32]);
+      float k = static_cast<float>(key[index + i * 32]);
+      if constexpr (std::is_same_v<KV, int8_t>) k *= k_scale;
+      sum += q[i] * k;
     }
     // 先合并线程内四项，再做 warp 归约；只使用 lane 0 的最终和。
     for (int delta = 16; delta > 0; delta /= 2) {
@@ -69,7 +87,9 @@ __global__ void paged_decode_kernel(
     new_weight = __shfl_sync(0xffffffffu, new_weight, 0);
 #pragma unroll
     for (int i = 0; i < 4; ++i) {
-      accumulator[i] = accumulator[i] * old_scale + new_weight * static_cast<float>(value[index + i * 32]);
+      float v = static_cast<float>(value[index + i * 32]);
+      if constexpr (std::is_same_v<KV, int8_t>) v *= v_scale;
+      accumulator[i] = accumulator[i] * old_scale + new_weight * v;
     }
     // Token 循环内仍只有私有状态与 warp shuffle，没有块级屏障。
   }
@@ -147,12 +167,15 @@ __global__ void merge_decode_kernel(const float* partials, c10::BFloat16* output
 }
 }  // 匿名命名空间：内部实现不暴露给其他编译单元。
 
-at::Tensor paged_decode_cuda(const at::Tensor& query, const at::Tensor& key,
+// 共用形状检查、块号检查、工作区与启动；两个公开入口固定各自精度。
+static at::Tensor paged_decode_impl(const at::Tensor& query, const at::Tensor& key,
                             const at::Tensor& value, const at::Tensor& table,
-                            int64_t length) {
+                            int64_t length, bool quantized,
+                            const at::Tensor& key_scale, const at::Tensor& value_scale) {
   TORCH_CHECK(query.is_cuda() && key.is_cuda() && value.is_cuda() && table.is_cuda(), "输入必须全部位于 CUDA");
   TORCH_CHECK(query.device() == key.device() && key.device() == value.device() && key.device() == table.device(), "输入必须位于同一设备");
-  TORCH_CHECK(query.scalar_type() == at::kBFloat16 && key.scalar_type() == at::kBFloat16 && value.scalar_type() == at::kBFloat16, "Q/K/V 必须是 BF16");
+  const auto kv_type = quantized ? at::kChar : at::kBFloat16;
+  TORCH_CHECK(query.scalar_type() == at::kBFloat16 && key.scalar_type() == kv_type && value.scalar_type() == kv_type, "Q 必须是 BF16，K/V 类型必须匹配所选入口");
   TORCH_CHECK(table.scalar_type() == at::kLong && table.dim() == 1, "块表必须是一维 int64");
   TORCH_CHECK(query.is_contiguous() && key.is_contiguous() && value.is_contiguous() && table.is_contiguous(), "V0 只接受连续布局张量");
   TORCH_CHECK(query.dim() == 4 && query.size(0) == 1 && query.size(2) == 1 && query.size(3) == kDim, "Q 必须是 [1, Query头数, 1, 128]");
@@ -160,6 +183,13 @@ at::Tensor paged_decode_cuda(const at::Tensor& query, const at::Tensor& key,
   const int64_t q_heads = query.size(1), kv_heads = key.size(1);
   TORCH_CHECK(q_heads > 0 && q_heads <= 1024 && kv_heads > 0 && q_heads % kv_heads == 0, "V0 要求 Query 头数不超过 1024 且是 KV 头数的正整数倍");
   TORCH_CHECK(length > 0 && (length - 1) / kBlockSize < table.numel(), "有效长度必须为正且块表必须足够长");
+  if (quantized) {
+    TORCH_CHECK(key_scale.is_cuda() && value_scale.is_cuda() && key_scale.device() == query.device() && value_scale.device() == query.device(), "scale 必须与 Q 同一 CUDA 设备");
+    TORCH_CHECK(key_scale.scalar_type() == at::kHalf && value_scale.scalar_type() == at::kHalf && key_scale.is_contiguous() && value_scale.is_contiguous(), "scale 必须是连续 FP16 张量");
+    TORCH_CHECK(key_scale.dim() == 4 && key_scale.sizes() == value_scale.sizes() && key_scale.size(0) == key.size(0) && key_scale.size(1) == kv_heads && key_scale.size(2) == kBlockSize && key_scale.size(3) == 1, "scale 必须是 [物理块数, KV头数, 16, 1]");
+    // 有效槽位的整数范围与有限正 scale 由已验证的量化写入保证；此处不扫描数值。
+    // 未写尾部允许哨兵值，内核只按有效长度读取；此入口不是不可信数据清洗器。
+  }
   const int64_t segment_count = (length - 1) / kSegmentSize + 1;
   TORCH_CHECK(segment_count <= 65535, "分段数超过二维 CUDA 网格上限");
   const int segments = static_cast<int>(segment_count);
@@ -179,11 +209,19 @@ at::Tensor paged_decode_cuda(const at::Tensor& query, const at::Tensor& key,
   }
   const dim3 grid(static_cast<unsigned int>(q_heads), static_cast<unsigned int>(segments));
   // 四个 warp 独立计算，段末才合并；跨段合并内核保持原样。
-  paged_decode_kernel<<<grid, 128, 0, stream>>>(
-      query.data_ptr<c10::BFloat16>(), key.data_ptr<c10::BFloat16>(),
-      value.data_ptr<c10::BFloat16>(), table.data_ptr<int64_t>(),
-      output.data_ptr<c10::BFloat16>(), partial_ptr, length, static_cast<int>(kv_heads),
-      static_cast<int>(q_heads / kv_heads), segments);
+  if (quantized) {
+    paged_decode_kernel<int8_t><<<grid, 128, 0, stream>>>(
+        query.data_ptr<c10::BFloat16>(), key.data_ptr<int8_t>(), value.data_ptr<int8_t>(),
+        table.data_ptr<int64_t>(), key_scale.data_ptr<c10::Half>(), value_scale.data_ptr<c10::Half>(),
+        output.data_ptr<c10::BFloat16>(), partial_ptr, length, static_cast<int>(kv_heads),
+        static_cast<int>(q_heads / kv_heads), segments);
+  } else {
+    paged_decode_kernel<c10::BFloat16><<<grid, 128, 0, stream>>>(
+        query.data_ptr<c10::BFloat16>(), key.data_ptr<c10::BFloat16>(),
+        value.data_ptr<c10::BFloat16>(), table.data_ptr<int64_t>(), nullptr, nullptr,
+        output.data_ptr<c10::BFloat16>(), partial_ptr, length, static_cast<int>(kv_heads),
+        static_cast<int>(q_heads / kv_heads), segments);
+  }
   C10_CUDA_KERNEL_LAUNCH_CHECK();
   if (segments > 1) {
     merge_decode_kernel<<<static_cast<unsigned int>(q_heads), kDim, 0, stream>>>(
@@ -191,4 +229,15 @@ at::Tensor paged_decode_cuda(const at::Tensor& query, const at::Tensor& key,
     C10_CUDA_KERNEL_LAUNCH_CHECK();
   }
   return output;
+}
+
+at::Tensor paged_decode_cuda(const at::Tensor& query, const at::Tensor& key,
+                            const at::Tensor& value, const at::Tensor& table, int64_t length) {
+  return paged_decode_impl(query, key, value, table, length, false, at::Tensor(), at::Tensor());
+}
+
+at::Tensor paged_decode_int8_cuda(const at::Tensor& query, const at::Tensor& key,
+                                 const at::Tensor& value, const at::Tensor& key_scale,
+                                 const at::Tensor& value_scale, const at::Tensor& table, int64_t length) {
+  return paged_decode_impl(query, key, value, table, length, true, key_scale, value_scale);
 }

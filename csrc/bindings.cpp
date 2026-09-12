@@ -7,8 +7,14 @@ at::Tensor paged_decode_cuda(const at::Tensor& query, const at::Tensor& key,
                             const at::Tensor& value, const at::Tensor& table,
                             int64_t length);
 
+// INT8 入口仍只读缓存；scale 为每 Token、每 KV 头的 FP16，K/V 分离。
+at::Tensor paged_decode_int8_cuda(const at::Tensor& query, const at::Tensor& key,
+                                 const at::Tensor& value, const at::Tensor& key_scale,
+                                 const at::Tensor& value_scale, const at::Tensor& table, int64_t length);
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, module) {
   // 保留原有 Smoke，便于区分扩展链路错误与 Attention 错误。
   module.def("smoke_add", &smoke_add_cuda, "两个 CUDA Tensor 逐元素相加");
   module.def("paged_decode", &paged_decode_cuda, "单请求 BF16 分页 Decode V0");
+  module.def("paged_decode_int8", &paged_decode_int8_cuda, "单请求 INT8 分页 Decode 融合反量化，输出 BF16");
 }

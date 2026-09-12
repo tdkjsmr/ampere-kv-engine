@@ -8,6 +8,7 @@ import torch
 
 from ampere_kv import _C
 from ampere_kv.paged_cache import PagedKVCache, PagedKVStorage
+from ampere_kv.quantization import quantize_kv
 
 
 @torch.inference_mode()
@@ -71,6 +72,73 @@ def benchmark() -> None:
             cache.release()
             assert storage._pool.num_free_blocks == length // 16
     print("[完成] 三种长度调用基线；不能据此宣称独立内核或端到端加速比")
+
+
+@torch.inference_mode()
+def check_int8() -> None:
+    """同一 INT8 数据与 scale 的融合/独立反量化对照，不测试量化前后的模型质量。"""
+    generator = torch.Generator().manual_seed(2)
+    # 同时覆盖空 warp、物理块边界、分段边界及两种头映射；不改变原 BF16 随机输入。
+    for q_heads, kv_heads, length in ((2, 2, 1), (2, 2, 17), (2, 2, 65),
+                                     (32, 8, 1), (32, 8, 17), (32, 8, 65)):
+        blocks = max(3, (length + 15) // 16)
+        storage = PagedKVStorage(kv_heads, 128, blocks, 16, device="cuda", kv_dtype=torch.int8)
+        cache = PagedKVCache(storage)
+        tensors = (storage._key, storage._value, storage._key_scale, storage._value_scale)
+        for tensor in tensors:
+            tensor.fill_(-128 if tensor.dtype == torch.int8 else float("nan"))
+        held = [storage._pool.allocate() for _ in range(blocks)]
+        for block in held:
+            storage._pool.free(block)
+        query = torch.randn(1, q_heads, 1, 128, generator=generator).to(torch.bfloat16)
+        amplitude = torch.linspace(0.1, 2, kv_heads * length).reshape(1, kv_heads, length, 1)
+        key = (torch.randn(1, kv_heads, length, 128, generator=generator) * amplitude).to(torch.bfloat16)
+        value = (torch.randn(1, kv_heads, length, 128, generator=generator) * (3 - amplitude)).to(torch.bfloat16)
+        # CPU 独立量化；不从被测分页 get 构造数学参考。FP16 scale 在 FP64 中精确读取。
+        kd, ks = quantize_kv(key)
+        vd, vs = quantize_kv(value)
+        mapping = torch.arange(q_heads) // (q_heads // kv_heads)
+        k = (kd.double() * ks.double()).index_select(1, mapping)
+        v = (vd.double() * vs.double()).index_select(1, mapping)
+        expected = torch.softmax((query.double() @ k.transpose(-2, -1)) * 128 ** -0.5, dim=-1) @ v
+        try:
+            cache.append(key.cuda(), value.cuda())
+            table = torch.tensor(cache._table.block_ids, dtype=torch.long, device="cuda")
+            q = query.cuda()
+            addresses = tuple(t.data_ptr() for t in tensors)
+            # 核对 GPU 写入确实对应同一组整数和 scale，避免把量化差异归咎于读取内核。
+            for physical_tensor, reference in zip(tensors, (kd, vd, ks, vs)):
+                physical = physical_tensor.cpu()
+                for token in range(length):
+                    block = cache._table.block_ids[token // 16]
+                    assert torch.equal(physical[block, :, token % 16], reference[0, :, token])
+            actual = _C.paged_decode_int8(q, *tensors, table, length)
+            result = actual.cpu()
+            error = (result.double() - expected).abs().max().item()
+            print(f"[诊断] INT8 融合：Q头={q_heads}，KV头={kv_heads}，长度={length}，FP64参考误差={error:.8g}，rtol=0.01，atol=0.002")
+            assert result.shape == query.shape and result.dtype == torch.bfloat16
+            assert torch.isfinite(result).all() and torch.isfinite(expected).all()
+            # 沿用 BF16 输出的初始容差；对照的是相同量化数据，而非原始 BF16 K/V。
+            torch.testing.assert_close(result.double(), expected, rtol=0.01, atol=0.002)
+            if length == 1:
+                torch.testing.assert_close(result, v.to(torch.bfloat16), rtol=0, atol=0)
+            bad_table = table.clone()
+            bad_table[0] = blocks
+            for bad_scale, selected_table in ((storage._key_scale.float(), table),
+                                               (storage._key_scale[:, :, :, :0], table),
+                                               (storage._key_scale, bad_table)):
+                try:
+                    _C.paged_decode_int8(q, storage._key, storage._value, bad_scale, storage._value_scale, selected_table, length)
+                except RuntimeError:
+                    pass
+                else:
+                    raise AssertionError("非法 scale 类型/形状或块编号未被拒绝")
+            assert cache.length == length and tuple(t.data_ptr() for t in tensors) == addresses
+        finally:
+            cache.release()
+        assert storage._pool.num_free_blocks == blocks
+        print("[PASS] INT8 融合数值对照、非法输入拒绝和块归还通过")
+    print("[PASS] INT8 CUDA 六个场景通过；未验证模型、长上下文、量化写入融合或性能")
 
 
 def main() -> None:
@@ -168,6 +236,7 @@ def main() -> None:
         assert storage._pool.num_free_blocks == num_blocks
         print(f"[PASS] {label}：数值对照、非法块号拒绝与块归还通过")
     print(f"[PASS] CUDA 分页 Decode {len(cases)} 个场景通过（最长 513 Token）；不代表完整长上下文、模型、性能或 CUDA Graph 验证通过")
+    check_int8()
 
 
 if __name__ == "__main__":
