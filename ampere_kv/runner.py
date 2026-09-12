@@ -522,12 +522,33 @@ def check_int8_decode(model, input_ids) -> None:
         k = (kd.double() * ks.double()).index_select(1, mapping)
         v = (vd.double() * vs.double()).index_select(1, mapping)
         q = query.cpu().double()
-        expected = torch.softmax((q @ k.transpose(-2, -1)) * 128 ** -0.5, dim=-1) @ v
+        quantized_weights = torch.softmax((q @ k.transpose(-2, -1)) * 128 ** -0.5, dim=-1)
+        expected = quantized_weights @ v
         error = (actual.cpu().double() - expected).abs().max().item()
         print(f"[诊断] 第一层 INT8 Decode：Token ID={first_token.item()}，位置={length}，输出形状={tuple(actual.shape)}")
         print(f"[诊断] 融合 CUDA / 同量化数据 FP64：最大绝对误差={error:.8g}，rtol=0.01，atol=0.002")
         torch.testing.assert_close(actual.cpu().double(), expected, rtol=0.01, atol=0.002)
         print("[PASS] 第一层 INT8 融合 Attention 与独立反量化参考对照通过")
+
+        # 固定 Q 和 FP64 公式，只改变 K/V 的表示，隔离量化对权重和内容的影响。
+        # 原始 BF16 数值转 FP64 并不会恢复 BF16 之前的精度，这里只比较 KV 量化增量。
+        original_k = original_key.cpu().double().index_select(1, mapping)
+        original_v = original_value.cpu().double().index_select(1, mapping)
+        original_weights = torch.softmax((q @ original_k.transpose(-2, -1)) * 128 ** -0.5, dim=-1)
+        original_output = original_weights @ original_v
+        reference_norm = original_output.norm().clamp_min(1e-12)
+        head_norm = original_output.norm(dim=-1).clamp_min(1e-12)
+        print("[诊断] 量化归因：同一 Q、同一 FP64 公式；最差头按逐头相对L2选择，编号从0开始，分母下限=1e-12")
+        for label, output in (("仅量化K", quantized_weights @ original_v),
+                              ("仅量化V", original_weights @ v), ("同时量化K/V", expected)):
+            # K 决定 softmax 权重，V 决定被加权的内容；两者共同误差不能简单相加。
+            delta = output - original_output
+            head_relative = delta.norm(dim=-1) / head_norm
+            head_cosine = torch.nn.functional.cosine_similarity(output, original_output, dim=-1, eps=1e-12)
+            worst_head = head_relative.reshape(-1).argmax().item()
+            print(f"[观测] {label}：最大绝对误差={delta.abs().max().item():.8g}，相对L2={(delta.norm() / reference_norm).item():.8g}，逐头平均余弦={head_cosine.mean().item():.8g}")
+            print(f"[观测] 最差Query头={worst_head}，对应KV头={mapping[worst_head].item()}，该头相对L2={head_relative[0, worst_head, 0].item():.8g}，余弦={head_cosine[0, worst_head, 0].item():.8g}，参考范数={original_output[0, worst_head, 0].norm().item():.8g}")
+        # 这里只定位本次输入的偏差，不新增精度验收阈值，也不据此宣称模型质量通过。
 
         # BF16 SDPA 使用未量化的同一份真实 K/V。与融合输出比较是综合影响，
         # 同时包含量化、计算路径与输出舍入差异，不将它称为纯量化误差或模型验收。
