@@ -522,7 +522,8 @@ def check_int8_decode(model, input_ids) -> None:
         k = (kd.double() * ks.double()).index_select(1, mapping)
         v = (vd.double() * vs.double()).index_select(1, mapping)
         q = query.cpu().double()
-        quantized_weights = torch.softmax((q @ k.transpose(-2, -1)) * 128 ** -0.5, dim=-1)
+        quantized_scores = (q @ k.transpose(-2, -1)) * 128 ** -0.5
+        quantized_weights = torch.softmax(quantized_scores, dim=-1)
         expected = quantized_weights @ v
         error = (actual.cpu().double() - expected).abs().max().item()
         print(f"[诊断] 第一层 INT8 Decode：Token ID={first_token.item()}，位置={length}，输出形状={tuple(actual.shape)}")
@@ -534,7 +535,8 @@ def check_int8_decode(model, input_ids) -> None:
         # 原始 BF16 数值转 FP64 并不会恢复 BF16 之前的精度，这里只比较 KV 量化增量。
         original_k = original_key.cpu().double().index_select(1, mapping)
         original_v = original_value.cpu().double().index_select(1, mapping)
-        original_weights = torch.softmax((q @ original_k.transpose(-2, -1)) * 128 ** -0.5, dim=-1)
+        original_scores = (q @ original_k.transpose(-2, -1)) * 128 ** -0.5
+        original_weights = torch.softmax(original_scores, dim=-1)
         original_output = original_weights @ original_v
         reference_norm = original_output.norm().clamp_min(1e-12)
         head_norm = original_output.norm(dim=-1).clamp_min(1e-12)
@@ -548,6 +550,27 @@ def check_int8_decode(model, input_ids) -> None:
             worst_head = head_relative.reshape(-1).argmax().item()
             print(f"[观测] {label}：最大绝对误差={delta.abs().max().item():.8g}，相对L2={(delta.norm() / reference_norm).item():.8g}，逐头平均余弦={head_cosine.mean().item():.8g}")
             print(f"[观测] 最差Query头={worst_head}，对应KV头={mapping[worst_head].item()}，该头相对L2={head_relative[0, worst_head, 0].item():.8g}，余弦={head_cosine[0, worst_head, 0].item():.8g}，参考范数={original_output[0, worst_head, 0].norm().item():.8g}")
+            if label == "仅量化K":
+                # 动态选择本次最差头，不硬编码上次的头8；位置是含模板的逻辑 Token 位置。
+                kv_head = mapping[worst_head].item()
+                before = original_scores[0, worst_head, 0]
+                after = quantized_scores[0, worst_head, 0]
+                score_delta = after - before
+                position = score_delta.abs().argmax().item()
+                key_vector = original_k[0, worst_head, position]
+                key_error = k[0, worst_head, position] - key_vector
+                print(f"[定位] K分数最大变化位置={position}（0起，含当前Token），原分数={before[position].item():.8g}，量化后={after[position].item():.8g}，变化={score_delta[position].item():.8g}")
+                print(f"[定位] 该位置K：最大绝对值={key_vector.abs().max().item():.8g}，RMS={key_vector.square().mean().sqrt().item():.8g}，scale={ks[0, kv_head, position, 0].item():.8g}，最大量化误差={key_error.abs().max().item():.8g}")
+                weights_before = original_weights[0, worst_head, 0]
+                weights_after = quantized_weights[0, worst_head, 0]
+                weight_delta = (weights_after - weights_before).abs()
+                weight_position = weight_delta.argmax().item()
+                # 分数最大变化位置不一定是权重最大变化位置；Softmax 对统一平移不敏感。
+                print(f"[定位] 权重变化：最大绝对差={weight_delta.max().item():.8g}，位置={weight_position}，原权重={weights_before[weight_position].item():.8g}，量化后={weights_after[weight_position].item():.8g}，L1总量={weight_delta.sum().item():.8g}")
+                for name, weights in (("原始K", weights_before), ("量化K", weights_after)):
+                    values, positions = weights.topk(min(3, weights.numel()))
+                    entries = [(pos, round(weight, 8)) for pos, weight in zip(positions.tolist(), values.tolist())]
+                    print(f"[定位] {name}注意力前三项（逻辑位置, 权重）={entries}")
         # 这里只定位本次输入的偏差，不新增精度验收阈值，也不据此宣称模型质量通过。
 
         # BF16 SDPA 使用未量化的同一份真实 K/V。与融合输出比较是综合影响，
