@@ -12,7 +12,8 @@
 
 BF16 模型对照和 INT8 六个小型 CUDA 场景已有 RTX 3090 验证结果。
 K scale已改为每32维一组，V仍每Token每KV头一个scale；新存储CPU检查通过。
-分组CUDA读取与第一层真实对照已适配，等待重新编译和GPU验证；历史结果不代表新内核通过。
+分组CUDA读取与第一层真实对照已在临时sm_89实例通过检查，不代表3090新版本或性能验证。
+int8-check现升级为共享BF16 Prefill后的全模型一次INT8/BF16 CUDA Decode，等待云端验证。
 当前不提供多请求调度、在线服务或通用模型适配。
 
 ## 运行
@@ -28,7 +29,7 @@ make smoke
 # 本轮：分组K存储与参考读回，CPU执行，无需GPU。
 python -m ampere_kv.paged_cache
 
-# 本轮重新make build后：分组INT8算子与第一层真实Attention对照。
+# 已有分组扩展编译通过后：算子检查与全模型一次INT8/BF16 CUDA Decode。
 python -m ampere_kv.paged_decode
 python -m ampere_kv.runner --mode int8-check --cache paged
 

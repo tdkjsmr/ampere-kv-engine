@@ -117,13 +117,19 @@ def decoder_layer_forward(
     query, key = apply_rope(query, key, position_ids, config)
     # 只有缓存 Attention 的阶段不同，归一化、投影、RoPE、残差与 MLP 共用原实现。
     if cuda_decode:
-        # 可选后端仅由 cuda-check 开启；普通生成不导入扩展。
+        # CUDA对照按缓存类型选择内核；普通SDPA生成不导入扩展。
         from ampere_kv import _C
 
         # 单 Token K/V 只追加一次；CUDA 直接读物理存储，不调用 get 或复制 GQA 头。
         cache.append(key, value)
         table = torch.tensor(cache._table.block_ids, dtype=torch.long, device=query.device)
-        head_output = _C.paged_decode(query.contiguous(), cache._key, cache._value, table, cache.length)
+        if cache._key.dtype == torch.int8:
+            head_output = _C.paged_decode_int8(
+                query.contiguous(), cache._key, cache._value,
+                cache._key_scale, cache._value_scale, table, cache.length,
+            )
+        else:
+            head_output = _C.paged_decode(query.contiguous(), cache._key, cache._value, table, cache.length)
     else:
         attention_fn = prefill_attention if is_prefill else decode_attention
         head_output = attention_fn(query, key, value, cache)
@@ -183,6 +189,11 @@ def model_forward(model, input_ids, position_ids, caches, *, is_prefill: bool, c
             hidden_states, layer, position_ids, cache, model.config, is_prefill=is_prefill, cuda_decode=cuda_decode,
         )
     # Prefill 和 Decode 共用末尾归一化与输出投影，不另写一套生成计算。
+    return final_logits(model, hidden_states)
+
+
+def final_logits(model, hidden_states):
+    """共用末尾归一化和LM Head，只返回最后位置的logits，不读写缓存。"""
     norm = model.model.norm
     normalized = rms_norm(hidden_states, norm.weight, norm.variance_epsilon)
     return torch.nn.functional.linear(normalized[:, -1:, :], model.lm_head.weight, model.lm_head.bias)
@@ -470,111 +481,82 @@ def check_cuda_decode(model, input_ids) -> None:
 
 @torch.inference_mode()
 def check_int8_decode(model, input_ids) -> None:
-    """仅检查第一层一次真实 Decode Attention；不接管模型生成，不测性能。"""
-    from ampere_kv import _C
-    from ampere_kv.quantization import quantize_kv
-
-    layer = model.model.layers[0]
-    if model.config.head_dim != 128 or layer.self_attn.sliding_window is not None:
-        raise ValueError("本对照仅支持每头 128 维、无滑动窗口的 Attention")
+    """共享BF16 Prefill，比较两套缓存的全模型一次CUDA Decode；不测性能。"""
+    config = model.config
     length = input_ids.shape[1]
-    # HF 只负责选出真实的首个贪心 Token，不保留它的全模型 KV 缓存。
-    # 即使首个 Token 是 EOS，本入口也强制计算一次诊断 Decode，不视为正常生成。
-    first_token = model(input_ids=input_ids, use_cache=False).logits[:, -1:].argmax(dim=-1)
-
-    def prepare(ids, positions):
-        # 第一层输入就是 Embedding；复用已有 Pre-Norm、Q/K 归一化和 RoPE。
-        hidden = model.model.embed_tokens.weight[ids]
-        norm = layer.input_layernorm
-        q, k, v = project_qkv(rms_norm(hidden, norm.weight, norm.variance_epsilon), layer.self_attn)
-        q, k = apply_rope(q, k, positions, model.config)
-        return q, k, v
-
-    _, history_key, history_value = prepare(input_ids, torch.arange(length, device=input_ids.device)[None])
-    query, new_key, new_value = prepare(first_token, input_ids.new_tensor([[length]]))
-    # 连续原始 K/V 只用于本次诊断参考，不是生产路径里的常驻 BF16 副本。
-    original_key = torch.cat((history_key, new_key), dim=2)
-    original_value = torch.cat((history_value, new_value), dim=2)
     blocks = (length + 1 + PAGED_BLOCK_SIZE - 1) // PAGED_BLOCK_SIZE
-    storage = PagedKVStorage(new_key.shape[1], 128, blocks, PAGED_BLOCK_SIZE,
-                            device=query.device, kv_dtype=torch.int8)
-    cache = PagedKVCache(storage)
-    tensors = (cache._key, cache._value, cache._key_scale, cache._value_scale)
-    addresses = tuple(t.data_ptr() for t in tensors)
+    reference_caches, quantized_caches = [], []
+    positions = torch.arange(length, device=input_ids.device)[None]
+    hidden = model.model.embed_tokens.weight[input_ids]
     try:
-        cache.append(history_key, history_value)
-        assert cache.length == length
-        cache.append(new_key, new_value)
-        assert cache.length == length + 1
-        table = torch.tensor(cache._table.block_ids, dtype=torch.long, device=query.device)
-        actual = _C.paged_decode_int8(query.contiguous(), *tensors, table, cache.length)
-        assert actual.shape == query.shape and actual.dtype == torch.bfloat16
-        assert torch.isfinite(actual).all().item()
-
-        # CPU 从原始 K/V 独立量化，先核对分页读回，再构造 FP64 数学参考。
-        # 这样融合计算误差不掺入“原始 BF16 与 INT8 表示不同”的量化误差。
-        # 独立按连续32维切片，避免与分页写入共用同一种reshape而掩盖映射错误。
-        cpu_key = original_key.cpu()
-        groups = [quantize_kv(cpu_key[..., start:start + 32]) for start in range(0, 128, 32)]
-        restored_reference = torch.cat([data.double() * scale.double() for data, scale in groups], dim=-1)
-        vd, vs = quantize_kv(original_value.cpu())
-        restored_key, restored_value = cache.get()
-        torch.testing.assert_close(restored_key.cpu(), restored_reference.float(), rtol=0, atol=0)
-        torch.testing.assert_close(restored_value.cpu(), vd.float() * vs.float(), rtol=0, atol=0)
-        mapping = torch.arange(query.shape[1]) // (query.shape[1] // new_key.shape[1])
-        k = restored_reference.index_select(1, mapping)
-        v = (vd.double() * vs.double()).index_select(1, mapping)
-        q = query.cpu().double()
-        quantized_scores = (q @ k.transpose(-2, -1)) * 128 ** -0.5
-        quantized_weights = torch.softmax(quantized_scores, dim=-1)
-        expected = quantized_weights @ v
-        error = (actual.cpu().double() - expected).abs().max().item()
-        print(f"[诊断] 第一层 INT8 Decode：Token ID={first_token.item()}，位置={length}，输出形状={tuple(actual.shape)}")
-        print(f"[诊断] 融合 CUDA / 同量化数据 FP64：最大绝对误差={error:.8g}，rtol=0.01，atol=0.002")
-        torch.testing.assert_close(actual.cpu().double(), expected, rtol=0.01, atol=0.002)
-        print("[PASS] 第一层 INT8 融合 Attention 与独立反量化参考对照通过")
-
-        # 固定 Q 和 FP64 公式，只改变 K/V 的表示，隔离量化对权重和内容的影响。
-        # 原始 BF16 数值转 FP64 并不会恢复 BF16 之前的精度，这里只比较 KV 量化增量。
-        original_k = original_key.cpu().double().index_select(1, mapping)
-        original_v = original_value.cpu().double().index_select(1, mapping)
-        original_scores = (q @ original_k.transpose(-2, -1)) * 128 ** -0.5
-        original_weights = torch.softmax(original_scores, dim=-1)
-        original_output = original_weights @ original_v
-        # 保留分组方案整体及最差头观测，删除已完成使命的单scale归因与前三项打印。
-        delta = expected - original_output
-        head_relative = delta.norm(dim=-1) / original_output.norm(dim=-1).clamp_min(1e-12)
-        head_cosine = torch.nn.functional.cosine_similarity(expected, original_output, dim=-1, eps=1e-12)
-        worst_head = head_relative.reshape(-1).argmax().item()
-        print(f"[观测] 分组K+INT8 V / 原始KV（同FP64公式）：相对L2={(delta.norm() / original_output.norm().clamp_min(1e-12)).item():.8g}，平均余弦={head_cosine.mean().item():.8g}")
-        print(f"[观测] 最差Query头={worst_head}，相对L2={head_relative[0, worst_head, 0].item():.8g}，余弦={head_cosine[0, worst_head, 0].item():.8g}；不是模型精度验收")
-
-        # BF16 SDPA 使用未量化的同一份真实 K/V。与融合输出比较是综合影响，
-        # 同时包含量化、计算路径与输出舍入差异，不将它称为纯量化误差或模型验收。
-        gpu_mapping = mapping.to(query.device)
-        baseline = torch.nn.functional.scaled_dot_product_attention(
-            query.contiguous(), original_key.index_select(1, gpu_mapping).contiguous(),
-            original_value.index_select(1, gpu_mapping).contiguous(),
-            dropout_p=0.0, is_causal=False, scale=128 ** -0.5,
-        )
-        assert torch.isfinite(baseline).all().item()
-        difference = actual.float() - baseline.float()
-        relative = difference.norm() / baseline.float().norm().clamp_min(1e-12)
-        cosine = torch.nn.functional.cosine_similarity(actual.float(), baseline.float(), dim=-1).mean()
-        print(f"[观测] INT8 融合 / 原始 BF16 SDPA：最大绝对误差={difference.abs().max().item():.8g}，相对L2={relative.item():.8g}，逐头平均余弦={cosine.item():.8g}；不是模型精度验收")
-        assert cache.length == length + 1 and tuple(t.data_ptr() for t in tensors) == addresses
-        print(f"[PASS] 缓存长度={cache.length}，存储地址不变，Decode 跨块={length % PAGED_BLOCK_SIZE == 0}")
+        # 只走一次BF16 Prefill，逐层将同一份RoPE后的K和原始V保存成两种表示。
+        # INT8缓存不参与Prefill Attention，避免起点已经是两套不同的隐藏状态。
+        for layer in model.model.layers:
+            for caches, dtype in ((reference_caches, torch.bfloat16), (quantized_caches, torch.int8)):
+                storage = PagedKVStorage(config.num_key_value_heads, config.head_dim, blocks,
+                                        PAGED_BLOCK_SIZE, device=input_ids.device, kv_dtype=dtype)
+                caches.append(PagedKVCache(storage))
+            hidden = decoder_layer_forward(hidden, layer, positions, reference_caches[-1], config, is_prefill=True)
+            # get只在诊断准备阶段复制当前层历史；Decode直接由CUDA读取物理块。
+            key, value = reference_caches[-1].get()
+            quantized_caches[-1].append(key, value)
+        first_logits = final_logits(model, hidden)
+        assert torch.isfinite(first_logits).all().item()
+        first_token = first_logits.argmax(dim=-1)
+        all_caches = reference_caches + quantized_caches
+        assert all(cache.length == length for cache in all_caches)
+        tensors = [tensor for cache in all_caches
+                   for tensor in (cache._key, cache._value, cache._key_scale, cache._value_scale)
+                   if tensor is not None]
+        addresses = [tensor.data_ptr() for tensor in tensors]
+        print(f"[PASS] 共用BF16 Prefill完成：层数={len(reference_caches)}，KV长度={length}，首Token={first_token.item()}")
+        # 即使首Token为EOS也强制诊断一次，不代表正常生成应该忽略EOS。
+        # 释放大段隐藏状态引用，两个Decode分支共用权重但不共享可变缓存。
+        del hidden, first_logits, key, value
+        reference_hidden = model.model.embed_tokens.weight[first_token]
+        quantized_hidden = reference_hidden
+        positions = input_ids.new_tensor([[length]])
+        for layer, reference_cache, quantized_cache in zip(model.model.layers, reference_caches, quantized_caches):
+            reference_hidden = decoder_layer_forward(
+                reference_hidden, layer, positions, reference_cache, config, is_prefill=False, cuda_decode=True,
+            )
+            quantized_hidden = decoder_layer_forward(
+                quantized_hidden, layer, positions, quantized_cache, config, is_prefill=False, cuda_decode=True,
+            )
+        reference = final_logits(model, reference_hidden)
+        actual = final_logits(model, quantized_hidden)
+        # 从第二层开始隐藏状态可以不同：这里观测全模型误差传播，不是同Q/K/V算子对照。
+        for label, result, baseline in (("最后Decoder隐藏状态", quantized_hidden, reference_hidden),
+                                        ("最终logits", actual, reference)):
+            assert torch.isfinite(result).all().item() and torch.isfinite(baseline).all().item()
+            delta = result.float() - baseline.float()
+            relative = delta.norm() / baseline.float().norm().clamp_min(1e-12)
+            cosine = torch.nn.functional.cosine_similarity(result.float(), baseline.float(), dim=-1).mean()
+            print(f"[观测] {label} INT8/BF16 CUDA：最大绝对误差={delta.abs().max().item():.8g}，相对L2={relative.item():.8g}，余弦={cosine.item():.8g}")
+        reference_id, actual_id = reference.argmax(dim=-1).item(), actual.argmax(dim=-1).item()
+        # 两条路径的argmax可因量化而不同，不把一致选词冒充完整精度验收。
+        print(f"[观测] 第二Token：BF16={reference_id}，INT8={actual_id}，一致={reference_id == actual_id}")
+        top_values, top_ids = reference[0, 0].float().topk(2)
+        selected = actual[0, 0, top_ids].float()
+        print(f"[观测] BF16前两名ID={top_ids.tolist()}，logits={top_values.tolist()}，差距={(top_values[0] - top_values[1]).item():.8g}")
+        print(f"[观测] INT8在上述相同ID的logits={selected.tolist()}，差距={(selected[0] - selected[1]).item():.8g}（不是INT8自身前两名）")
+        assert all(cache.length == length + 1 for cache in all_caches)
+        assert addresses == [tensor.data_ptr() for cache in all_caches
+                             for tensor in (cache._key, cache._value, cache._key_scale, cache._value_scale)
+                             if tensor is not None]
+        print(f"[PASS] 全部层两套KV长度={length + 1}，地址不变，Decode跨块={length % PAGED_BLOCK_SIZE == 0}")
     finally:
-        cache.release()
-    assert storage._pool.num_free_blocks == blocks
-    print("[PASS] 第一层 INT8 诊断块已全部归还；未验证输出投影、完整层、连续生成、长上下文或性能")
+        for cache in reference_caches + quantized_caches:
+            cache.release()
+    assert all(cache._pool.num_free_blocks == blocks for cache in reference_caches + quantized_caches)
+    print("[PASS] 两套缓存块全部归还；本轮仅全模型一次Decode运行与缓存检查，不代表精度验收、独立HF对照、连续生成或性能通过")
 
 
 def main() -> None:
     """加载与分词只做一次；选择对照或纯生成模式，最后统一展示结果。"""
     parser = argparse.ArgumentParser(description="Qwen3 自建 BF16 生成与正确性对照")
     # 默认保留对照行为；纯生成须显式选择，避免把输出文本误认为验证通过。
-    parser.add_argument("--mode", choices=("check", "generate", "benchmark", "cuda-check", "int8-check"), default="check", help="check：HF 对照；generate：纯生成；benchmark：纯生成基线；cuda-check：有界 CUDA Decode 对照；int8-check：第一层 INT8 Attention 对照")
+    parser.add_argument("--mode", choices=("check", "generate", "benchmark", "cuda-check", "int8-check"), default="check", help="check：HF 对照；generate：纯生成；benchmark：纯生成基线；cuda-check：有界 CUDA Decode 对照；int8-check：全模型一次 INT8/BF16 CUDA Decode")
     parser.add_argument("--repeats", type=int, default=3, help="benchmark 模式测量次数，默认 3，另有 1 次预热")
     parser.add_argument("--cache", choices=("contiguous", "paged"), default="contiguous", help="默认连续缓存；paged 为每块 16 Token 的分页参考")
     args = parser.parse_args()
@@ -602,7 +584,7 @@ def main() -> None:
     model.eval()
     if args.mode == "int8-check":
         check_int8_decode(model, input_ids)
-        return  # 只诊断一次 Attention，不打印完整生成通过或性能结论。
+        return  # 仅一次全模型Decode，不打印连续生成通过或性能结论。
     if args.mode == "cuda-check":
         check_cuda_decode(model, input_ids)
         return  # 对照入口自行汇总，不能落入下面的普通生成结果打印。
