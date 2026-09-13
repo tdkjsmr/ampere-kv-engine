@@ -49,13 +49,13 @@ __global__ void paged_decode_kernel(
     const int64_t index = ((physical * kv_heads + kv_head) * kBlockSize + offset) * kDim + lane;
     float k_scale = 1.0f, v_scale = 1.0f;
     if constexpr (std::is_same_v<KV, int8_t>) {
-      // scale 布局 [物理块, KV头, 块内Token, 1]，必须使用 KV 头而非 Query 头。
+      // K scale末维4、V末维1；必须使用KV头而非Query头。
       const int64_t scale_index = (physical * kv_heads + kv_head) * kBlockSize + offset;
+      // lane 0..3各读一组K scale，下面按维度组编号广播，不需要共享内存。
+      if (lane < 4) k_scale = static_cast<float>(key_scale[scale_index * 4 + lane]);
       if (lane == 0) {
-        k_scale = static_cast<float>(key_scale[scale_index]);
         v_scale = static_cast<float>(value_scale[scale_index]);
       }
-      k_scale = __shfl_sync(0xffffffffu, k_scale, 0);
       v_scale = __shfl_sync(0xffffffffu, v_scale, 0);
     }
     float sum = 0.0f;
@@ -63,7 +63,8 @@ __global__ void paged_decode_kernel(
 #pragma unroll
     for (int i = 0; i < 4; ++i) {
       float k = static_cast<float>(key[index + i * 32]);
-      if constexpr (std::is_same_v<KV, int8_t>) k *= k_scale;
+      // lane+i*32属于第i组；全部lane参与shuffle，从lane i获取该组scale。
+      if constexpr (std::is_same_v<KV, int8_t>) k *= __shfl_sync(0xffffffffu, k_scale, i);
       sum += q[i] * k;
     }
     // 先合并线程内四项，再做 warp 归约；只使用 lane 0 的最终和。
@@ -186,7 +187,8 @@ static at::Tensor paged_decode_impl(const at::Tensor& query, const at::Tensor& k
   if (quantized) {
     TORCH_CHECK(key_scale.is_cuda() && value_scale.is_cuda() && key_scale.device() == query.device() && value_scale.device() == query.device(), "scale 必须与 Q 同一 CUDA 设备");
     TORCH_CHECK(key_scale.scalar_type() == at::kHalf && value_scale.scalar_type() == at::kHalf && key_scale.is_contiguous() && value_scale.is_contiguous(), "scale 必须是连续 FP16 张量");
-    TORCH_CHECK(key_scale.dim() == 4 && key_scale.sizes() == value_scale.sizes() && key_scale.size(0) == key.size(0) && key_scale.size(1) == kv_heads && key_scale.size(2) == kBlockSize && key_scale.size(3) == 1, "scale 必须是 [物理块数, KV头数, 16, 1]");
+    TORCH_CHECK(key_scale.dim() == 4 && key_scale.size(0) == key.size(0) && key_scale.size(1) == kv_heads && key_scale.size(2) == kBlockSize && key_scale.size(3) == 4, "K scale必须是 [物理块数, KV头数, 16, 4]，请使用分组K存储");
+    TORCH_CHECK(value_scale.dim() == 4 && value_scale.size(0) == key.size(0) && value_scale.size(1) == kv_heads && value_scale.size(2) == kBlockSize && value_scale.size(3) == 1, "V scale必须是 [物理块数, KV头数, 16, 1]");
     // 有效槽位的整数范围与有限正 scale 由已验证的量化写入保证；此处不扫描数值。
     // 未写尾部允许哨兵值，内核只按有效长度读取；此入口不是不可信数据清洗器。
   }

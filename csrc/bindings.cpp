@@ -7,7 +7,7 @@ at::Tensor paged_decode_cuda(const at::Tensor& query, const at::Tensor& key,
                             const at::Tensor& value, const at::Tensor& table,
                             int64_t length);
 
-// INT8 入口仍只读缓存；scale 为每 Token、每 KV 头的 FP16，K/V 分离。
+// INT8入口只读缓存：每Token、每KV头的K有四组FP16 scale，V有一个。
 at::Tensor paged_decode_int8_cuda(const at::Tensor& query, const at::Tensor& key,
                                  const at::Tensor& value, const at::Tensor& key_scale,
                                  const at::Tensor& value_scale, const at::Tensor& table, int64_t length);

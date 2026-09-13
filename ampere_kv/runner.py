@@ -471,7 +471,6 @@ def check_cuda_decode(model, input_ids) -> None:
 @torch.inference_mode()
 def check_int8_decode(model, input_ids) -> None:
     """仅检查第一层一次真实 Decode Attention；不接管模型生成，不测性能。"""
-    raise RuntimeError("INT8真实对照暂时停用：分组K存储等待CUDA适配")
     from ampere_kv import _C
     from ampere_kv.quantization import quantize_kv
 
@@ -514,13 +513,16 @@ def check_int8_decode(model, input_ids) -> None:
 
         # CPU 从原始 K/V 独立量化，先核对分页读回，再构造 FP64 数学参考。
         # 这样融合计算误差不掺入“原始 BF16 与 INT8 表示不同”的量化误差。
-        kd, ks = quantize_kv(original_key.cpu())
+        # 独立按连续32维切片，避免与分页写入共用同一种reshape而掩盖映射错误。
+        cpu_key = original_key.cpu()
+        groups = [quantize_kv(cpu_key[..., start:start + 32]) for start in range(0, 128, 32)]
+        restored_reference = torch.cat([data.double() * scale.double() for data, scale in groups], dim=-1)
         vd, vs = quantize_kv(original_value.cpu())
         restored_key, restored_value = cache.get()
-        torch.testing.assert_close(restored_key.cpu(), kd.float() * ks.float(), rtol=0, atol=0)
+        torch.testing.assert_close(restored_key.cpu(), restored_reference.float(), rtol=0, atol=0)
         torch.testing.assert_close(restored_value.cpu(), vd.float() * vs.float(), rtol=0, atol=0)
         mapping = torch.arange(query.shape[1]) // (query.shape[1] // new_key.shape[1])
-        k = (kd.double() * ks.double()).index_select(1, mapping)
+        k = restored_reference.index_select(1, mapping)
         v = (vd.double() * vs.double()).index_select(1, mapping)
         q = query.cpu().double()
         quantized_scores = (q @ k.transpose(-2, -1)) * 128 ** -0.5
@@ -539,58 +541,13 @@ def check_int8_decode(model, input_ids) -> None:
         original_scores = (q @ original_k.transpose(-2, -1)) * 128 ** -0.5
         original_weights = torch.softmax(original_scores, dim=-1)
         original_output = original_weights @ original_v
-        reference_norm = original_output.norm().clamp_min(1e-12)
-        head_norm = original_output.norm(dim=-1).clamp_min(1e-12)
-        # 仅作 CPU 参考实验：每个 Token 的 128 维顺序切成四组，每组 32 维。
-        # 暂将 Token 和组维合并，复用原量化规则；函数只沿最后一维求 scale。
-        # 还原后仍是原来的 KV 头与 Token 顺序，不更改正式缓存的 scale 布局。
-        grouped_input = original_key.cpu().reshape(1, original_key.shape[1], -1, 32)
-        grouped_data, grouped_scale = quantize_kv(grouped_input)
-        grouped_k = (grouped_data.double() * grouped_scale.double()).reshape(original_key.shape).index_select(1, mapping)
-        grouped_weights = torch.softmax((q @ grouped_k.transpose(-2, -1)) * 128 ** -0.5, dim=-1)
-        grouped_output = grouped_weights @ original_v
-        print("[实验] K每32维一组，V规则不变；仅FP64参考，不使用分组CUDA或分页存储")
-        print("[诊断] 量化归因：同一 Q、同一 FP64 公式；最差头按逐头相对L2选择，编号从0开始，分母下限=1e-12")
-        for label, output in (("仅量化K", quantized_weights @ original_v),
-                              ("仅量化V", original_weights @ v), ("同时量化K/V", expected),
-                              ("分组K+原始V", grouped_output), ("分组K+原方案INT8 V", grouped_weights @ v)):
-            # K 决定 softmax 权重，V 决定被加权的内容；两者共同误差不能简单相加。
-            delta = output - original_output
-            head_relative = delta.norm(dim=-1) / head_norm
-            head_cosine = torch.nn.functional.cosine_similarity(output, original_output, dim=-1, eps=1e-12)
-            worst_head = head_relative.reshape(-1).argmax().item()
-            print(f"[观测] {label}：最大绝对误差={delta.abs().max().item():.8g}，相对L2={(delta.norm() / reference_norm).item():.8g}，逐头平均余弦={head_cosine.mean().item():.8g}")
-            print(f"[观测] 最差Query头={worst_head}，对应KV头={mapping[worst_head].item()}，该头相对L2={head_relative[0, worst_head, 0].item():.8g}，余弦={head_cosine[0, worst_head, 0].item():.8g}，参考范数={original_output[0, worst_head, 0].norm().item():.8g}")
-            if label == "仅量化K":
-                # 动态选择本次最差头，不硬编码上次的头8；位置是含模板的逻辑 Token 位置。
-                kv_head = mapping[worst_head].item()
-                before = original_scores[0, worst_head, 0]
-                after = quantized_scores[0, worst_head, 0]
-                score_delta = after - before
-                position = score_delta.abs().argmax().item()
-                key_vector = original_k[0, worst_head, position]
-                key_error = k[0, worst_head, position] - key_vector
-                print(f"[定位] K分数最大变化位置={position}（0起，含当前Token），原分数={before[position].item():.8g}，量化后={after[position].item():.8g}，变化={score_delta[position].item():.8g}")
-                print(f"[定位] 该位置K：最大绝对值={key_vector.abs().max().item():.8g}，RMS={key_vector.square().mean().sqrt().item():.8g}，scale={ks[0, kv_head, position, 0].item():.8g}，最大量化误差={key_error.abs().max().item():.8g}")
-                weights_before = original_weights[0, worst_head, 0]
-                weights_after = quantized_weights[0, worst_head, 0]
-                weight_delta = (weights_after - weights_before).abs()
-                weight_position = weight_delta.argmax().item()
-                # 分数最大变化位置不一定是权重最大变化位置；Softmax 对统一平移不敏感。
-                print(f"[定位] 权重变化：最大绝对差={weight_delta.max().item():.8g}，位置={weight_position}，原权重={weights_before[weight_position].item():.8g}，量化后={weights_after[weight_position].item():.8g}，L1总量={weight_delta.sum().item():.8g}")
-                # 跟踪旧方案的同一个最差头，防止分组后的最差头变化而无法直接比较。
-                grouped_head = grouped_output[0, worst_head, 0]
-                original_head = original_output[0, worst_head, 0]
-                grouped_relative = (grouped_head - original_head).norm() / head_norm[0, worst_head, 0]
-                grouped_cosine = torch.nn.functional.cosine_similarity(grouped_head, original_head, dim=0, eps=1e-12)
-                grouped_l1 = (grouped_weights[0, worst_head, 0] - weights_before).abs().sum()
-                print(f"[实验] 原最差Query头={worst_head}，分组K+原始V：相对L2={grouped_relative.item():.8g}，余弦={grouped_cosine.item():.8g}，权重L1={grouped_l1.item():.8g}")
-                for name, weights in (("原始K", weights_before), ("量化K", weights_after),
-                                      ("分组K", grouped_weights[0, worst_head, 0])):
-                    values, positions = weights.topk(min(3, weights.numel()))
-                    entries = [(pos, round(weight, 8)) for pos, weight in zip(positions.tolist(), values.tolist())]
-                    print(f"[定位] {name}注意力前三项（逻辑位置, 权重）={entries}")
-        # 这里只定位本次输入的偏差，不新增精度验收阈值，也不据此宣称模型质量通过。
+        # 保留分组方案整体及最差头观测，删除已完成使命的单scale归因与前三项打印。
+        delta = expected - original_output
+        head_relative = delta.norm(dim=-1) / original_output.norm(dim=-1).clamp_min(1e-12)
+        head_cosine = torch.nn.functional.cosine_similarity(expected, original_output, dim=-1, eps=1e-12)
+        worst_head = head_relative.reshape(-1).argmax().item()
+        print(f"[观测] 分组K+INT8 V / 原始KV（同FP64公式）：相对L2={(delta.norm() / original_output.norm().clamp_min(1e-12)).item():.8g}，平均余弦={head_cosine.mean().item():.8g}")
+        print(f"[观测] 最差Query头={worst_head}，相对L2={head_relative[0, worst_head, 0].item():.8g}，余弦={head_cosine[0, worst_head, 0].item():.8g}；不是模型精度验收")
 
         # BF16 SDPA 使用未量化的同一份真实 K/V。与融合输出比较是综合影响，
         # 同时包含量化、计算路径与输出舍入差异，不将它称为纯量化误差或模型验收。
@@ -621,8 +578,6 @@ def main() -> None:
     parser.add_argument("--repeats", type=int, default=3, help="benchmark 模式测量次数，默认 3，另有 1 次预热")
     parser.add_argument("--cache", choices=("contiguous", "paged"), default="contiguous", help="默认连续缓存；paged 为每块 16 Token 的分页参考")
     args = parser.parse_args()
-    if args.mode == "int8-check":
-        parser.error("分组K存储等待CUDA适配；本轮请运行 python -m ampere_kv.paged_cache（无需GPU）")
     if args.repeats < 1:
         parser.error("--repeats 必须为正数")
     if args.mode in ("cuda-check", "int8-check") and args.cache != "paged":

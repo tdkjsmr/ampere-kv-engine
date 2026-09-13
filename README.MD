@@ -11,8 +11,8 @@
 - 权重与分词器使用固定 Revision，只从本地缓存加载；底层线性计算使用 PyTorch。
 
 BF16 模型对照和 INT8 六个小型 CUDA 场景已有 RTX 3090 验证结果。
-当前正在将 K scale 改为每32维一组，V仍每头一个scale；新存储等待云端验证。
-旧INT8 CUDA及真实模型检查暂时停用，等待新布局适配；历史验证不代表新布局通过。
+K scale已改为每32维一组，V仍每Token每KV头一个scale；新存储CPU检查通过。
+分组CUDA读取与第一层真实对照已适配，等待重新编译和GPU验证；历史结果不代表新内核通过。
 当前不提供多请求调度、在线服务或通用模型适配。
 
 ## 运行
@@ -28,6 +28,10 @@ make smoke
 # 本轮：分组K存储与参考读回，CPU执行，无需GPU。
 python -m ampere_kv.paged_cache
 
+# 本轮重新make build后：分组INT8算子与第一层真实Attention对照。
+python -m ampere_kv.paged_decode
+python -m ampere_kv.runner --mode int8-check --cache paged
+
 # 保留的整体回归：自建 BF16 与 HF；CUDA Decode 与自建 SDPA。
 python -m ampere_kv.runner --mode check --cache paged
 python -m ampere_kv.runner --mode cuda-check --cache paged
@@ -41,7 +45,7 @@ python -m ampere_kv.paged_decode --benchmark
 ```
 
 旧版 reference 演示与历史CPU自检已删除；paged_cache只保留当前分组K检查。
-历史验证代码可从 Git 历史查看。INT8 CUDA检查将在适配四组K scale后恢复。
+历史验证代码可从 Git 历史查看。INT8 CUDA检查已恢复，必须重新编译扩展。
 
 ## 性能口径
 

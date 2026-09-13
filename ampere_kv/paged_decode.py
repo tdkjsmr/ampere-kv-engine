@@ -77,8 +77,6 @@ def benchmark() -> None:
 @torch.inference_mode()
 def check_int8() -> None:
     """同一 INT8 数据与 scale 的融合/独立反量化对照，不测试量化前后的模型质量。"""
-    # 下一轮适配四个K scale后移除此暂停，不能用旧内核读取新布局。
-    raise RuntimeError("INT8 CUDA对照暂时停用：K scale已改为四组，请先运行 python -m ampere_kv.paged_cache")
     generator = torch.Generator().manual_seed(2)
     # 同时覆盖空 warp、物理块边界、分段边界及两种头映射；不改变原 BF16 随机输入。
     for q_heads, kv_heads, length in ((2, 2, 1), (2, 2, 17), (2, 2, 65),
@@ -97,10 +95,13 @@ def check_int8() -> None:
         key = (torch.randn(1, kv_heads, length, 128, generator=generator) * amplitude).to(torch.bfloat16)
         value = (torch.randn(1, kv_heads, length, 128, generator=generator) * (3 - amplitude)).to(torch.bfloat16)
         # CPU 独立量化；不从被测分页 get 构造数学参考。FP16 scale 在 FP64 中精确读取。
-        kd, ks = quantize_kv(key)
+        # 按切片独立构造四组参考，与存储内部的reshape写法分开。
+        groups = [quantize_kv(key[..., start:start + 32]) for start in range(0, 128, 32)]
+        kd = torch.cat([data for data, scale in groups], dim=-1)
+        ks = torch.cat([scale for data, scale in groups], dim=-1)
         vd, vs = quantize_kv(value)
         mapping = torch.arange(q_heads) // (q_heads // kv_heads)
-        k = (kd.double() * ks.double()).index_select(1, mapping)
+        k = torch.cat([data.double() * scale.double() for data, scale in groups], dim=-1).index_select(1, mapping)
         v = (vd.double() * vs.double()).index_select(1, mapping)
         expected = torch.softmax((query.double() @ k.transpose(-2, -1)) * 128 ** -0.5, dim=-1) @ v
         try:
@@ -127,7 +128,7 @@ def check_int8() -> None:
             bad_table = table.clone()
             bad_table[0] = blocks
             for bad_scale, selected_table in ((storage._key_scale.float(), table),
-                                               (storage._key_scale[:, :, :, :0], table),
+                                               (storage._key_scale[:, :, :, :1].contiguous(), table),
                                                (storage._key_scale, bad_table)):
                 try:
                     _C.paged_decode_int8(q, storage._key, storage._value, bad_scale, storage._value_scale, selected_table, length)
@@ -140,7 +141,7 @@ def check_int8() -> None:
             cache.release()
         assert storage._pool.num_free_blocks == blocks
         print("[PASS] INT8 融合数值对照、非法输入拒绝和块归还通过")
-    print("[PASS] INT8 CUDA 六个场景通过；未验证模型、长上下文、量化写入融合或性能")
+    print("[PASS] 分组K INT8 CUDA 六个场景通过；未验证模型、长上下文、量化写入融合或性能")
 
 
 def main() -> None:
