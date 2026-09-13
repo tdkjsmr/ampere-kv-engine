@@ -17,6 +17,8 @@ class PagedKVStorage:
             raise ValueError("KV 头数、每头维度、块数量和块大小必须是正整数")
         if kv_dtype not in (torch.bfloat16, torch.int8):
             raise ValueError("分页存储只支持 BF16 或 INT8")
+        if kv_dtype == torch.int8 and head_dim != 128:
+            raise ValueError("当前 INT8 存储固定每头128维，K分成四组32维")
         self._pool = BlockPool(num_blocks)
         # K、V 各自布局为 [物理块数, KV 头数, 每块 Token 数, 每头维度]。
         # 一次分配全部物理空间；申请编号不会再次分配张量，空闲区域内容无效。
@@ -26,8 +28,9 @@ class PagedKVStorage:
         # INT8 每个物理位置、每个 KV 头分别保存 K/V scale，不常驻 BF16 历史副本。
         self._key_scale = self._value_scale = None
         if kv_dtype == torch.int8:
-            self._key_scale = torch.empty(shape[:-1] + (1,), dtype=torch.float16, device=device)
-            self._value_scale = torch.empty_like(self._key_scale)
+            # K 每连续32维一个 scale；V 仍是整个128维一个 scale。
+            self._key_scale = torch.empty(shape[:-1] + (4,), dtype=torch.float16, device=device)
+            self._value_scale = torch.empty(shape[:-1] + (1,), dtype=torch.float16, device=device)
 
 
 class PagedKVCache:
@@ -71,7 +74,11 @@ class PagedKVCache:
         if self._key_scale is not None:
             # K/V 全部量化成功后才申请块；例如 V 含 NaN 时，不能留下只写入 K 的状态。
             # 这里只产生本次追加数据的临时结果，不重新量化旧历史。
-            key, key_scale = quantize_kv(key)
+            shape = key.shape
+            # 临时合并 Token 与组维，只沿32维量化；不混合不同 Token 的分量。
+            key, key_scale = quantize_kv(key.reshape(1, shape[1], shape[2] * 4, 32))
+            key = key.reshape(shape)
+            key_scale = key_scale.reshape(1, shape[1], shape[2], 4)
             value, value_scale = quantize_kv(value)
         # 块表拒绝空追加和容量不足；以上可预检错误均在修改存储前拒绝。
         # 先登记才能用 locate 查询新位置。若后续复制失败，不提供事务回滚；
@@ -105,10 +112,57 @@ class PagedKVCache:
 
         key, value = gather(self._key), gather(self._value)
         if self._key_scale is not None:
-            return (dequantize_kv(key, gather(self._key_scale)),
+            # 按相同顺序拆组反量化，再还原每个 Token 的128维；不展开 GQA 头。
+            grouped_key = key.reshape(1, key.shape[1], self.length * 4, 32)
+            scales = gather(self._key_scale).reshape(1, key.shape[1], self.length * 4, 1)
+            return (dequantize_kv(grouped_key, scales).reshape(key.shape),
                     dequantize_kv(value, gather(self._value_scale)))
         return key, value
 
     def release(self) -> None:
         """归还请求占用的块；保留物理张量，不清零旧数据，不释放底层显存。"""
         self._table.release()
+
+
+def main() -> None:
+    """本轮仅验证分组K的物理布局与读回；CPU执行，不调用CUDA或模型。"""
+    storage = PagedKVStorage(2, 128, 2, 16, kv_dtype=torch.int8)
+    cache = PagedKVCache(storage)
+    tensors = (cache._key, cache._value, cache._key_scale, cache._value_scale)
+    addresses = tuple(t.data_ptr() for t in tensors)
+    # 先归还0再归还1，令逻辑块顺序为(1, 0)，检查跨块寻址而非连续巧合。
+    held = [storage._pool.allocate() for _ in range(2)]
+    for block in held:
+        storage._pool.free(block)
+    generator = torch.Generator().manual_seed(3)
+    key = torch.randn(1, 2, 17, 128, generator=generator)
+    key *= torch.tensor([1., 10., 0.1, 100.]).repeat_interleave(32)
+    key = key.to(torch.bfloat16)
+    value = torch.randn(1, 2, 17, 128, generator=generator).to(torch.bfloat16)
+    # 独立按切片逐组量化，避免参考也用同一 reshape 顺序而掩盖布局错误。
+    groups = [quantize_kv(key[..., start:start + 32]) for start in range(0, 128, 32)]
+    kd = torch.cat([data for data, scale in groups], dim=-1)
+    ks = torch.cat([scale for data, scale in groups], dim=-1)
+    vd, vs = quantize_kv(value)
+    expected_key = torch.cat([data.float() * scale.float() for data, scale in groups], dim=-1)
+    try:
+        for start, end in ((0, 15), (15, 17)):
+            cache.append(key[:, :, start:end], value[:, :, start:end])
+            for tensor, reference in zip(tensors, (kd, vd, ks, vs)):
+                for token in range(end):
+                    block, offset = cache._table.locate(token)
+                    assert torch.equal(tensor[block, :, offset], reference[0, :, token])
+            actual_key, actual_value = cache.get()
+            torch.testing.assert_close(actual_key, expected_key[:, :, :end], rtol=0, atol=0)
+            torch.testing.assert_close(actual_value, (vd.float() * vs.float())[:, :, :end], rtol=0, atol=0)
+            assert cache.length == end and tuple(t.data_ptr() for t in tensors) == addresses
+            print(f"[PASS] 分组K存储：长度={end}，整数与scale布局、FP32读回及地址一致")
+        assert cache._table.block_ids == (1, 0)
+    finally:
+        cache.release()
+    assert storage._pool.num_free_blocks == 2
+    print("[PASS] CPU分组K存储与跨块追加通过；K scale末维4，V末维1；未验证新布局CUDA、模型或性能")
+
+
+if __name__ == "__main__":
+    main()

@@ -471,6 +471,7 @@ def check_cuda_decode(model, input_ids) -> None:
 @torch.inference_mode()
 def check_int8_decode(model, input_ids) -> None:
     """仅检查第一层一次真实 Decode Attention；不接管模型生成，不测性能。"""
+    raise RuntimeError("INT8真实对照暂时停用：分组K存储等待CUDA适配")
     from ampere_kv import _C
     from ampere_kv.quantization import quantize_kv
 
@@ -620,6 +621,8 @@ def main() -> None:
     parser.add_argument("--repeats", type=int, default=3, help="benchmark 模式测量次数，默认 3，另有 1 次预热")
     parser.add_argument("--cache", choices=("contiguous", "paged"), default="contiguous", help="默认连续缓存；paged 为每块 16 Token 的分页参考")
     args = parser.parse_args()
+    if args.mode == "int8-check":
+        parser.error("分组K存储等待CUDA适配；本轮请运行 python -m ampere_kv.paged_cache（无需GPU）")
     if args.repeats < 1:
         parser.error("--repeats 必须为正数")
     if args.mode in ("cuda-check", "int8-check") and args.cache != "paged":

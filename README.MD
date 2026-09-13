@@ -11,8 +11,9 @@
 - 权重与分词器使用固定 Revision，只从本地缓存加载；底层线性计算使用 PyTorch。
 
 BF16 模型对照和 INT8 六个小型 CUDA 场景已有 RTX 3090 验证结果。
-第一层真实 INT8 Attention 检查入口已实现，等待 GPU 验证；不代表 INT8 完整模型、
-长上下文或性能已通过。当前不提供多请求调度、在线服务或通用模型适配。
+当前正在将 K scale 改为每32维一组，V仍每头一个scale；新存储等待云端验证。
+旧INT8 CUDA及真实模型检查暂时停用，等待新布局适配；历史验证不代表新布局通过。
+当前不提供多请求调度、在线服务或通用模型适配。
 
 ## 运行
 
@@ -24,11 +25,8 @@ Accelerate 和已缓存的固定版本模型。输入文本不写入文件。
 make build
 make smoke
 
-# 当前 INT8 算子：六个小型数值对照场景。
-python -m ampere_kv.paged_decode
-
-# 最新检查：第一层一次真实 INT8 Decode Attention。
-python -m ampere_kv.runner --mode int8-check --cache paged
+# 本轮：分组K存储与参考读回，CPU执行，无需GPU。
+python -m ampere_kv.paged_cache
 
 # 保留的整体回归：自建 BF16 与 HF；CUDA Decode 与自建 SDPA。
 python -m ampere_kv.runner --mode check --cache paged
@@ -42,8 +40,8 @@ python -m ampere_kv.runner --mode benchmark --cache paged --repeats 3
 python -m ampere_kv.paged_decode --benchmark
 ```
 
-旧版 reference 演示和 block_pool、kv_cache、paged_cache、quantization 的模块自检入口
-已删除；核心存储与计算函数保留。历史验证代码可从 Git 历史查看。
+旧版 reference 演示与历史CPU自检已删除；paged_cache只保留当前分组K检查。
+历史验证代码可从 Git 历史查看。INT8 CUDA检查将在适配四组K scale后恢复。
 
 ## 性能口径
 

@@ -77,6 +77,8 @@ def benchmark() -> None:
 @torch.inference_mode()
 def check_int8() -> None:
     """同一 INT8 数据与 scale 的融合/独立反量化对照，不测试量化前后的模型质量。"""
+    # 下一轮适配四个K scale后移除此暂停，不能用旧内核读取新布局。
+    raise RuntimeError("INT8 CUDA对照暂时停用：K scale已改为四组，请先运行 python -m ampere_kv.paged_cache")
     generator = torch.Generator().manual_seed(2)
     # 同时覆盖空 warp、物理块边界、分段边界及两种头映射；不改变原 BF16 随机输入。
     for q_heads, kv_heads, length in ((2, 2, 1), (2, 2, 17), (2, 2, 65),
