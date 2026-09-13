@@ -540,9 +540,19 @@ def check_int8_decode(model, input_ids) -> None:
         original_output = original_weights @ original_v
         reference_norm = original_output.norm().clamp_min(1e-12)
         head_norm = original_output.norm(dim=-1).clamp_min(1e-12)
+        # 仅作 CPU 参考实验：每个 Token 的 128 维顺序切成四组，每组 32 维。
+        # 暂将 Token 和组维合并，复用原量化规则；函数只沿最后一维求 scale。
+        # 还原后仍是原来的 KV 头与 Token 顺序，不更改正式缓存的 scale 布局。
+        grouped_input = original_key.cpu().reshape(1, original_key.shape[1], -1, 32)
+        grouped_data, grouped_scale = quantize_kv(grouped_input)
+        grouped_k = (grouped_data.double() * grouped_scale.double()).reshape(original_key.shape).index_select(1, mapping)
+        grouped_weights = torch.softmax((q @ grouped_k.transpose(-2, -1)) * 128 ** -0.5, dim=-1)
+        grouped_output = grouped_weights @ original_v
+        print("[实验] K每32维一组，V规则不变；仅FP64参考，不使用分组CUDA或分页存储")
         print("[诊断] 量化归因：同一 Q、同一 FP64 公式；最差头按逐头相对L2选择，编号从0开始，分母下限=1e-12")
         for label, output in (("仅量化K", quantized_weights @ original_v),
-                              ("仅量化V", original_weights @ v), ("同时量化K/V", expected)):
+                              ("仅量化V", original_weights @ v), ("同时量化K/V", expected),
+                              ("分组K+原始V", grouped_output), ("分组K+原方案INT8 V", grouped_weights @ v)):
             # K 决定 softmax 权重，V 决定被加权的内容；两者共同误差不能简单相加。
             delta = output - original_output
             head_relative = delta.norm(dim=-1) / head_norm
@@ -567,7 +577,15 @@ def check_int8_decode(model, input_ids) -> None:
                 weight_position = weight_delta.argmax().item()
                 # 分数最大变化位置不一定是权重最大变化位置；Softmax 对统一平移不敏感。
                 print(f"[定位] 权重变化：最大绝对差={weight_delta.max().item():.8g}，位置={weight_position}，原权重={weights_before[weight_position].item():.8g}，量化后={weights_after[weight_position].item():.8g}，L1总量={weight_delta.sum().item():.8g}")
-                for name, weights in (("原始K", weights_before), ("量化K", weights_after)):
+                # 跟踪旧方案的同一个最差头，防止分组后的最差头变化而无法直接比较。
+                grouped_head = grouped_output[0, worst_head, 0]
+                original_head = original_output[0, worst_head, 0]
+                grouped_relative = (grouped_head - original_head).norm() / head_norm[0, worst_head, 0]
+                grouped_cosine = torch.nn.functional.cosine_similarity(grouped_head, original_head, dim=0, eps=1e-12)
+                grouped_l1 = (grouped_weights[0, worst_head, 0] - weights_before).abs().sum()
+                print(f"[实验] 原最差Query头={worst_head}，分组K+原始V：相对L2={grouped_relative.item():.8g}，余弦={grouped_cosine.item():.8g}，权重L1={grouped_l1.item():.8g}")
+                for name, weights in (("原始K", weights_before), ("量化K", weights_after),
+                                      ("分组K", grouped_weights[0, worst_head, 0])):
                     values, positions = weights.topk(min(3, weights.numel()))
                     entries = [(pos, round(weight, 8)) for pos, weight in zip(positions.tolist(), values.tolist())]
                     print(f"[定位] {name}注意力前三项（逻辑位置, 权重）={entries}")
