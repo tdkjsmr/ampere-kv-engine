@@ -481,10 +481,10 @@ def check_cuda_decode(model, input_ids) -> None:
 
 @torch.inference_mode()
 def check_int8_decode(model, input_ids) -> None:
-    """共享BF16 Prefill，比较两套缓存的全模型一次CUDA Decode；不测性能。"""
+    """共享BF16 Prefill，按BF16选词驱动两条CUDA路径；仅同历史对照，不测性能。"""
     config = model.config
     length = input_ids.shape[1]
-    blocks = (length + 1 + PAGED_BLOCK_SIZE - 1) // PAGED_BLOCK_SIZE
+    blocks = (length + MAX_NEW_TOKENS - 1 + PAGED_BLOCK_SIZE - 1) // PAGED_BLOCK_SIZE
     reference_caches, quantized_caches = [], []
     positions = torch.arange(length, device=input_ids.device)[None]
     hidden = model.model.embed_tokens.weight[input_ids]
@@ -510,53 +510,67 @@ def check_int8_decode(model, input_ids) -> None:
                    if tensor is not None]
         addresses = [tensor.data_ptr() for tensor in tensors]
         print(f"[PASS] 共用BF16 Prefill完成：层数={len(reference_caches)}，KV长度={length}，首Token={first_token.item()}")
-        # 即使首Token为EOS也强制诊断一次，不代表正常生成应该忽略EOS。
-        # 释放大段隐藏状态引用，两个Decode分支共用权重但不共享可变缓存。
+        # 首Token来自共同Prefill，不计入Decode选词一致率；若它是EOS则零步结束。
         del hidden, first_logits, key, value
-        reference_hidden = model.model.embed_tokens.weight[first_token]
-        quantized_hidden = reference_hidden
-        positions = input_ids.new_tensor([[length]])
-        for layer, reference_cache, quantized_cache in zip(model.model.layers, reference_caches, quantized_caches):
-            reference_hidden = decoder_layer_forward(
-                reference_hidden, layer, positions, reference_cache, config, is_prefill=False, cuda_decode=True,
-            )
-            quantized_hidden = decoder_layer_forward(
-                quantized_hidden, layer, positions, quantized_cache, config, is_prefill=False, cuda_decode=True,
-            )
-        reference = final_logits(model, reference_hidden)
-        actual = final_logits(model, quantized_hidden)
-        # 从第二层开始隐藏状态可以不同：这里观测全模型误差传播，不是同Q/K/V算子对照。
-        for label, result, baseline in (("最后Decoder隐藏状态", quantized_hidden, reference_hidden),
-                                        ("最终logits", actual, reference)):
-            assert torch.isfinite(result).all().item() and torch.isfinite(baseline).all().item()
-            delta = result.float() - baseline.float()
-            relative = delta.norm() / baseline.float().norm().clamp_min(1e-12)
-            cosine = torch.nn.functional.cosine_similarity(result.float(), baseline.float(), dim=-1).mean()
-            print(f"[观测] {label} INT8/BF16 CUDA：最大绝对误差={delta.abs().max().item():.8g}，相对L2={relative.item():.8g}，余弦={cosine.item():.8g}")
-        reference_id, actual_id = reference.argmax(dim=-1).item(), actual.argmax(dim=-1).item()
-        # 两条路径的argmax可因量化而不同，不把一致选词冒充完整精度验收。
-        print(f"[观测] 第二Token：BF16={reference_id}，INT8={actual_id}，一致={reference_id == actual_id}")
-        top_values, top_ids = reference[0, 0].float().topk(2)
-        selected = actual[0, 0, top_ids].float()
-        print(f"[观测] BF16前两名ID={top_ids.tolist()}，logits={top_values.tolist()}，差距={(top_values[0] - top_values[1]).item():.8g}")
-        print(f"[观测] INT8在上述相同ID的logits={selected.tolist()}，差距={(selected[0] - selected[1]).item():.8g}（不是INT8自身前两名）")
-        assert all(cache.length == length + 1 for cache in all_caches)
-        assert addresses == [tensor.data_ptr() for cache in all_caches
-                             for tensor in (cache._key, cache._value, cache._key_scale, cache._value_scale)
-                             if tensor is not None]
-        print(f"[PASS] 全部层两套KV长度={length + 1}，地址不变，Decode跨块={length % PAGED_BLOCK_SIZE == 0}")
+        eos_ids = model.generation_config.eos_token_id
+        eos_ids = [eos_ids] if isinstance(eos_ids, int) else (eos_ids or [])
+        current_id = first_token.item()
+        compared = matched = 0
+        relative_errors = []
+        first_mismatch = None
+        used = length
+        for step in range(MAX_NEW_TOKENS - 1):
+            if current_id in eos_ids:
+                break
+            # 两套缓存只共享Token历史，不共享中间隐藏状态或新计算的K/V。
+            current_input = input_ids.new_tensor([[current_id]])
+            positions = input_ids.new_tensor([[length + step]])
+            reference = model_forward(model, current_input, positions, reference_caches,
+                                      is_prefill=False, cuda_decode=True)
+            actual = model_forward(model, current_input, positions, quantized_caches,
+                                   is_prefill=False, cuda_decode=True)
+            assert torch.isfinite(reference).all().item() and torch.isfinite(actual).all().item()
+            delta = actual.float() - reference.float()
+            relative_errors.append((delta.norm() / reference.float().norm().clamp_min(1e-12)).item())
+            reference_id = reference.argmax(dim=-1).item()
+            actual_id = actual.argmax(dim=-1).item()
+            compared += 1
+            matched += int(reference_id == actual_id)
+            if reference_id != actual_id and first_mismatch is None:
+                first_mismatch = (step + 2, length + step, reference_id, actual_id)
+            # INT8即使选到EOS也不提前结束；下一轮始终服从BF16基线，避免文本历史分叉。
+            current_id = reference_id
+            used = length + compared
+            assert all(cache.length == used for cache in all_caches)
+            assert addresses == [tensor.data_ptr() for cache in all_caches
+                                 for tensor in (cache._key, cache._value, cache._key_scale, cache._value_scale)
+                                 if tensor is not None]
+        reason = "BF16 EOS" if current_id in eos_ids else "达到输出上限"
+        print(f"[汇总] 同历史对照：输出上限={MAX_NEW_TOKENS}，基线输出数={compared + 1}，Decode比较数={compared}，停止原因={reason}")
+        if compared:
+            print(f"[观测] Decode选词一致={matched}/{compared}（{matched / compared:.2%}），不含共用首Token")
+            print(f"[观测] logits相对L2：均值={statistics.mean(relative_errors):.8g}，最大值={max(relative_errors):.8g}")
+        else:
+            print("[未覆盖] 首Token为EOS，没有执行Decode；一致率与误差无定义")
+        if first_mismatch is not None:
+            number, position, reference_id, actual_id = first_mismatch
+            print(f"[观测] 首次分歧：第{number}个输出Token，输入位置={position}，BF16={reference_id}，INT8={actual_id}")
+        elif compared:
+            print("[观测] 本次Decode比较未出现选词分歧")
+        crossed = compared > 0 and (used - 1) // PAGED_BLOCK_SIZE > (length - 1) // PAGED_BLOCK_SIZE
+        print(f"[PASS] 两套全部层KV长度={used}，逐步地址检查通过，Decode跨块={crossed}")
     finally:
         for cache in reference_caches + quantized_caches:
             cache.release()
     assert all(cache._pool.num_free_blocks == blocks for cache in reference_caches + quantized_caches)
-    print("[PASS] 两套缓存块全部归还；本轮仅全模型一次Decode运行与缓存检查，不代表精度验收、独立HF对照、连续生成或性能通过")
+    print("[PASS] 两套缓存块全部归还；本轮为BF16驱动的同历史对照，不代表INT8独立生成、完整精度验收、HF对照或性能通过")
 
 
 def main() -> None:
     """加载与分词只做一次；选择对照或纯生成模式，最后统一展示结果。"""
     parser = argparse.ArgumentParser(description="Qwen3 自建 BF16 生成与正确性对照")
     # 默认保留对照行为；纯生成须显式选择，避免把输出文本误认为验证通过。
-    parser.add_argument("--mode", choices=("check", "generate", "benchmark", "cuda-check", "int8-check"), default="check", help="check：HF 对照；generate：纯生成；benchmark：纯生成基线；cuda-check：有界 CUDA Decode 对照；int8-check：全模型一次 INT8/BF16 CUDA Decode")
+    parser.add_argument("--mode", choices=("check", "generate", "benchmark", "cuda-check", "int8-check"), default="check", help="check：HF 对照；generate：纯生成；benchmark：纯生成基线；cuda-check：有界 CUDA Decode 对照；int8-check：BF16驱动的INT8同历史对照")
     parser.add_argument("--repeats", type=int, default=3, help="benchmark 模式测量次数，默认 3，另有 1 次预热")
     parser.add_argument("--cache", choices=("contiguous", "paged"), default="contiguous", help="默认连续缓存；paged 为每块 16 Token 的分页参考")
     args = parser.parse_args()
@@ -584,7 +598,7 @@ def main() -> None:
     model.eval()
     if args.mode == "int8-check":
         check_int8_decode(model, input_ids)
-        return  # 仅一次全模型Decode，不打印连续生成通过或性能结论。
+        return  # 同历史对照不等于INT8独立生成，不进入普通生成输出。
     if args.mode == "cuda-check":
         check_cuda_decode(model, input_ids)
         return  # 对照入口自行汇总，不能落入下面的普通生成结果打印。
