@@ -91,7 +91,7 @@ def decoder_layer_forward(
     调用方提供该层专用缓存并显式选择阶段；写入 RoPE 后的 K 和未旋转的 V。
     不加载模型、不打印结果、不调用 HF 层的 forward，也不进行参考对照。
     不支持分块 Prefill；缓存写入后若计算失败，不自动回滚。
-    cuda_decode 仅用于可选对照，默认仍走 SDPA；当前 CUDA 分支不支持 Graph。
+    cuda_decode 用于可选生成与对照，默认仍走 SDPA；当前 CUDA 分支不支持 Graph。
     """
     attention = layer.self_attn
     if cuda_decode and (is_prefill or not isinstance(cache, PagedKVCache)):
@@ -116,8 +116,17 @@ def decoder_layer_forward(
     query, key, value = project_qkv(normalized, attention)
     query, key = apply_rope(query, key, position_ids, config)
     # 只有缓存 Attention 的阶段不同，归一化、投影、RoPE、残差与 MLP 共用原实现。
-    if cuda_decode:
-        # CUDA对照按缓存类型选择内核；普通SDPA生成不导入扩展。
+    if is_prefill and cache._key.dtype == torch.int8:
+        # Prefill计算使用原始BF16 K/V，只有存储量化；不能走FP32反量化参考。
+        cache.append(key, value)
+        group_size = query.shape[1] // key.shape[1]
+        head_output = torch.nn.functional.scaled_dot_product_attention(
+            query.contiguous(), key.repeat_interleave(group_size, dim=1).contiguous(),
+            value.repeat_interleave(group_size, dim=1).contiguous(),
+            dropout_p=0.0, is_causal=query.shape[2] > 1, scale=query.shape[-1] ** -0.5,
+        )
+    elif cuda_decode:
+        # 按缓存类型选择内核；普通SDPA生成不导入扩展。
         from ampere_kv import _C
 
         # 单 Token K/V 只追加一次；CUDA 直接读物理存储，不调用 get 或复制 GQA 头。
@@ -200,7 +209,7 @@ def final_logits(model, hidden_states):
 
 
 @torch.inference_mode()
-def generate_tokens(model, input_ids, *, max_new_tokens: int = MAX_NEW_TOKENS, verify: bool = False, timings: dict | None = None, cache_kind: str = "contiguous", cuda_decode: bool = False) -> list[int]:
+def generate_tokens(model, input_ids, *, max_new_tokens: int = MAX_NEW_TOKENS, verify: bool = False, timings: dict | None = None, cache_kind: str = "contiguous", cuda_decode: bool = False, kv_dtype: torch.dtype = torch.bfloat16) -> list[int]:
     """返回新 Token IDs；每次请求创建独立缓存，不向调用方保留 GPU 张量。
 
     两种模式共用自建前向和循环；verify 只额外执行 HF 参考和诊断。
@@ -208,9 +217,14 @@ def generate_tokens(model, input_ids, *, max_new_tokens: int = MAX_NEW_TOKENS, v
     timings 非空时写入请求级墙钟指标；不允许同时开启 HF 对照。
     两种存储共用生成循环；分页每层独占块池，尚非多请求共享池。
     cuda_decode 仅切换 Decode，Prefill 始终使用 SDPA；默认后端不变。
+    INT8仅支持分页CUDA独立生成，本轮不开放计时或HF逐Token严格对照。
     """
     if cache_kind not in ("contiguous", "paged"):
         raise ValueError("缓存类型必须是 contiguous 或 paged")
+    if kv_dtype not in (torch.bfloat16, torch.int8):
+        raise ValueError("KV类型必须是BF16或INT8")
+    if kv_dtype == torch.int8 and (cache_kind != "paged" or not cuda_decode or verify or timings is not None):
+        raise ValueError("INT8只支持分页CUDA纯生成，不支持计时或HF严格对照")
     if cuda_decode and (cache_kind != "paged" or verify):
         raise ValueError("CUDA Decode 仅支持分页纯生成；逐步对照请使用 cuda-check")
     if timings is not None and verify:
@@ -238,7 +252,7 @@ def generate_tokens(model, input_ids, *, max_new_tokens: int = MAX_NEW_TOKENS, v
             cache = PagedKVCache(PagedKVStorage(
                 model.config.num_key_value_heads, model.config.head_dim,
                 num_blocks=(capacity + PAGED_BLOCK_SIZE - 1) // PAGED_BLOCK_SIZE,
-                block_size=PAGED_BLOCK_SIZE, device=input_ids.device,
+                block_size=PAGED_BLOCK_SIZE, device=input_ids.device, kv_dtype=kv_dtype,
             ))
         else:
             cache = ContiguousKVCache(
@@ -596,11 +610,15 @@ def main() -> None:
     parser.add_argument("--mode", choices=("check", "generate", "benchmark", "cuda-check", "int8-check"), default="check", help="check：HF 对照；generate：纯生成；benchmark：纯生成基线；cuda-check：有界 CUDA Decode 对照；int8-check：BF16驱动的INT8同历史对照")
     parser.add_argument("--repeats", type=int, default=3, help="benchmark 模式测量次数，默认 3，另有 1 次预热")
     parser.add_argument("--cache", choices=("contiguous", "paged"), default="contiguous", help="默认连续缓存；paged 为每块 16 Token 的分页参考")
+    parser.add_argument("--kv-dtype", choices=("bf16", "int8"), default="bf16",
+                        help="普通生成的KV存储类型；int8仅支持paged，自动使用CUDA Decode；诊断模式自行选择类型")
     args = parser.parse_args()
     if args.repeats < 1:
         parser.error("--repeats 必须为正数")
     if args.mode in ("cuda-check", "int8-check") and args.cache != "paged":
         parser.error("CUDA 对照模式需要显式指定 --cache paged")
+    if args.kv_dtype == "int8" and (args.mode != "generate" or args.cache != "paged"):
+        parser.error("--kv-dtype int8 本轮仅用于 --mode generate --cache paged")
     if not torch.cuda.is_available():
         raise RuntimeError("模型生成需要在云端 CUDA 环境运行")
     text = input("请输入一段文本：")
@@ -635,7 +653,14 @@ def main() -> None:
                 cuda_decode=True, reference_ids=generated_ids,
             )
     else:
-        generated_ids = generate_tokens(model, input_ids, verify=(args.mode == "check"), cache_kind=args.cache)
+        # INT8直接复用循环，由自身logits选词；不创建BF16陪跑缓存。
+        use_int8 = args.kv_dtype == "int8"
+        if args.mode == "generate":
+            print(f"生成路径：KV={args.kv_dtype}，Prefill=BF16 SDPA，Decode={'INT8 CUDA' if use_int8 else 'BF16 SDPA'}")
+        generated_ids = generate_tokens(
+            model, input_ids, verify=(args.mode == "check"), cache_kind=args.cache,
+            cuda_decode=use_int8, kv_dtype=torch.int8 if use_int8 else torch.bfloat16,
+        )
     eos_ids = model.generation_config.eos_token_id
     eos_ids = [eos_ids] if isinstance(eos_ids, int) else (eos_ids or [])
     reason = "EOS" if generated_ids[-1] in eos_ids else "达到新 Token 上限"
