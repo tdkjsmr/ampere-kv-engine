@@ -517,6 +517,7 @@ def check_int8_decode(model, input_ids) -> None:
         current_id = first_token.item()
         compared = matched = 0
         relative_errors = []
+        kl_values, mismatch_gaps = [], []
         first_mismatch = None
         used = length
         for step in range(MAX_NEW_TOKENS - 1):
@@ -530,14 +531,31 @@ def check_int8_decode(model, input_ids) -> None:
             actual = model_forward(model, current_input, positions, quantized_caches,
                                    is_prefill=False, cuda_decode=True)
             assert torch.isfinite(reference).all().item() and torch.isfinite(actual).all().item()
-            delta = actual.float() - reference.float()
-            relative_errors.append((delta.norm() / reference.float().norm().clamp_min(1e-12)).item())
+            reference_scores, actual_scores = reference.float().flatten(), actual.float().flatten()
+            delta = actual_scores - reference_scores
+            relative_errors.append((delta.norm() / reference_scores.norm().clamp_min(1e-12)).item())
+            # 完整词表、温度1、自然对数：KL方向为BF16到INT8，不做Top-k截断。
+            reference_logp = reference_scores.log_softmax(dim=-1)
+            actual_logp = actual_scores.log_softmax(dim=-1)
+            kl = (reference_logp.exp() * (reference_logp - actual_logp)).sum().item()
+            kl_values.append(kl)  # 保留FP32原始结果；极小负值可能来自浮点舍入。
             reference_id = reference.argmax(dim=-1).item()
             actual_id = actual.argmax(dim=-1).item()
             compared += 1
             matched += int(reference_id == actual_id)
-            if reference_id != actual_id and first_mismatch is None:
-                first_mismatch = (step + 2, length + step, reference_id, actual_id)
+            if reference_id != actual_id:
+                # 衡量实际竞争候选的差距，而不假设INT8选择的是BF16第二名。
+                gap = (reference_scores[reference_id] - reference_scores[actual_id]).item()
+                mismatch_gaps.append(gap)
+                if first_mismatch is None:
+                    top_two = reference_scores.topk(2).values
+                    margin = (top_two[0] - top_two[1]).item()
+                    # 并列使用竞争排名：严格更高的候选数+1，不对整个词表排序。
+                    rank = (reference_scores > reference_scores[actual_id]).sum().item() + 1
+                    ids = [reference_id, actual_id]
+                    # 只保存CPU标量与两个候选分数，不保留逐步GPU logits。
+                    first_mismatch = (step + 2, length + step, ids, kl, margin, rank,
+                                      reference_scores[ids].tolist(), actual_scores[ids].tolist())
             # INT8即使选到EOS也不提前结束；下一轮始终服从BF16基线，避免文本历史分叉。
             current_id = reference_id
             used = length + compared
@@ -550,11 +568,16 @@ def check_int8_decode(model, input_ids) -> None:
         if compared:
             print(f"[观测] Decode选词一致={matched}/{compared}（{matched / compared:.2%}），不含共用首Token")
             print(f"[观测] logits相对L2：均值={statistics.mean(relative_errors):.8g}，最大值={max(relative_errors):.8g}")
+            print(f"[观测] KL(BF16 || INT8)：均值={statistics.mean(kl_values):.8g}，最大值={max(kl_values):.8g}（自然对数，温度1）")
+            if mismatch_gaps:
+                print(f"[观测] 分歧步BF16竞争分差：均值={statistics.mean(mismatch_gaps):.8g}，最大值={max(mismatch_gaps):.8g}，仅统计{len(mismatch_gaps)}个分歧步")
         else:
             print("[未覆盖] 首Token为EOS，没有执行Decode；一致率与误差无定义")
         if first_mismatch is not None:
-            number, position, reference_id, actual_id = first_mismatch
-            print(f"[观测] 首次分歧：第{number}个输出Token，输入位置={position}，BF16={reference_id}，INT8={actual_id}")
+            number, position, ids, kl, margin, rank, reference_pair, actual_pair = first_mismatch
+            print(f"[观测] 首次分歧：第{number}个输出Token，输入位置={position}，BF16={ids[0]}，INT8={ids[1]}")
+            print(f"[观测] 该步KL={kl:.8g}，BF16前两名分差={margin:.8g}，INT8所选Token在BF16中排名={rank}（严格更高数+1）")
+            print(f"[观测] 候选顺序={ids}，BF16分数={reference_pair}，INT8分数={actual_pair}")
         elif compared:
             print("[观测] 本次Decode比较未出现选词分歧")
         crossed = compared > 0 and (used - 1) // PAGED_BLOCK_SIZE > (length - 1) // PAGED_BLOCK_SIZE
