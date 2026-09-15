@@ -15,7 +15,8 @@ K scale已改为每32维一组，V仍每Token每KV头一个scale；新存储CPU�
 分组CUDA读取与第一层真实对照已在临时sm_89实例通过检查，不代表3090新版本或性能验证。
 全模型一次INT8/BF16 CUDA Decode已在3090完成运行与缓存检查，选词一致不代表精度验收。
 int8-check提供BF16选词驱动的同历史对照，已有短上下文运行结果，不代表完整精度验收。
-INT8独立生成复用现有循环：BF16 Prefill计算、INT8 KV存储与CUDA Decode，等待云端验证。
+INT8独立生成已有EOS与输出上限两种短输入运行结果，不代表完整质量验收。
+BF16/INT8 CUDA固定长度计时与实际KV字节统计已接入，等待云端验证。
 当前不提供多请求调度、在线服务或通用模型适配。
 
 ## 运行
@@ -37,8 +38,11 @@ python -m ampere_kv.runner --mode int8-check --cache paged
 
 # int8-check只汇总Decode一致率、logits误差及首次分歧；不是INT8独立生成。
 
-# INT8独立选词，最多32个输出Token，遇到自身EOS停止；本轮不支持INT8 benchmark。
+# INT8独立选词，最多32个输出Token，遇到自身EOS停止。
 python -m ampere_kv.runner --mode generate --cache paged --kv-dtype int8
+
+# 同一输入依次测BF16 CUDA与INT8 CUDA；均忽略EOS，固定32个输出Token。
+python -m ampere_kv.runner --mode benchmark --cache paged --kv-dtype int8 --repeats 3
 
 # 保留的整体回归：自建 BF16 与 HF；CUDA Decode 与自建 SDPA。
 python -m ampere_kv.runner --mode check --cache paged
@@ -59,7 +63,10 @@ python -m ampere_kv.paged_decode --benchmark
 
 模型和输入已就绪的单请求 Engine-only 墙钟时间，包含 KV 分配、Prefill、Decode、
 选词与必要同步；排除模型加载、分词、HF 对照、文本解码、打印及结束时缓存归还。
-输出最多 32 Token，遇到 EOS 提前停止。
+普通生成最多32 Token，遇到EOS提前停止；benchmark固定32 Token（31次Decode），忽略EOS。
+新计时口径不能直接与旧版遇EOS停止的数据混合比较，固定步数输出不用于质量评估。
+INT8配对基线包含两边KV追加及INT8量化写入；两边独立选词，Token历史可能不同。
+KV容量统计来自实际预留张量，包括INT8数据与FP16 scale，不含权重和页表；不是进程显存节省比例。
 
 - TTFT：开始到首个 Token ID 在 CPU 可用。
 - TPOT：首个到最后一个 Token 的时间除以后续 Token 数；只输出一个时无定义。

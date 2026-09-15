@@ -209,7 +209,7 @@ def final_logits(model, hidden_states):
 
 
 @torch.inference_mode()
-def generate_tokens(model, input_ids, *, max_new_tokens: int = MAX_NEW_TOKENS, verify: bool = False, timings: dict | None = None, cache_kind: str = "contiguous", cuda_decode: bool = False, kv_dtype: torch.dtype = torch.bfloat16) -> list[int]:
+def generate_tokens(model, input_ids, *, max_new_tokens: int = MAX_NEW_TOKENS, verify: bool = False, timings: dict | None = None, cache_kind: str = "contiguous", cuda_decode: bool = False, kv_dtype: torch.dtype = torch.bfloat16, ignore_eos: bool = False) -> list[int]:
     """返回新 Token IDs；每次请求创建独立缓存，不向调用方保留 GPU 张量。
 
     两种模式共用自建前向和循环；verify 只额外执行 HF 参考和诊断。
@@ -217,14 +217,15 @@ def generate_tokens(model, input_ids, *, max_new_tokens: int = MAX_NEW_TOKENS, v
     timings 非空时写入请求级墙钟指标；不允许同时开启 HF 对照。
     两种存储共用生成循环；分页每层独占块池，尚非多请求共享池。
     cuda_decode 仅切换 Decode，Prefill 始终使用 SDPA；默认后端不变。
-    INT8仅支持分页CUDA独立生成，本轮不开放计时或HF逐Token严格对照。
+    INT8支持分页CUDA生成与计时，不支持HF逐Token严格对照。
+    ignore_eos仅用于固定工作量基线，普通生成仍遇到EOS停止。
     """
     if cache_kind not in ("contiguous", "paged"):
         raise ValueError("缓存类型必须是 contiguous 或 paged")
     if kv_dtype not in (torch.bfloat16, torch.int8):
         raise ValueError("KV类型必须是BF16或INT8")
-    if kv_dtype == torch.int8 and (cache_kind != "paged" or not cuda_decode or verify or timings is not None):
-        raise ValueError("INT8只支持分页CUDA纯生成，不支持计时或HF严格对照")
+    if kv_dtype == torch.int8 and (cache_kind != "paged" or not cuda_decode or verify):
+        raise ValueError("INT8只支持分页CUDA生成，不支持HF严格对照")
     if cuda_decode and (cache_kind != "paged" or verify):
         raise ValueError("CUDA Decode 仅支持分页纯生成；逐步对照请使用 cuda-check")
     if timings is not None and verify:
@@ -302,7 +303,7 @@ def generate_tokens(model, input_ids, *, max_new_tokens: int = MAX_NEW_TOKENS, v
             assert addresses == [tensor.data_ptr() for cache in caches for tensor in (cache._key, cache._value)]
 
         # 先判断停止，再准备下一次输入；最终 Token（包括 EOS）不再写入 KV。
-        if next_id in eos_ids or step + 1 == max_new_tokens:
+        if (not ignore_eos and next_id in eos_ids) or step + 1 == max_new_tokens:
             break
         current_input = torch.tensor([[next_id]], dtype=torch.long, device=input_ids.device)
         if verify:
@@ -319,6 +320,15 @@ def generate_tokens(model, input_ids, *, max_new_tokens: int = MAX_NEW_TOKENS, v
             print(f"分页块大小={PAGED_BLOCK_SIZE}，Prefill 长度={tokens}，最终 KV 长度={used_tokens}，Decode 跨块={crossed}")
             if not crossed:
                 print("[未覆盖] 本次 Decode 未跨块，需换输入补验；不能据此宣称跨块生成验证通过")
+    if timings is not None:
+        # 统计在最后Token就绪之后，只查元数据，不计入推理时间；包含已预留的空闲槽位。
+        timings["kv_data_bytes"] = sum(t.numel() * t.element_size() for c in caches for t in (c._key, c._value))
+        timings["kv_scale_bytes"] = sum(
+            t.numel() * t.element_size() for c in caches
+            for t in (getattr(c, "_key_scale", None), getattr(c, "_value_scale", None)) if t is not None
+        )
+        timings["bf16_capacity_bytes"] = sum(c._key.numel() * 4 for c in caches)
+        timings["capacity"] = caches[0].capacity
     if cache_kind == "paged":
         for cache in caches:
             cache.release()
@@ -339,28 +349,28 @@ def generate_tokens(model, input_ids, *, max_new_tokens: int = MAX_NEW_TOKENS, v
     return generated_ids
 
 
-def benchmark(model, input_ids, *, repeats: int = 3, cache_kind: str = "contiguous", cuda_decode: bool = False, reference_ids: list[int] | None = None) -> list[int]:
+def benchmark(model, input_ids, *, repeats: int = 3, cache_kind: str = "contiguous", cuda_decode: bool = False, reference_ids: list[int] | None = None, kv_dtype: torch.dtype = torch.bfloat16) -> list[int]:
     """同一模型预热一次、重复纯生成；只打印基础统计，不保存输入或结果文件。"""
     if repeats < 1:
         raise ValueError("测量次数必须为正数")
-    if cuda_decode and reference_ids is None:
-        raise ValueError("CUDA 基线需要先提供相同输入的 SDPA 参考序列")
     backend = "CUDA V0" if cuda_decode else "SDPA"
-    print(f"\n基线路径：缓存={cache_kind}，Decode={backend}，Prefill=SDPA")
+    print(f"\n基线路径：缓存={cache_kind}，KV={kv_dtype}，Decode={backend}，Prefill=BF16 SDPA")
     print(f"基线：预热=1 次，测量={repeats} 次，输入 Token={input_ids.shape[1]}，输出上限={MAX_NEW_TOKENS}")
     print("范围：模型与输入已就绪，包含 KV 分配和选词；无 HF 对照、分词、文本解码或终端打印")
     print("终点为最后一个 Token ID 可用；不计随后缓存归还。保留实现必需的输入检查和同步，不是内核单独计时。")
+    print(f"固定工作量：忽略EOS，生成{MAX_NEW_TOKENS}个Token；EOS后输出不用于质量评估。")
     if cache_kind == "paged":
         print("分页 SDPA 包含逻辑读回与 GQA 临时复制；CUDA Decode 包含块表创建/上传和块号检查同步；两边均包含 KV 追加。")
     # 预热不计入结果；每次调用都新建请求缓存，不复用上个请求的有效内容。
-    expected_ids = generate_tokens(model, input_ids, cache_kind=cache_kind, cuda_decode=cuda_decode)
+    expected_ids = generate_tokens(model, input_ids, cache_kind=cache_kind, cuda_decode=cuda_decode,
+                                   kv_dtype=kv_dtype, ignore_eos=True)
     if reference_ids is not None:
-        if expected_ids != reference_ids:
+        if kv_dtype == torch.int8:
+            print(f"[观测] 与BF16固定长度序列一致={expected_ids == reference_ids}；各自选词，历史可能不同，不是精度验收")
+        elif expected_ids != reference_ids:
             raise RuntimeError("CUDA 预热序列与 SDPA 不一致，取消 CUDA 测量；请运行 cuda-check 定位")
-        print("[PASS] 计时外完整 Token 序列与 SDPA 一致；不代表 logits 精度验收通过")
-    if cuda_decode and len(expected_ids) == 1:
-        print("[未覆盖] 首个 Token 为 EOS，取消 CUDA 测量；请换输入覆盖 Decode")
-        return expected_ids
+        else:
+            print("[PASS] 计时外完整 Token 序列与 SDPA 一致；不代表 logits 精度验收通过")
     device = input_ids.device
     torch.cuda.synchronize(device)
     baseline_allocated = torch.cuda.memory_allocated(device)
@@ -370,7 +380,8 @@ def benchmark(model, input_ids, *, repeats: int = 3, cache_kind: str = "contiguo
         # 重置峰值与读取显存放在生成计时区间外；不调用 empty_cache 改变分配器状态。
         torch.cuda.reset_peak_memory_stats(device)
         metrics = {}
-        generated_ids = generate_tokens(model, input_ids, timings=metrics, cache_kind=cache_kind, cuda_decode=cuda_decode)
+        generated_ids = generate_tokens(model, input_ids, timings=metrics, cache_kind=cache_kind,
+                                        cuda_decode=cuda_decode, kv_dtype=kv_dtype, ignore_eos=True)
         torch.cuda.synchronize(device)
         allocated = torch.cuda.memory_allocated(device)
         reserved = torch.cuda.memory_reserved(device)
@@ -380,6 +391,11 @@ def benchmark(model, input_ids, *, repeats: int = 3, cache_kind: str = "contiguo
             raise RuntimeError("重复请求 Token 序列不一致，停止性能汇总")
         rows.append(metrics)
         after_allocated.append(allocated)
+        if run == 0:
+            kv_bytes = metrics["kv_data_bytes"] + metrics["kv_scale_bytes"]
+            ratio = metrics["bf16_capacity_bytes"] / kv_bytes
+            print(f'[容量] 每层物理容量={metrics["capacity"]} Token，全部层KV数据={metrics["kv_data_bytes"]}字节，scale={metrics["kv_scale_bytes"]}字节，总计={kv_bytes}字节')
+            print(f'[容量] 同容量BF16字节数/当前KV字节数={ratio:.6f}；不含权重、页表、临时张量和分配器保留空间，不代表最大上下文倍数')
         tpot = "N/A" if metrics["tpot_ms"] is None else f'{metrics["tpot_ms"]:.3f} ms'
         print(f'测量 {run + 1}：输出={len(generated_ids)}，TTFT={metrics["ttft_ms"]:.3f} ms，平均 TPOT={tpot}，总耗时={metrics["total_ms"]:.3f} ms，输出吞吐={metrics["output_tokens_per_s"]:.3f} Token/s')
         print(f"显存：结束 allocated={allocated / 1024**2:.2f} MiB（较预热 {allocated - baseline_allocated:+d} 字节），reserved={reserved / 1024**2:.2f} MiB，峰值 allocated={peak / 1024**2:.2f} MiB")
@@ -611,14 +627,14 @@ def main() -> None:
     parser.add_argument("--repeats", type=int, default=3, help="benchmark 模式测量次数，默认 3，另有 1 次预热")
     parser.add_argument("--cache", choices=("contiguous", "paged"), default="contiguous", help="默认连续缓存；paged 为每块 16 Token 的分页参考")
     parser.add_argument("--kv-dtype", choices=("bf16", "int8"), default="bf16",
-                        help="普通生成的KV存储类型；int8仅支持paged，自动使用CUDA Decode；诊断模式自行选择类型")
+                        help="生成的KV类型；benchmark选int8则比较BF16/INT8 CUDA，均需paged；诊断模式自行选择")
     args = parser.parse_args()
     if args.repeats < 1:
         parser.error("--repeats 必须为正数")
     if args.mode in ("cuda-check", "int8-check") and args.cache != "paged":
         parser.error("CUDA 对照模式需要显式指定 --cache paged")
-    if args.kv_dtype == "int8" and (args.mode != "generate" or args.cache != "paged"):
-        parser.error("--kv-dtype int8 本轮仅用于 --mode generate --cache paged")
+    if args.kv_dtype == "int8" and (args.mode not in ("generate", "benchmark") or args.cache != "paged"):
+        parser.error("--kv-dtype int8 仅用于 generate/benchmark 且需 --cache paged")
     if not torch.cuda.is_available():
         raise RuntimeError("模型生成需要在云端 CUDA 环境运行")
     text = input("请输入一段文本：")
@@ -644,6 +660,15 @@ def main() -> None:
         check_cuda_decode(model, input_ids)
         return  # 对照入口自行汇总，不能落入下面的普通生成结果打印。
     if args.mode == "benchmark":
+        if args.kv_dtype == "int8":
+            # 同一模型、同一输入、相同输出步数；先BF16再INT8，固定顺序仍可能受时钟漂移影响。
+            # 这里不执行SDPA陪跑；质量检查由int8-check承担，量化写入开销包含在计时内。
+            print("配对基线：BF16 CUDA → INT8 CUDA；各自独立选词，不要求跨精度序列完全一致。")
+            reference_ids = benchmark(model, input_ids, repeats=args.repeats, cache_kind="paged", cuda_decode=True)
+            benchmark(model, input_ids, repeats=args.repeats, cache_kind="paged", cuda_decode=True,
+                      kv_dtype=torch.int8, reference_ids=reference_ids)
+            print("[完成] 固定长度BF16/INT8 CUDA初步基线；不代表正式精度或稳定加速比验收")
+            return
         generated_ids = benchmark(model, input_ids, repeats=args.repeats, cache_kind=args.cache)
         if args.cache == "paged":
             # 一次加载、同一输入、同一上限；两条路径仍分别创建并归还自己的缓存。
@@ -652,6 +677,7 @@ def main() -> None:
                 model, input_ids, repeats=args.repeats, cache_kind="paged",
                 cuda_decode=True, reference_ids=generated_ids,
             )
+        return  # benchmark忽略EOS，不把固定工作量输出打印为正常回答或EOS停止。
     else:
         # INT8直接复用循环，由自身logits选词；不创建BF16陪跑缓存。
         use_int8 = args.kv_dtype == "int8"
