@@ -1,4 +1,4 @@
-"""每 Token、每 KV 头的对称 INT8 量化参考；不接入缓存、模型或 CUDA 扩展。"""
+"""对称INT8量化参考；用于CPU对照和未融合的分页写入，CUDA单Token快路径另行实现。"""
 
 import torch
 
@@ -8,7 +8,7 @@ def quantize_kv(tensor: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     """输入 BF16 [1, KV头, Token数, 维度]，返回 INT8 数据与 FP16 [..., 1] scale。
 
     K、V 分别调用，不共享 scale。沿最后一维求最大值，不混合不同头或 Token。
-    这是清晰优先的参考：有限性检查可能同步 GPU，不用于性能计时。
+    这是清晰优先的参考：有限性检查会取回GPU结果；若调用方计时，这些开销不可排除。
     """
     if tensor.ndim != 4 or tensor.shape[0] != 1 or any(size <= 0 for size in tensor.shape):
         raise ValueError("输入必须是非空的 [1, KV头数, Token数, 每头维度]")

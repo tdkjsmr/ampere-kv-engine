@@ -94,6 +94,13 @@ def check_int8() -> None:
         amplitude = torch.linspace(0.1, 2, kv_heads * length).reshape(1, kv_heads, length, 1)
         key = (torch.randn(1, kv_heads, length, 128, generator=generator) * amplitude).to(torch.bfloat16)
         value = (torch.randn(1, kv_heads, length, 128, generator=generator) * (3 - amplitude)).to(torch.bfloat16)
+        # 首Token覆盖零scale特例、极小值和最近偶数舍入；其他Token保持随机分布。
+        key[:, :, 0, :32] = 0
+        key[:, :, 0, 32:64] = 1e-8
+        key[:, :, 0, 64:96] = 0
+        key[:, :, 0, 64:69] = torch.tensor([127, 0.5, 1.5, -0.5, -1.5], dtype=torch.bfloat16)
+        value[:, :, 0] = 0
+        value[:, :, 0, :5] = torch.tensor([127, 0.5, 1.5, -0.5, -1.5], dtype=torch.bfloat16)
         # CPU 独立量化；不从被测分页 get 构造数学参考。FP16 scale 在 FP64 中精确读取。
         # 按切片独立构造四组参考，与存储内部的reshape写法分开。
         groups = [quantize_kv(key[..., start:start + 32]) for start in range(0, 128, 32)]
@@ -105,16 +112,24 @@ def check_int8() -> None:
         v = (vd.double() * vs.double()).index_select(1, mapping)
         expected = torch.softmax((query.double() @ k.transpose(-2, -1)) * 128 ** -0.5, dim=-1) @ v
         try:
-            cache.append(key.cuda(), value.cuda())
+            gpu_key, gpu_value = key.cuda(), value.cuda()
+            # 每次只追加一个Token：覆盖融合写入、块边界、非顺序物理块及多次累积。
+            for token in range(length):
+                cache.append(gpu_key[:, :, token:token + 1], gpu_value[:, :, token:token + 1], fused=True)
             table = torch.tensor(cache._table.block_ids, dtype=torch.long, device="cuda")
             q = query.cuda()
             addresses = tuple(t.data_ptr() for t in tensors)
             # 核对 GPU 写入确实对应同一组整数和 scale，避免把量化差异归咎于读取内核。
             for physical_tensor, reference in zip(tensors, (kd, vd, ks, vs)):
                 physical = physical_tensor.cpu()
+                written = torch.zeros(blocks, 16, dtype=torch.bool)
                 for token in range(length):
                     block = cache._table.block_ids[token // 16]
+                    written[block, token % 16] = True
                     assert torch.equal(physical[block, :, token % 16], reference[0, :, token])
+                # 未分配块和尾部仍是哨兵，验证写入不越界、不误覆盖。
+                untouched = physical.permute(0, 2, 1, 3)[~written]
+                assert (untouched == -128).all() if physical.dtype == torch.int8 else torch.isnan(untouched).all()
             actual = _C.paged_decode_int8(q, *tensors, table, length)
             result = actual.cpu()
             error = (result.double() - expected).abs().max().item()
@@ -141,7 +156,7 @@ def check_int8() -> None:
             cache.release()
         assert storage._pool.num_free_blocks == blocks
         print("[PASS] INT8 融合数值对照、非法输入拒绝和块归还通过")
-    print("[PASS] 分组K INT8 CUDA 六个场景通过；未验证模型、长上下文、量化写入融合或性能")
+    print("[PASS] INT8融合写入与Decode六个场景通过；未验证模型、长上下文或性能")
 
 
 def main() -> None:

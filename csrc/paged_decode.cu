@@ -12,6 +12,49 @@ constexpr int kDim = 128;
 constexpr int kBlockSize = 16;
 constexpr int kSegmentSize = 64;  // 与此前 256 段长做单变量实验，不代表最终最优值。
 
+// 单Token写入：每个KV头一个warp；K的四组分别归约，V对128维一起归约。
+// 调用方保证输入有限且scale可用FP16表示；这是模型内部快路径，不清洗外部数据。
+__device__ float write_scale(float maximum) {
+  const float raw = maximum == 0.0f ? 1.0f : fmaxf(__fdiv_rn(maximum, 127.0f), 0x1p-14f);
+  // 必须先舍入到实际保存的FP16 scale，再用同一scale量化。
+  return static_cast<float>(static_cast<c10::Half>(raw));
+}
+
+__global__ void quantize_write_kernel(
+    const c10::BFloat16* key, const c10::BFloat16* value,
+    int8_t* output_key, int8_t* output_value, c10::Half* key_scale,
+    c10::Half* value_scale, int heads, int block, int offset) {
+  const int lane = threadIdx.x;
+  const int head = blockIdx.x;
+  const int64_t slot = (static_cast<int64_t>(block) * heads + head) * kBlockSize + offset;
+  float v[4];
+  float vmax = 0.0f;
+#pragma unroll
+  for (int group = 0; group < 4; ++group) {
+    const int dim = group * 32 + lane;
+    const float k = static_cast<float>(key[head * kDim + dim]);
+    v[group] = static_cast<float>(value[head * kDim + dim]);
+    vmax = fmaxf(vmax, fabsf(v[group]));
+    float kmax = fabsf(k);
+    for (int shift = 16; shift > 0; shift /= 2)
+      kmax = fmaxf(kmax, __shfl_xor_sync(0xffffffff, kmax, shift));
+    const float scale = write_scale(kmax);
+    if (lane == 0) key_scale[slot * 4 + group] = static_cast<c10::Half>(scale);
+    const float rounded = nearbyintf(__fdiv_rn(k, scale));  // 最近偶数舍入，与torch.round一致。
+    output_key[slot * kDim + dim] = static_cast<int8_t>(fminf(127.0f, fmaxf(-127.0f, rounded)));
+  }
+  for (int shift = 16; shift > 0; shift /= 2)
+    vmax = fmaxf(vmax, __shfl_xor_sync(0xffffffff, vmax, shift));
+  const float scale = write_scale(vmax);
+  if (lane == 0) value_scale[slot] = static_cast<c10::Half>(scale);
+#pragma unroll
+  for (int group = 0; group < 4; ++group) {
+    const float rounded = nearbyintf(__fdiv_rn(v[group], scale));
+    output_value[slot * kDim + group * 32 + lane] =
+        static_cast<int8_t>(fminf(127.0f, fmaxf(-127.0f, rounded)));
+  }
+}
+
 // 一个线程块的四个 warp 分别处理段内不同 Token；每线程仍负责四维。
 // 不创建连续历史副本，不展开 GQA 的 K/V，不使用 Tensor Core 或异步搬运。
 // 只实例化 BF16 与 INT8 两种读取方式，归约和分段合并共用；不是通用类型派发框架。
@@ -231,6 +274,40 @@ static at::Tensor paged_decode_impl(const at::Tensor& query, const at::Tensor& k
     C10_CUDA_KERNEL_LAUNCH_CHECK();
   }
   return output;
+}
+
+// 只检查CPU可见元数据，不读取GPU标量；块归属由Python块表管理。
+void quantize_write_cuda(const at::Tensor& key, const at::Tensor& value,
+                         const at::Tensor& output_key, const at::Tensor& output_value,
+                         const at::Tensor& key_scale, const at::Tensor& value_scale,
+                         int64_t block, int64_t offset) {
+  TORCH_CHECK(key.is_cuda() && key.dim() == 4 && key.size(0) == 1 &&
+              key.size(2) == 1 && key.size(3) == kDim && key.size(1) > 0 &&
+              key.size(1) <= 1024, "写入输入必须为CUDA [1, KV头, 1, 128]");
+  for (const auto& tensor : {key, value, output_key, output_value, key_scale, value_scale})
+    TORCH_CHECK(tensor.device() == key.device() && tensor.is_contiguous(), "写入张量必须同设备且连续");
+  TORCH_CHECK(key.scalar_type() == at::kBFloat16 && value.scalar_type() == at::kBFloat16 &&
+              key.sizes() == value.sizes(), "新K/V必须为同形状BF16");
+  TORCH_CHECK(output_key.dim() == 4 && output_key.size(1) == key.size(1) &&
+              output_key.size(2) == kBlockSize && output_key.size(3) == kDim &&
+              output_key.sizes() == output_value.sizes() &&
+              output_key.scalar_type() == at::kChar && output_value.scalar_type() == at::kChar,
+              "写入目标必须为INT8 [块数, KV头, 16, 128]");
+  TORCH_CHECK(block >= 0 && block < output_key.size(0) && offset >= 0 && offset < kBlockSize,
+              "写入物理位置越界");
+  for (const auto& tensor : {key_scale, value_scale})
+    TORCH_CHECK(tensor.scalar_type() == at::kHalf && tensor.dim() == 4 &&
+                tensor.size(0) == output_key.size(0) && tensor.size(1) == key.size(1) &&
+                tensor.size(2) == kBlockSize, "scale布局或类型错误");
+  TORCH_CHECK(key_scale.size(3) == 4 && value_scale.size(3) == 1, "K/V scale末维应为4/1");
+  const c10::cuda::CUDAGuard guard(key.device());
+  const auto stream = c10::cuda::getCurrentCUDAStream(key.get_device()).stream();
+  quantize_write_kernel<<<static_cast<unsigned int>(key.size(1)), 32, 0, stream>>>(
+      key.data_ptr<c10::BFloat16>(), value.data_ptr<c10::BFloat16>(),
+      output_key.data_ptr<int8_t>(), output_value.data_ptr<int8_t>(),
+      key_scale.data_ptr<c10::Half>(), value_scale.data_ptr<c10::Half>(),
+      static_cast<int>(key.size(1)), static_cast<int>(block), static_cast<int>(offset));
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
 at::Tensor paged_decode_cuda(const at::Tensor& query, const at::Tensor& key,

@@ -130,7 +130,7 @@ def decoder_layer_forward(
         from ampere_kv import _C
 
         # 单 Token K/V 只追加一次；CUDA 直接读物理存储，不调用 get 或复制 GQA 头。
-        cache.append(key, value)
+        cache.append(key, value, fused=cache._key.dtype == torch.int8)
         table = torch.tensor(cache._table.block_ids, dtype=torch.long, device=query.device)
         if cache._key.dtype == torch.int8:
             head_output = _C.paged_decode_int8(
