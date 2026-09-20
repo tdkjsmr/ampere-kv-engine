@@ -9,9 +9,6 @@ class BlockPool:
     """
 
     def __init__(self, num_blocks: int):
-        # bool 在 Python 中也是 int 的子类，这里只接受真正的内置整数。
-        if type(num_blocks) is not int or num_blocks <= 0:
-            raise ValueError("块数量必须是正整数")
         # 列表尾部作为栈顶：初次按 0、1、2……分配，归还的块优先复用。
         self._free_blocks = list(range(num_blocks - 1, -1, -1))
         # 下标就是块编号；标记用来拒绝未分配块的释放，避免重复加入空闲列表。
@@ -31,12 +28,9 @@ class BlockPool:
         return block_id
 
     def free(self, block_id: int) -> None:
-        """归还一个已分配编号；所有输入检查都在修改状态之前完成。"""
-        if type(block_id) is not int or not 0 <= block_id < len(self._allocated):
-            raise ValueError("块编号必须是池内有效整数")
+        """归还一个已分配编号；只回收编号，不清零任何 K/V。"""
         if not self._allocated[block_id]:
             raise ValueError("不能释放未分配或已经释放的块")
-        # 这里只回收编号，不清零任何 K/V；未来读取仍必须遵守有效 Token 长度。
         self._free_blocks.append(block_id)
         self._allocated[block_id] = False
 
@@ -49,8 +43,6 @@ class BlockTable:
     """
 
     def __init__(self, pool: BlockPool, block_size: int):
-        if type(block_size) is not int or block_size <= 0:
-            raise ValueError("每块 Token 数必须是正整数")
         self._pool = pool
         self._block_size = block_size
         self._block_ids: list[int] = []
@@ -67,14 +59,11 @@ class BlockTable:
 
     def append_tokens(self, num_tokens: int) -> None:
         """登记尾部新增 Token；只申请缺少的块，不搬运或写入任何 K/V。"""
-        if type(num_tokens) is not int or num_tokens <= 0:
-            raise ValueError("追加 Token 数必须是正整数")
         new_length = self._length + num_tokens
         # 向上取整：块大小为 4 时，长度 4 需要 1 块，长度 5 才需要 2 块。
         required = (new_length + self._block_size - 1) // self._block_size
         additional = required - len(self._block_ids)
-        # 先检查全部需求，避免只分配一部分后才发现耗尽。
-        # 依赖单线程且外部不破坏所有权；不承诺内存异常等故障下的事务回滚。
+        # 先检查全部需求，避免只分配一部分后才发现耗尽；不提供内存异常下的事务回滚。
         if additional > self._pool.num_free_blocks:
             raise RuntimeError("空闲块不足，本次 Token 追加未执行")
         for _ in range(additional):

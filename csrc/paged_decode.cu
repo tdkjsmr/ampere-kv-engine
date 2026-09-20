@@ -122,9 +122,8 @@ __global__ void paged_decode_kernel(
   for (int64_t token = begin + warp; token < end; token += 4) {
     // 布局 [物理块, KV 头, 块内 Token, 维度]；索引使用 64 位避免乘法溢出。
     const int64_t physical = table[token / kBlockSize];
-    // 在形成任何 K/V 或 scale 访存之前拦截非法块号；内部入口不做宿主标量取回时，
-    // 这里是唯一的越界保护。块号在合法范围内并不等于属于当前请求，归属仍由块池和块表
-    // 生命周期保证；越界时明确失败，不夹到合法编号、不跳过 Token、不返回假装正常的零。
+    // 访存前拦截非法块号；这是内部入口唯一的越界保护。块号合法不等于属于当前请求，
+    // 归属由块池与块表生命周期保证。
     CUDA_KERNEL_ASSERT(physical >= 0 && physical < blocks);
     const int offset = token % kBlockSize;
     const int64_t index = ((physical * kv_heads + kv_head) * kBlockSize + offset) * kDim + lane;
@@ -282,9 +281,8 @@ static at::Tensor paged_decode_impl(const at::Tensor& query, const at::Tensor& k
     const auto used_table = table.narrow(0, 0, (length - 1) / kBlockSize + 1);
     TORCH_CHECK(used_table.min().item<int64_t>() >= 0 && used_table.max().item<int64_t>() < key.size(0), "物理块编号越界");
   }
-  // 内部入口跳过上面两次标量取回，消除每层每 Token 的 CPU 等待；越界改由内核在访存前用
-  // 设备端断言拦截。设备端断言属异步失败，通常在后续同步点才可见，发生后不能捕获异常继续
-  // 复用同一 CUDA 上下文：内部路径出现非法块表视为实现错误，本次运行必须终止。
+  // 内部入口跳过宿主标量取回，消除每层每 Token 的 CPU 等待；越界由内核在访存前断言拦截。
+  // 设备端断言是异步失败且会毒化上下文，内部路径出现非法块表视为实现错误，本次运行终止。
   auto output = at::empty_like(query);
   const auto stream = c10::cuda::getCurrentCUDAStream(query.get_device()).stream();
   // 长历史才建立局部结果；临时存储分配和额外启动均计入现有调用基线。
@@ -372,8 +370,7 @@ void bf16_write_cuda(const at::Tensor& key, const at::Tensor& value,
               output_key.sizes() == output_value.sizes() &&
               output_key.scalar_type() == at::kBFloat16 && output_value.scalar_type() == at::kBFloat16,
               "写入目标必须为BF16 [块数, KV头, 16, 128]");
-  // 只校验写入范围与块表长度自洽。start 等于旧有效长度、块归属正确均由调用方保证；
-  // 本检查本身不证明历史有效区域与末块未写尾部全部受到保护。
+  // 只校验写入范围与块表长度自洽；start 等于旧有效长度、块归属正确由调用方保证。
   TORCH_CHECK(table.scalar_type() == at::kLong && table.dim() == 1 && start >= 0 &&
               start <= table.numel() * kBlockSize - key.size(2), "块表或写入范围无效");
   const c10::cuda::CUDAGuard guard(key.device());

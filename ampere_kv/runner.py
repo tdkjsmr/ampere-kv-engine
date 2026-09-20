@@ -52,18 +52,12 @@ def project_qkv(normalized: torch.Tensor, attention) -> tuple[torch.Tensor, torc
 
 
 def apply_rope(query: torch.Tensor, key: torch.Tensor, position_ids: torch.Tensor, config):
-    """按固定 Qwen3 的默认 RoPE 旋转 Q/K；位置显式传入，不修改原张量或 V。"""
+    """按固定 Qwen3 的默认 RoPE 旋转 Q/K；位置显式传入，不修改原张量或 V。
 
-    # 只实现当前模型实际使用的完整维度默认 RoPE，不悄悄忽略长上下文缩放配置。
-    if config.rope_scaling is not None or getattr(config, "partial_rotary_factor", 1.0) != 1.0:
-        raise ValueError("当前 RoPE 仅支持无缩放、完整头维度的模型配置")
+    模型 Revision 固定、rope_scaling 为空且头维度完整，因此不在每层每步重复校验配置。
+    """
     dim = config.head_dim
-    if dim % 2 != 0 or query.shape[-1] != dim or key.shape[-1] != dim:
-        raise ValueError("RoPE 需要偶数头维度，且 Q/K 维度必须与配置一致")
-    if position_ids.shape != (query.shape[0], query.shape[2]):
-        raise ValueError("位置形状必须是 [批大小, 本次 Token 数]")
-    # 从真实 rope_theta 计算各维度频率；与当前 CPU 加载后搬到 GPU 的模型路径一致。
-    # 这里只生成很短的频率向量，不复制模型权重；后续接入多层时再复用频率表。
+    # 从真实 rope_theta 计算各维度频率；只生成很短的频率向量，不复制模型权重。
     exponent = torch.arange(0, dim, 2, dtype=torch.int64).float() / dim
     inv_freq = (1.0 / (config.rope_theta ** exponent)).to(query.device)
     with torch.autocast(device_type=query.device.type, enabled=False):
@@ -94,14 +88,6 @@ def decoder_layer_forward(
     cuda_decode 用于可选生成与对照，默认仍走 SDPA；当前 CUDA 分支不支持 Graph。
     """
     attention = layer.self_attn
-    if cuda_decode and (is_prefill or not isinstance(cache, PagedKVCache)):
-        raise ValueError("CUDA Decode 只接受分页缓存的单 Token Decode")
-    if is_prefill and cache.length != 0:
-        raise ValueError("层 Prefill 只接受空缓存，不支持分块追加")
-    if not is_prefill:
-        if hidden_states.shape[1] != 1 or cache.length == 0:
-            raise ValueError("层 Decode 需要单 Token 输入和非空历史缓存")
-
     # Pre-Norm：先归一化，再送入 Attention；原始输入留在残差支路上。
     norm = layer.input_layernorm
     normalized = rms_norm(hidden_states, norm.weight, norm.variance_epsilon)
@@ -178,18 +164,6 @@ def model_forward(model, input_ids, position_ids, caches, *, is_prefill: bool, c
     不负责分词、选词、打印或对照；不提供缓存写入失败后的跨层回滚。
     """
     layers = model.model.layers
-    if len(caches) != len(layers):
-        raise ValueError("缓存数量必须与模型层数一致")
-    if cuda_decode:
-        # 全部层写入前拒绝不支持的后端配置；后续 GPU 故障仍不提供事务回滚。
-        if is_prefill or model.config.head_dim != 128 or any(
-            not isinstance(cache, PagedKVCache) or cache._key.shape[2] != 16 for cache in caches
-        ):
-            raise ValueError("CUDA V0 仅支持分页 Decode、块大小 16、每头 128 维")
-    # 写入前检查全部层的长度和容量，避免后面某层才发现容量不足。
-    used_tokens = caches[0].length
-    if any(cache.length != used_tokens or used_tokens + input_ids.shape[1] > cache.capacity for cache in caches):
-        raise ValueError("各层缓存长度不一致或容量不足")
     hidden_states = model.model.embed_tokens.weight[input_ids]
     for layer, cache in zip(layers, caches):
         hidden_states = decoder_layer_forward(
@@ -210,32 +184,9 @@ def final_logits(model, hidden_states):
 def generate_tokens(model, input_ids, *, max_new_tokens: int = MAX_NEW_TOKENS, verify: bool = False, timings: dict | None = None, cache_kind: str = "contiguous", cuda_decode: bool = False, kv_dtype: torch.dtype = torch.bfloat16, ignore_eos: bool = False) -> list[int]:
     """返回新 Token IDs；每次请求创建独立缓存，不向调用方保留 GPU 张量。
 
-    两种模式共用自建前向和循环；verify 只额外执行 HF 参考和诊断。
-    纯生成不调用 HF forward、不创建 HF 缓存、不逐步打印，仍保留必要输入检查。
-    timings 非空时写入请求级墙钟指标；不允许同时开启 HF 对照。
-    两种存储共用生成循环；分页每层独占块池，尚非多请求共享池。
-    cuda_decode 仅切换 Decode，Prefill 始终使用 SDPA；默认后端不变。
-    INT8支持分页CUDA生成与计时，不支持HF逐Token严格对照。
-    ignore_eos仅用于固定工作量基线，普通生成仍遇到EOS停止。
+    verify 额外执行 HF 参考与诊断，timings 写入请求级墙钟指标，两者互斥；模式组合与
+    输入张量由 main 保证，这里不重复校验。cuda_decode 只切换 Decode，Prefill 始终用 SDPA。
     """
-    if cache_kind not in ("contiguous", "paged"):
-        raise ValueError("缓存类型必须是 contiguous 或 paged")
-    if kv_dtype not in (torch.bfloat16, torch.int8):
-        raise ValueError("KV类型必须是BF16或INT8")
-    if kv_dtype == torch.int8 and (cache_kind != "paged" or not cuda_decode or verify):
-        raise ValueError("INT8只支持分页CUDA生成，不支持HF严格对照")
-    if cuda_decode and (cache_kind != "paged" or verify):
-        raise ValueError("CUDA Decode 仅支持分页纯生成；逐步对照请使用 cuda-check")
-    if timings is not None and verify:
-        raise ValueError("计时不能包含 HF 对照，请使用纯生成路径")
-    if max_new_tokens <= 0:
-        raise ValueError("新 Token 上限必须为正数")
-    if input_ids.ndim != 2 or input_ids.shape[0] != 1 or input_ids.shape[1] == 0:
-        raise ValueError("当前只支持单条非空、无填充的 Token 序列")
-    if input_ids.dtype != torch.long or input_ids.device.type != "cuda":
-        raise ValueError("输入 Token IDs 必须是 CUDA 上的 int64 张量")
-    if model.training:
-        raise ValueError("生成前必须将模型设为 eval 模式")
     tokens = input_ids.shape[1]
     if timings is not None:
         # 先排空前序 GPU 工作，再开始计时；模型加载、分词、输入搬运都已完成。

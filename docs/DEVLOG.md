@@ -123,3 +123,15 @@
 - **BF16/INT8同时切换**：`runner.py`的`cuda_decode`分支两条精度都改用内部入口，不只优化一边。本轮不叠加块表常驻更新、CUDA Graph、Triton或其他内核优化，以免无法归因。
 - **验证状态**：本地只做AST解析、`git diff --check`与CUDA声明/定义/绑定/参数静态核对，**未编译、未运行任何GPU测试**。新增`check_internal_guard`：因设备端断言会毒化上下文，探测在**独立子进程**执行（`--probe-guard bf16|int8`），父进程断言子进程到达探测点、未打印存活标记、非零退出、且stderr不含`illegal memory access`，用以区分"断言拦住了"与"保护没编进去、真的读越界"。**本机`.venv`无torch头文件，`CUDA_KERNEL_ASSERT`在实际构建配置中是否生效只能由该探测在云端确认**；若探测失败，属Codex裁定中"无法落实有效的访存前保护"，需再触发复核。
 - **遗留**：同步减少后的实际收益未测量，需云端用固定输入（28 Token）跑`--mode benchmark --cache paged --kv-dtype int8`并与本轮45.165/38.969 ms同口径比较。G4/G5暂不关闭：最大容量实测、8192步精度统计、Triton融合、Custom Op/Meta/`opcheck`、V3同KV头协作与向量化加载仍未做。
+
+### 2026-09-20 按 vLLM 风格精简防御性检查与注释（待云端验证）
+
+- **作者**：平台q（只删校验与注释，未改算法、布局、量化规则或 benchmark 计时口径）
+- **动机**：用户指出验证对照过多、代码难以人工审阅，要求以 vLLM 这类成熟引擎为标准——边界处校验、内部互相信任、热路径不为校验做宿主同步、测试不写进算子文件。精简前 7 个主要文件共 1932 行，其中 132 行检查、289 行注释（占 21%）。
+- **补记上一轮实测**（推翻上一条"未测量"）：移除每层每 Token 的 `min().item()`/`max().item()` 后，TPOT 由 39.045/38.969 降到 37.321/37.178 ms（BF16/INT8，−1.724/−1.791 ms，约 −4.5%），即**每次设备同步约 24 µs**；这修正了此前从"移除每层 `position_ids.item()` 降 8.7 ms"反推的 242 µs/层——那次同时移除了逐层 KV 读回与重复检查，不是纯同步成本。设备端块号保护已由独立子进程探测确认在实际构建配置下生效（失败原因是断言而非非法访存）。该轮输入为 36 Token 而非 28，**跨轮 TTFT 不可直接相减**。
+- **删除**：`paged_decode.py` 的内部入口设备端保护子进程探测框架（约 87 行，一次性使命已完成）；`kv_cache.py` 的 `_cached_attention` 16 个输入校验与 `ContiguousKVCache.append` 7 个；`paged_cache.py::append` 的形状/dtype/设备前置检查、以及融合分支中重复 CUDA 入口的支持范围检查；`block_pool.py` 的 `type(x) is not int` 式检查；`runner.py` 中与 argparse `choices=` 或 `main` 重复的 9 个 `generate_tokens` 校验、`apply_rope` 的 3 个逐层配置校验、`model_forward` 与 `decoder_layer_forward` 的 6 个内部不变量校验；`quantization.py::dequantize_kv` 的 5 个校验。`check_bf16_write` 由 42 行压到 27 行、`check_int8` 的逐 Token 物理写入循环改为 `get()` 一次性对照。
+- **保留（最低代码量的安全保护）**：三处内核 `CUDA_KERNEL_ASSERT` 块号保护、`paged_decode_impl` 与两个写入入口的边界 `TORCH_CHECK`、量化规则本身（`write_scale`、最近偶数舍入、`[-127,127]`、零 scale 特例、FP16 范围拒绝）、块池耗尽与重复归还 raise、`locate` 的有效长度边界、`check_int8` 对 FP64 参考的数值对照与非法块号拒绝。
+- **性能副产物**：`apply_rope` 的 3 个配置校验此前每层每步执行，删除后每 Token 少 108 次 Python 级判断；量级很小，未单独测量。
+- **结果**：7 个文件 1932 → 1589 行（−343），检查 132 → 72，注释 289 → 187。**`csrc/paged_decode.cu` 的 30 条 `TORCH_CHECK` 本轮未动**——它们位于扩展入口边界，是 vLLM 也会保留的位置；且本机无法编译，重写表达式若出错要浪费一次云端构建，留待单独一轮。
+- **验证状态**：本地只做 AST 解析与 `git diff --check`，**未编译、未运行**。需云端 `make build` 后重跑 `python -m ampere_kv.paged_decode`、`--mode check --cache paged`、`--mode cuda-check`、`--mode int8-check` 与 `--mode benchmark` 确认无回归。
+- **行为变化**：非法输入现在更可能表现为 PyTorch/CUDA 的底层报错而非中文提示；内部路径出现非法块表仍按上一轮约定视为实现错误并终止运行。

@@ -12,11 +12,6 @@ class PagedKVStorage:
 
     def __init__(self, num_kv_heads: int, head_dim: int, num_blocks: int,
                  block_size: int, device="cpu", *, kv_dtype=torch.bfloat16):
-        if any(type(size) is not int or size <= 0
-               for size in (num_kv_heads, head_dim, num_blocks, block_size)):
-            raise ValueError("KV 头数、每头维度、块数量和块大小必须是正整数")
-        if kv_dtype not in (torch.bfloat16, torch.int8):
-            raise ValueError("分页存储只支持 BF16 或 INT8")
         if kv_dtype == torch.int8 and head_dim != 128:
             raise ValueError("当前 INT8 存储固定每头128维，K分成四组32维")
         self._pool = BlockPool(num_blocks)
@@ -25,7 +20,6 @@ class PagedKVStorage:
         shape = (num_blocks, num_kv_heads, block_size, head_dim)
         self._key = torch.empty(shape, dtype=kv_dtype, device=device)
         self._value = torch.empty(shape, dtype=kv_dtype, device=device)
-        # INT8 每个物理位置、每个 KV 头分别保存 K/V scale，不常驻 BF16 历史副本。
         self._key_scale = self._value_scale = None
         if kv_dtype == torch.int8:
             # K 每连续32维一个 scale；V 仍是整个128维一个 scale。
@@ -61,51 +55,32 @@ class PagedKVCache:
     @torch.no_grad()
     def append(self, key: torch.Tensor, value: torch.Tensor, *, fused: bool = False) -> torch.Tensor | None:
         """追加BF16 K/V；融合分支返回GPU块表供Decode复用，参考分支返回None。"""
-        # 主动拒绝形状、类型与设备不匹配，避免 copy_ 自动广播或转换掩盖错误。
-        if key.ndim != 4 or key.shape != value.shape:
-            raise ValueError("新 K/V 必须是形状相同的四维张量")
-        if key.shape[0] != 1 or key.shape[1] != self._key.shape[1] or key.shape[3] != self._key.shape[3]:
-            raise ValueError("新 K/V 的批大小、KV 头数或每头维度与缓存不一致")
-        if key.dtype != torch.bfloat16 or value.dtype != torch.bfloat16:
-            raise ValueError("新 K/V 必须使用 BF16")
-        if key.device != self._key.device or value.device != self._value.device:
-            raise ValueError("新 K/V 必须与缓存位于同一设备")
         start = self.length
         if fused:
-            # 模型内部Prefill/Decode共用：INT8需输入有限且scale可表示，BF16只按位搬运。
-            # GPU异步失败后请求必须丢弃，不能继续使用已登记的块表。
-            # 与CUDA写入入口同一组条件；必须在改块表前拒绝，否则会登记未写入的Token。
-            if (not key.is_cuda or self._key.shape[2] != 16 or not 0 < key.shape[2] <= 65535
-                    or key.shape[3] != 128 or not 0 < key.shape[1] <= 1024):
-                raise ValueError("融合写入只支持CUDA分页缓存、块大小16、每头128维且KV头数不超过1024")
+            # 模型内部快路径：GPU 异步失败后本次请求必须丢弃，不能继续用已登记的块表。
+            # 支持范围由 CUDA 写入入口校验，这里不重复。
             from ampere_kv import _C
             quantized = self._key_scale is not None
-            write = _C.quantize_write if quantized else _C.bf16_write  # 旧扩展缺少入口时，在修改块表之前报错。
+            write = _C.quantize_write if quantized else _C.bf16_write
             key, value = key.contiguous(), value.contiguous()
             self._table.append_tokens(key.shape[2])
             table = torch.tensor(self._table.block_ids, dtype=torch.long, device=key.device)
-            # 块分配、块表上传与返回值两种精度共用；只有写入入口和scale参数不同。
             if quantized:
                 write(key, value, self._key, self._value, self._key_scale, self._value_scale, table, start)
             else:
                 write(key, value, self._key, self._value, table, start)
             return table
         if self._key_scale is not None:
-            # K/V 全部量化成功后才申请块；例如 V 含 NaN 时，不能留下只写入 K 的状态。
-            # 这里只产生本次追加数据的临时结果，不重新量化旧历史。
+            # 参考量化路径：K 临时合并 Token 与组维，只沿 32 维量化，不混合不同 Token 的分量。
             shape = key.shape
-            # 临时合并 Token 与组维，只沿32维量化；不混合不同 Token 的分量。
             key, key_scale = quantize_kv(key.reshape(1, shape[1], shape[2] * 4, 32))
             key = key.reshape(shape)
             key_scale = key_scale.reshape(1, shape[1], shape[2], 4)
             value, value_scale = quantize_kv(value)
-        # 块表拒绝空追加和容量不足；以上可预检错误均在修改存储前拒绝。
-        # 先登记才能用 locate 查询新位置。若后续复制失败，不提供事务回滚；
-        # 调用方应丢弃本次缓存状态，不能继续读取或盲目重试追加。
+        # 参考路径逐 Token 复制，只求语义清晰；不提供失败回滚，调用方应丢弃本次缓存状态。
         self._table.append_tokens(key.shape[2])
         for index in range(key.shape[2]):
             physical_block, offset = self._table.locate(start + index)
-            # 一次复制一个 Token 的全部 KV 头；这里只追求语义清晰，不追求速度。
             self._key[physical_block, :, offset, :].copy_(key[0, :, index, :])
             self._value[physical_block, :, offset, :].copy_(value[0, :, index, :])
             if self._key_scale is not None:
@@ -116,14 +91,12 @@ class PagedKVCache:
     def get(self) -> tuple[torch.Tensor, torch.Tensor]:
         """按逻辑顺序复制有效 K/V，返回 [1, KV 头数, 有效 Token 数, 每头维度]。
 
-        BF16 返回 BF16；INT8 读取有效整数和 scale 后还原为 FP32，供参考 Attention 使用。
-        返回独立副本，不是底层视图；高性能分页 Attention 不应这样读回历史。
+        INT8 还原为 FP32 供参考 Attention 使用；返回独立副本，高性能路径不应这样读回历史。
         """
         if self.length == 0:
             shape = (1, self._key.shape[1], 0, self._key.shape[3])
             dtype = torch.float32 if self._key_scale is not None else torch.bfloat16
             return self._key.new_empty(shape, dtype=dtype), self._value.new_empty(shape, dtype=dtype)
-        # 数据与 scale 共用一份有效位置列表，末块未写入部分不会被读取。
         slots = [self._table.locate(position) for position in range(self.length)]
 
         def gather(tensor):
@@ -131,7 +104,7 @@ class PagedKVCache:
 
         key, value = gather(self._key), gather(self._value)
         if self._key_scale is not None:
-            # 按相同顺序拆组反量化，再还原每个 Token 的128维；不展开 GQA 头。
+            # 按相同顺序拆组反量化，再还原每个 Token 的 128 维；不展开 GQA 头。
             grouped_key = key.reshape(1, key.shape[1], self.length * 4, 32)
             scales = gather(self._key_scale).reshape(1, key.shape[1], self.length * 4, 1)
             return (dequantize_kv(grouped_key, scales).reshape(key.shape),
