@@ -128,13 +128,16 @@ def decoder_layer_forward(
         # 单 Token K/V 只追加一次；两种精度都走批量写入入口并复用其返回的块表。
         # CUDA 直接读物理存储，不调用 get 或复制 GQA 头。
         table = cache.append(key, value, fused=True)
+        # 模型内部用无宿主标量取回的入口，消除每层每 Token 的 min/max 同步等待。
+        # 块号越界改由内核在访存前用设备端断言拦截：属异步失败，不可捕获后复用同一
+        # CUDA 上下文，因此内部路径出现非法块表视为实现错误，本次运行终止。
         if cache._key.dtype == torch.int8:
-            head_output = _C.paged_decode_int8(
+            head_output = _C.paged_decode_int8_internal(
                 query.contiguous(), cache._key, cache._value,
                 cache._key_scale, cache._value_scale, table, cache.length,
             )
         else:
-            head_output = _C.paged_decode(query.contiguous(), cache._key, cache._value, table, cache.length)
+            head_output = _C.paged_decode_internal(query.contiguous(), cache._key, cache._value, table, cache.length)
     else:
         attention_fn = prefill_attention if is_prefill else decode_attention
         head_output = attention_fn(query, key, value, cache)

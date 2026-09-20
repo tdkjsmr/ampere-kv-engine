@@ -98,7 +98,7 @@ __global__ void paged_decode_kernel(
     const KV* value, const int64_t* table,
     const c10::Half* key_scale, const c10::Half* value_scale,
     c10::BFloat16* output, float* partials, int64_t length,
-    int kv_heads, int group_size, int segments) {
+    int kv_heads, int group_size, int segments, int64_t blocks) {
   const int lane = threadIdx.x % 32;
   const int warp = threadIdx.x / 32;  // 固定启动四个完整 warp，shuffle 只在各自 warp 内执行。
   // 只暂存局部结果，不搬运 K/V：四份 FP32 分子、最大值和分母，共 2080 字节。
@@ -122,6 +122,10 @@ __global__ void paged_decode_kernel(
   for (int64_t token = begin + warp; token < end; token += 4) {
     // 布局 [物理块, KV 头, 块内 Token, 维度]；索引使用 64 位避免乘法溢出。
     const int64_t physical = table[token / kBlockSize];
+    // 在形成任何 K/V 或 scale 访存之前拦截非法块号；内部入口不做宿主标量取回时，
+    // 这里是唯一的越界保护。块号在合法范围内并不等于属于当前请求，归属仍由块池和块表
+    // 生命周期保证；越界时明确失败，不夹到合法编号、不跳过 Token、不返回假装正常的零。
+    CUDA_KERNEL_ASSERT(physical >= 0 && physical < blocks);
     const int offset = token % kBlockSize;
     const int64_t index = ((physical * kv_heads + kv_head) * kBlockSize + offset) * kDim + lane;
     float k_scale = 1.0f, v_scale = 1.0f;
@@ -245,10 +249,10 @@ __global__ void merge_decode_kernel(const float* partials, c10::BFloat16* output
 }
 }  // 匿名命名空间：内部实现不暴露给其他编译单元。
 
-// 共用形状检查、块号检查、工作区与启动；两个公开入口固定各自精度。
+// 共用形状检查、工作区与启动；quantized 决定精度，check_table 决定是否做宿主块号检查。
 static at::Tensor paged_decode_impl(const at::Tensor& query, const at::Tensor& key,
                             const at::Tensor& value, const at::Tensor& table,
-                            int64_t length, bool quantized,
+                            int64_t length, bool quantized, bool check_table,
                             const at::Tensor& key_scale, const at::Tensor& value_scale) {
   TORCH_CHECK(query.is_cuda() && key.is_cuda() && value.is_cuda() && table.is_cuda(), "输入必须全部位于 CUDA");
   TORCH_CHECK(query.device() == key.device() && key.device() == value.device() && key.device() == table.device(), "输入必须位于同一设备");
@@ -273,9 +277,14 @@ static at::Tensor paged_decode_impl(const at::Tensor& query, const at::Tensor& k
   TORCH_CHECK(segment_count <= 65535, "分段数超过二维 CUDA 网格上限");
   const int segments = static_cast<int>(segment_count);
   const c10::cuda::CUDAGuard guard(query.device());
-  // 保留公开读取入口的块号保护；本轮不把移除安全检查混入Prefill融合收益。
-  const auto used_table = table.narrow(0, 0, (length - 1) / kBlockSize + 1);
-  TORCH_CHECK(used_table.min().item<int64_t>() >= 0 && used_table.max().item<int64_t>() < key.size(0), "物理块编号越界");
+  if (check_table) {
+    // 受检查入口保留宿主块号保护：非法块号同步报错，调用方可以捕获后继续做其他检查。
+    const auto used_table = table.narrow(0, 0, (length - 1) / kBlockSize + 1);
+    TORCH_CHECK(used_table.min().item<int64_t>() >= 0 && used_table.max().item<int64_t>() < key.size(0), "物理块编号越界");
+  }
+  // 内部入口跳过上面两次标量取回，消除每层每 Token 的 CPU 等待；越界改由内核在访存前用
+  // 设备端断言拦截。设备端断言属异步失败，通常在后续同步点才可见，发生后不能捕获异常继续
+  // 复用同一 CUDA 上下文：内部路径出现非法块表视为实现错误，本次运行必须终止。
   auto output = at::empty_like(query);
   const auto stream = c10::cuda::getCurrentCUDAStream(query.get_device()).stream();
   // 长历史才建立局部结果；临时存储分配和额外启动均计入现有调用基线。
@@ -292,13 +301,13 @@ static at::Tensor paged_decode_impl(const at::Tensor& query, const at::Tensor& k
         query.data_ptr<c10::BFloat16>(), key.data_ptr<int8_t>(), value.data_ptr<int8_t>(),
         table.data_ptr<int64_t>(), key_scale.data_ptr<c10::Half>(), value_scale.data_ptr<c10::Half>(),
         output.data_ptr<c10::BFloat16>(), partial_ptr, length, static_cast<int>(kv_heads),
-        static_cast<int>(q_heads / kv_heads), segments);
+        static_cast<int>(q_heads / kv_heads), segments, key.size(0));
   } else {
     paged_decode_kernel<c10::BFloat16><<<grid, 128, 0, stream>>>(
         query.data_ptr<c10::BFloat16>(), key.data_ptr<c10::BFloat16>(),
         value.data_ptr<c10::BFloat16>(), table.data_ptr<int64_t>(), nullptr, nullptr,
         output.data_ptr<c10::BFloat16>(), partial_ptr, length, static_cast<int>(kv_heads),
-        static_cast<int>(q_heads / kv_heads), segments);
+        static_cast<int>(q_heads / kv_heads), segments, key.size(0));
   }
   C10_CUDA_KERNEL_LAUNCH_CHECK();
   if (segments > 1) {
@@ -378,13 +387,28 @@ void bf16_write_cuda(const at::Tensor& key, const at::Tensor& value,
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
+// 受检查入口：供独立算子检查与外部调用；非法块号同步报错，调用方可捕获后继续。
 at::Tensor paged_decode_cuda(const at::Tensor& query, const at::Tensor& key,
                             const at::Tensor& value, const at::Tensor& table, int64_t length) {
-  return paged_decode_impl(query, key, value, table, length, false, at::Tensor(), at::Tensor());
+  return paged_decode_impl(query, key, value, table, length, false, true, at::Tensor(), at::Tensor());
 }
 
 at::Tensor paged_decode_int8_cuda(const at::Tensor& query, const at::Tensor& key,
                                  const at::Tensor& value, const at::Tensor& key_scale,
                                  const at::Tensor& value_scale, const at::Tensor& table, int64_t length) {
-  return paged_decode_impl(query, key, value, table, length, true, key_scale, value_scale);
+  return paged_decode_impl(query, key, value, table, length, true, true, key_scale, value_scale);
+}
+
+// 模型内部入口：不做宿主标量取回，块号改由内核在任何 K/V 或 scale 访存之前保护。
+// 形状、类型、设备、长度和块表长度检查仍然无条件执行；非法块表属实现错误，
+// 会在后续同步点异步失败并终止本次运行，不提供可恢复的 GPU 错误处理。
+at::Tensor paged_decode_internal_cuda(const at::Tensor& query, const at::Tensor& key,
+                                     const at::Tensor& value, const at::Tensor& table, int64_t length) {
+  return paged_decode_impl(query, key, value, table, length, false, false, at::Tensor(), at::Tensor());
+}
+
+at::Tensor paged_decode_int8_internal_cuda(const at::Tensor& query, const at::Tensor& key,
+                                          const at::Tensor& value, const at::Tensor& key_scale,
+                                          const at::Tensor& value_scale, const at::Tensor& table, int64_t length) {
+  return paged_decode_impl(query, key, value, table, length, true, false, key_scale, value_scale);
 }

@@ -100,3 +100,26 @@
 - **验证状态**：本地仅做AST解析、`git diff --check`与CUDA声明/定义/绑定/参数/索引静态核对，**未编译、未运行任何GPU测试**。需云端`make build`后依次跑`python -m ampere_kv.paged_decode`、`python -m ampere_kv.runner --mode check --cache paged`（对HF严格对照，会实际走新BF16写入路径）、`--mode cuda-check`与`--mode benchmark`。**性能未测量，不承诺加速幅度**；本轮收益含"移除BF16 Prefill分页读回"，不能全部归因于存储精度或单个内核。
 - **输入长度事实**：用户在同一台3090上更换了输入提示词，本轮输入Token数为39、比上一轮增加，因此本轮与上一轮的TTFT不能直接比较；BF16 TTFT由61.787到106.497 ms的变化不能全部归因于输入长度，本轮也没有做同输入的配对测量。后续每轮benchmark记录输入Token数，便于判断跨轮可比性。
 - **遗留问题**：Decode侧INT8相对BF16仍有约1.4 ms/Token净差，来源未测量；`--mode cuda-check`的Prefill严格对照两侧现在走同一路径，不再能区分新旧BF16写入，该保障由`check_bf16_write`的逐元素对照承担。
+
+### 2026-09-20 补记：等路径配对实测的条件与数字
+
+- 上一节改动在提交`83954a2`推送后由用户在云端编译运行；此前只写了"待云端验证"，现补记实际条件与数字。
+- **条件**：RTX 3090，Qwen3-8B（revision `b968826d`），缓存=paged，Decode=CUDA V0，Prefill=BF16 SDPA；输入28 Token（用户指定的固定提示词），忽略EOS固定输出32 Token；预热1次、测量3次取中位数；每层物理容量64 Token，最终KV长度60，Decode跨块。
+- **结果（中位数）**：BF16 TTFT 45.634 ms、TPOT 39.045 ms、总耗时1256.041 ms、输出吞吐25.477 Token/s；INT8 TTFT 45.165 ms、TPOT 38.969 ms、总耗时1253.215 ms、输出吞吐25.534 Token/s。组内离散：TTFT 0.609/0.437 ms，TPOT 0.214/0.284 ms。
+- **可记录的结论（经Codex复核后收窄口径）**：在已经测量的硬件、输入长度和固定输出工作量下，等路径比较**未观察到INT8的延迟收益**；计入scale后，同Token容量的BF16/INT8 KV存储字节比为**1.9248**。两条差值（TTFT 0.469 ms、TPOT 0.076 ms）都小于组内离散，n=3。
+- **不得写成两个更强的结论**：①"INT8在所有负载下没有延迟收益"——长上下文与批量尚未覆盖；②"已实测最大上下文容量提高1.9248倍"——该数字是存储布局的字节比，不是完整引擎的最大可运行Token容量比。**G5要求的最大容量实测仍未被这个字节比替代。**
+- 容量账本在第二个容量点复现：BF16 9,437,184 B；INT8 4,718,592 B + scale 184,320 B = 4,902,912 B；比值同为1.924812，scale占整数数据3.906%、占总量3.759%。峰值allocated差4.33 MiB与池字节差4,534,272 B（4.3243 MiB）吻合。
+- 上一轮39 Token下TTFT差为56.84 ms（2.14×）；本轮INT8代码路径未变、可作对照，等输入配对下差距降到0.469 ms，说明该差距来自BF16侧此前的参考写入与分页读回，不是存储精度。上一节"遗留问题"记的Decode侧约1.4 ms/Token净差，本轮同口径下降至0.076 ms（噪声级），归因为BF16 Decode此前走非融合`append`，**不是KV带宽**；这与2026-09-17台账"Decode非KV带宽受限"一致。
+- **正确性**：用户报告`make build`、扩展符号自检、`python -m ampere_kv.paged_decode`（含BF16写入逐元素对照与六个INT8场景）、`--mode check --cache paged`（对HF `rtol=0, atol=0`）、`--mode cuda-check`、`--mode int8-check`全部通过；**原始输出未提供，此处记为用户报告通过**。benchmark中`与BF16固定长度序列一致=False`是预期观测，不是精度验收也不是内核错误。
+
+### 2026-09-20 内部Decode路径移除逐层块号标量取回（待云端验证）
+
+- **作者**：平台q（只改代码，本机无CUDA，未编译未运行）
+- **动机**：`paged_decode_impl`每次调用对有效块表做`min().item()`/`max().item()`两次标量取回，Decode每Token 36层×2=72次CPU等待点（2026-09-17台账已记过该数字）。按Codex裁定：要消除的是这些逐层取回造成的等待，**不是物理块编号的边界约束**。
+- **改动**：`paged_decode_kernel`增加物理块总数入参，在读取`physical`之后、任何K/V或scale访存之前用`CUDA_KERNEL_ASSERT`拦截`0 ≤ physical < 块总数`；`paged_decode_impl`增加`check_table`形参，把宿主min/max检查改为条件执行，其余形状/类型/设备/长度/块表长度检查仍无条件执行；新增`paged_decode_internal`与`paged_decode_int8_internal`两个内部入口并在`bindings.cpp`注册。
+- **受检查入口保留**：`paged_decode`/`paged_decode_int8`行为不变，供独立算子检查与外部调用；`paged_decode.py`原有的非法块号测试仍打在受检查入口上，仍是可捕获的同步异常，"非法输入立即报错、进程还能继续做其他检查"的行为没有被悄悄改变。
+- **错误处理语义差异**：内部入口"仍防止越界访问"**不等于**"仍保持原来的同步异常行为"。设备端断言属异步失败，通常在后续同步点才可见；发生后不能捕获异常继续复用同一CUDA上下文，后续CUDA调用都会失败。因此内部路径出现非法块表视为实现错误，失败后终止该运行；本轮不做可恢复GPU错误框架。
+- **保护能力边界**：块号处于合法范围不代表属于当前请求；原来的min/max检查同样没有验证请求归属，归属仍由块池与块表生命周期保证。不得夸大新旧检查的保护能力。
+- **BF16/INT8同时切换**：`runner.py`的`cuda_decode`分支两条精度都改用内部入口，不只优化一边。本轮不叠加块表常驻更新、CUDA Graph、Triton或其他内核优化，以免无法归因。
+- **验证状态**：本地只做AST解析、`git diff --check`与CUDA声明/定义/绑定/参数静态核对，**未编译、未运行任何GPU测试**。新增`check_internal_guard`：因设备端断言会毒化上下文，探测在**独立子进程**执行（`--probe-guard bf16|int8`），父进程断言子进程到达探测点、未打印存活标记、非零退出、且stderr不含`illegal memory access`，用以区分"断言拦住了"与"保护没编进去、真的读越界"。**本机`.venv`无torch头文件，`CUDA_KERNEL_ASSERT`在实际构建配置中是否生效只能由该探测在云端确认**；若探测失败，属Codex裁定中"无法落实有效的访存前保护"，需再触发复核。
+- **遗留**：同步减少后的实际收益未测量，需云端用固定输入（28 Token）跑`--mode benchmark --cache paged --kv-dtype int8`并与本轮45.165/38.969 ms同口径比较。G4/G5暂不关闭：最大容量实测、8192步精度统计、Triton融合、Custom Op/Meta/`opcheck`、V3同KV头协作与向量化加载仍未做。

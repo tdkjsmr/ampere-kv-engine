@@ -2,6 +2,8 @@
 
 import argparse
 import statistics
+import subprocess
+import sys
 import time
 
 import torch
@@ -200,18 +202,76 @@ def check_int8() -> None:
     print("[PASS] INT8批量Prefill写入与Decode追加六个场景通过；未验证模型、长上下文或性能")
 
 
+@torch.inference_mode()
+def probe_internal_guard(kv_dtype: str) -> None:
+    """独立子进程专用：内部入口遇非法块号必须设备端失败，不得越界访问或正常返回。
+
+    设备端断言会毒化整个 CUDA 上下文，之后任何 CUDA 调用都失败，所以本函数只能在独占
+    进程里运行，正常检查进程不得调用。执行到最后一行打印就说明保护没有生效。
+    """
+    quantized = kv_dtype == "int8"
+    storage = PagedKVStorage(2, 128, 3, 16, device="cuda",
+                             kv_dtype=torch.int8 if quantized else torch.bfloat16)
+    cache = PagedKVCache(storage)
+    key = torch.randn(1, 2, 16, 128, device="cuda", dtype=torch.bfloat16)
+    value = torch.randn(1, 2, 16, 128, device="cuda", dtype=torch.bfloat16)
+    try:
+        table = cache.append(key, value, fused=True)
+        query = torch.randn(1, 2, 1, 128, device="cuda", dtype=torch.bfloat16)
+        bad_table = table.clone()
+        bad_table[0] = 3  # 等于物理块总数，越界一个块
+        print(f"[探测开始] {kv_dtype} 内部入口非法块号", flush=True)
+        if quantized:
+            _C.paged_decode_int8_internal(query, storage._key, storage._value,
+                                          storage._key_scale, storage._value_scale, bad_table, 16)
+        else:
+            _C.paged_decode_internal(query, storage._key, storage._value, bad_table, 16)
+        torch.cuda.synchronize()
+    finally:
+        cache.release()
+    print("[未拦截] 内部入口对非法块号正常返回，设备端保护未生效")
+
+
+def check_internal_guard() -> None:
+    """在独立子进程中确认内部入口的设备端块号保护在实际构建配置下真的生效。
+
+    设备端断言与非法访存的错误信息不同：用它区分"保护拦住了"和"保护没编进去、真的读
+    越界了"。不匹配具体断言文本，避免绑定某个 CUDA/PyTorch 版本的措辞。
+    """
+    for kv_dtype in ("bf16", "int8"):
+        result = subprocess.run(
+            [sys.executable, "-m", "ampere_kv.paged_decode", "--probe-guard", kv_dtype],
+            capture_output=True, text=True,
+        )
+        # 先确认子进程真的走到了探测点，否则"失败"可能只是导入或建存储出错。
+        assert f"[探测开始] {kv_dtype}" in result.stdout, (
+            f"{kv_dtype}：子进程未到达探测点，无法判定保护是否生效；stderr 末尾={result.stderr[-300:]}")
+        assert "[未拦截]" not in result.stdout, f"{kv_dtype}：内部入口未拦截非法块号，进程正常返回"
+        assert result.returncode != 0, f"{kv_dtype}：探测进程没有失败，设备端保护未生效"
+        assert "illegal memory access" not in result.stderr, (
+            f"{kv_dtype}：失败原因是非法访存而非设备端断言，说明保护未在访存前生效；"
+            f"stderr 末尾={result.stderr[-300:]}")
+        print(f"[PASS] {kv_dtype} 内部入口的设备端块号保护已在独立子进程确认生效（异步失败，运行需终止）")
+
+
 def main() -> None:
-    """默认检查 BF16 写入与 INT8 算子；保留 BF16 调用基线供后续比较。"""
-    parser = argparse.ArgumentParser(description="分页写入与 INT8 Decode 对照、BF16 调用基线")
+    """默认检查 BF16 写入、INT8 算子与内部入口保护；保留 BF16 调用基线供后续比较。"""
+    parser = argparse.ArgumentParser(description="分页写入、INT8 Decode 对照与内部入口保护检查、BF16 调用基线")
     parser.add_argument("--benchmark", action="store_true", help="测量 BF16 SDPA 与 CUDA 调用；不测 INT8")
+    parser.add_argument("--probe-guard", choices=("bf16", "int8"),
+                        help="独立子进程专用：探测内部入口的设备端块号保护，预期失败退出")
     args = parser.parse_args()
     if not torch.cuda.is_available():
         raise RuntimeError("需要云端 CUDA GPU 与已编译的扩展")
+    if args.probe_guard:
+        probe_internal_guard(args.probe_guard)
+        return
     if args.benchmark:
         benchmark()
     else:
         check_bf16_write()
         check_int8()
+        check_internal_guard()
 
 
 if __name__ == "__main__":
