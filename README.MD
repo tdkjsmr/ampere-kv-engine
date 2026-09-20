@@ -16,10 +16,12 @@ K scale已改为每32维一组，V仍每Token每KV头一个scale；新存储CPU�
 全模型一次INT8/BF16 CUDA Decode已在3090完成运行与缓存检查，选词一致不代表精度验收。
 int8-check提供BF16选词驱动的同历史对照，已有短上下文运行结果，不代表完整精度验收。
 INT8独立生成已有EOS与输出上限两种短输入运行结果，不代表完整质量验收。
-BF16/INT8 CUDA固定长度计时与实际KV字节统计已接入，等待云端验证。
-3090用户反馈当前INT8延迟高于BF16；尚无完整INT8计时记录，不宣称加速。
-单Token量化与分页写入现已融合到CUDA，需重新编译；正确性与性能等待云端验证。
-融合写入仅用于模型内部有限BF16输入且scale可表示的场景，不逐Token扫描NaN/Inf；Prefill仍用参考写入。
+BF16/INT8 CUDA固定长度计时与实际KV字节统计已有3090短输入结果。
+单Token融合版本中INT8 TTFT仍较高，TPOT略低；仅三次测量，不宣称稳定加速。
+单Token融合写入的六个算子场景与模型对照已有云端通过反馈。
+融合写入现扩展到整段Prefill，与Decode共用内核和量化规则；需重新编译，批量版本等待云端验证。
+输入须有限且scale可表示，不逐Token扫描NaN/Inf；Prefill Attention仍使用原始BF16 K/V。
+模型诊断保留数值对照和长度检查，移除重复地址/页表遍历；CUDA接口仍保留必要类型、形状与越界保护。
 当前不提供多请求调度、在线服务或通用模型适配。
 
 ## 运行
@@ -32,10 +34,10 @@ Accelerate 和已缓存的固定版本模型。输入文本不写入文件。
 make build
 make smoke
 
-# 本轮：分组K存储与参考读回，CPU执行，无需GPU。
+# 可选：分组K存储与参考读回，CPU执行，无需GPU。
 python -m ampere_kv.paged_cache
 
-# 已有分组扩展编译通过后：算子检查与BF16驱动的INT8同历史对照。
+# 重新编译后：批量写入/Decode追加检查与BF16驱动的INT8同历史对照。
 python -m ampere_kv.paged_decode
 python -m ampere_kv.runner --mode int8-check --cache paged
 

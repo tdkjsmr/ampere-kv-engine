@@ -59,8 +59,8 @@ class PagedKVCache:
         return self._table.length
 
     @torch.no_grad()
-    def append(self, key: torch.Tensor, value: torch.Tensor, *, fused: bool = False) -> None:
-        """将 [1, KV 头数, 本次 Token 数, 每头维度] 的 BF16 K/V 写到尾部。"""
+    def append(self, key: torch.Tensor, value: torch.Tensor, *, fused: bool = False) -> torch.Tensor | None:
+        """追加BF16 K/V；融合分支返回GPU块表供Decode复用，参考分支返回None。"""
         # 主动拒绝形状、类型与设备不匹配，避免 copy_ 自动广播或转换掩盖错误。
         if key.ndim != 4 or key.shape != value.shape:
             raise ValueError("新 K/V 必须是形状相同的四维张量")
@@ -72,17 +72,17 @@ class PagedKVCache:
             raise ValueError("新 K/V 必须与缓存位于同一设备")
         start = self.length
         if fused:
-            # 仅模型内部Decode使用：输入需有限、scale需可表示；不提供参考路径的数值拒绝保证。
+            # 模型内部Prefill/Decode共用：输入需有限、scale需可表示。
             # GPU异步失败后请求必须丢弃，不能继续使用已登记的块表。
-            if self._key_scale is None or not key.is_cuda or key.shape[2] != 1 or self._key.shape[2] != 16:
-                raise ValueError("融合写入只支持CUDA INT8缓存、单Token和块大小16")
+            if self._key_scale is None or not key.is_cuda or self._key.shape[2] != 16 or not 0 < key.shape[2] <= 65535:
+                raise ValueError("融合写入只支持CUDA INT8缓存和块大小16")
             from ampere_kv import _C
             write = _C.quantize_write  # 旧扩展缺少入口时，在修改块表之前报错。
             key, value = key.contiguous(), value.contiguous()
-            self._table.append_tokens(1)
-            block, offset = self._table.locate(start)
-            write(key, value, self._key, self._value, self._key_scale, self._value_scale, block, offset)
-            return
+            self._table.append_tokens(key.shape[2])
+            table = torch.tensor(self._table.block_ids, dtype=torch.long, device=key.device)
+            write(key, value, self._key, self._value, self._key_scale, self._value_scale, table, start)
+            return table
         if self._key_scale is not None:
             # K/V 全部量化成功后才申请块；例如 V 含 NaN 时，不能留下只写入 K 的状态。
             # 这里只产生本次追加数据的临时结果，不重新量化旧历史。

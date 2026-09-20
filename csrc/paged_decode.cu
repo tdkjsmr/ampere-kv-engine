@@ -1,6 +1,7 @@
 #include <ATen/ATen.h>
 #include <c10/util/BFloat16.h>
 #include <c10/util/Half.h>
+#include <c10/macros/Macros.h>
 #include <type_traits>
 #include <c10/cuda/CUDAGuard.h>
 #include <c10/cuda/CUDAStream.h>
@@ -12,7 +13,7 @@ constexpr int kDim = 128;
 constexpr int kBlockSize = 16;
 constexpr int kSegmentSize = 64;  // 与此前 256 段长做单变量实验，不代表最终最优值。
 
-// 单Token写入：每个KV头一个warp；K的四组分别归约，V对128维一起归约。
+// 每个(Token, KV头)一个warp；Prefill批量写入，Decode复用同一内核。
 // 调用方保证输入有限且scale可用FP16表示；这是模型内部快路径，不清洗外部数据。
 __device__ float write_scale(float maximum) {
   const float raw = maximum == 0.0f ? 1.0f : fmaxf(__fdiv_rn(maximum, 127.0f), 0x1p-14f);
@@ -23,17 +24,25 @@ __device__ float write_scale(float maximum) {
 __global__ void quantize_write_kernel(
     const c10::BFloat16* key, const c10::BFloat16* value,
     int8_t* output_key, int8_t* output_value, c10::Half* key_scale,
-    c10::Half* value_scale, int heads, int block, int offset) {
+    c10::Half* value_scale, const int64_t* table,
+    int heads, int64_t start, int tokens, int64_t blocks) {
   const int lane = threadIdx.x;
   const int head = blockIdx.x;
+  const int token = blockIdx.y;
+  const int64_t position = start + token;
+  const int64_t block = table[position / kBlockSize];
+  // 不回传GPU标量；非法页号在设备端终止，不能越界写入其他缓存。
+  CUDA_KERNEL_ASSERT(block >= 0 && block < blocks);
+  const int offset = position % kBlockSize;
   const int64_t slot = (static_cast<int64_t>(block) * heads + head) * kBlockSize + offset;
+  const int64_t input = (static_cast<int64_t>(head) * tokens + token) * kDim;
   float v[4];
   float vmax = 0.0f;
 #pragma unroll
   for (int group = 0; group < 4; ++group) {
     const int dim = group * 32 + lane;
-    const float k = static_cast<float>(key[head * kDim + dim]);
-    v[group] = static_cast<float>(value[head * kDim + dim]);
+    const float k = static_cast<float>(key[input + dim]);
+    v[group] = static_cast<float>(value[input + dim]);
     vmax = fmaxf(vmax, fabsf(v[group]));
     float kmax = fabsf(k);
     for (int shift = 16; shift > 0; shift /= 2)
@@ -239,8 +248,7 @@ static at::Tensor paged_decode_impl(const at::Tensor& query, const at::Tensor& k
   TORCH_CHECK(segment_count <= 65535, "分段数超过二维 CUDA 网格上限");
   const int segments = static_cast<int>(segment_count);
   const c10::cuda::CUDAGuard guard(query.device());
-  // V0 为安全先检查有效块号。这两次 item 会同步，不支持 CUDA Graph 捕获。
-  // 只检查使用到的块表前缀，不读取未使用的尾部；块归属仍由调用方保证。
+  // 保留公开读取入口的块号保护；本轮不把移除安全检查混入Prefill融合收益。
   const auto used_table = table.narrow(0, 0, (length - 1) / kBlockSize + 1);
   TORCH_CHECK(used_table.min().item<int64_t>() >= 0 && used_table.max().item<int64_t>() < key.size(0), "物理块编号越界");
   auto output = at::empty_like(query);
@@ -280,11 +288,12 @@ static at::Tensor paged_decode_impl(const at::Tensor& query, const at::Tensor& k
 void quantize_write_cuda(const at::Tensor& key, const at::Tensor& value,
                          const at::Tensor& output_key, const at::Tensor& output_value,
                          const at::Tensor& key_scale, const at::Tensor& value_scale,
-                         int64_t block, int64_t offset) {
+                         const at::Tensor& table, int64_t start) {
   TORCH_CHECK(key.is_cuda() && key.dim() == 4 && key.size(0) == 1 &&
-              key.size(2) == 1 && key.size(3) == kDim && key.size(1) > 0 &&
-              key.size(1) <= 1024, "写入输入必须为CUDA [1, KV头, 1, 128]");
-  for (const auto& tensor : {key, value, output_key, output_value, key_scale, value_scale})
+              key.size(2) > 0 && key.size(2) <= 65535 && key.size(3) == kDim &&
+              key.size(1) > 0 && key.size(1) <= 1024,
+              "写入输入必须为CUDA [1, KV头, Token, 128]");
+  for (const auto& tensor : {key, value, output_key, output_value, key_scale, value_scale, table})
     TORCH_CHECK(tensor.device() == key.device() && tensor.is_contiguous(), "写入张量必须同设备且连续");
   TORCH_CHECK(key.scalar_type() == at::kBFloat16 && value.scalar_type() == at::kBFloat16 &&
               key.sizes() == value.sizes(), "新K/V必须为同形状BF16");
@@ -293,8 +302,8 @@ void quantize_write_cuda(const at::Tensor& key, const at::Tensor& value,
               output_key.sizes() == output_value.sizes() &&
               output_key.scalar_type() == at::kChar && output_value.scalar_type() == at::kChar,
               "写入目标必须为INT8 [块数, KV头, 16, 128]");
-  TORCH_CHECK(block >= 0 && block < output_key.size(0) && offset >= 0 && offset < kBlockSize,
-              "写入物理位置越界");
+  TORCH_CHECK(table.scalar_type() == at::kLong && table.dim() == 1 && start >= 0 &&
+              start <= table.numel() * kBlockSize - key.size(2), "块表或写入范围无效");
   for (const auto& tensor : {key_scale, value_scale})
     TORCH_CHECK(tensor.scalar_type() == at::kHalf && tensor.dim() == 4 &&
                 tensor.size(0) == output_key.size(0) && tensor.size(1) == key.size(1) &&
@@ -302,11 +311,13 @@ void quantize_write_cuda(const at::Tensor& key, const at::Tensor& value,
   TORCH_CHECK(key_scale.size(3) == 4 && value_scale.size(3) == 1, "K/V scale末维应为4/1");
   const c10::cuda::CUDAGuard guard(key.device());
   const auto stream = c10::cuda::getCurrentCUDAStream(key.get_device()).stream();
-  quantize_write_kernel<<<static_cast<unsigned int>(key.size(1)), 32, 0, stream>>>(
+  const dim3 grid(static_cast<unsigned int>(key.size(1)), static_cast<unsigned int>(key.size(2)));
+  quantize_write_kernel<<<grid, 32, 0, stream>>>(
       key.data_ptr<c10::BFloat16>(), value.data_ptr<c10::BFloat16>(),
       output_key.data_ptr<int8_t>(), output_value.data_ptr<int8_t>(),
       key_scale.data_ptr<c10::Half>(), value_scale.data_ptr<c10::Half>(),
-      static_cast<int>(key.size(1)), static_cast<int>(block), static_cast<int>(offset));
+      table.data_ptr<int64_t>(), static_cast<int>(key.size(1)), start,
+      static_cast<int>(key.size(2)), output_key.size(0));
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
