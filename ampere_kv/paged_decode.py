@@ -75,6 +75,50 @@ def benchmark() -> None:
 
 
 @torch.inference_mode()
+def check_bf16_write() -> None:
+    """BF16 批量分页写入的逐元素对照；只验证搬运，不含量化或 Attention。"""
+    generator = torch.Generator().manual_seed(4)
+    # 两头一次整段写覆盖空缓存 Prefill 与跨块；八头分三批覆盖非对齐批量追加和跨块单 Token。
+    for kv_heads, ends in ((2, (17,)), (8, (15, 32, 33))):
+        length = ends[-1]
+        blocks = max(3, (length + 15) // 16)
+        storage = PagedKVStorage(kv_heads, 128, blocks, 16, device="cuda")
+        cache = PagedKVCache(storage)
+        tensors = (storage._key, storage._value)
+        for tensor in tensors:
+            tensor.fill_(float("nan"))
+        # 倒序归还块号，使物理编号顺序不同于逻辑顺序。
+        held = [storage._pool.allocate() for _ in range(blocks)]
+        for block in held:
+            storage._pool.free(block)
+        key = torch.randn(1, kv_heads, length, 128, generator=generator).to(device="cuda", dtype=torch.bfloat16)
+        value = torch.randn(1, kv_heads, length, 128, generator=generator).to(device="cuda", dtype=torch.bfloat16)
+        try:
+            start = 0
+            for end in ends:
+                table = cache.append(key[:, :, start:end], value[:, :, start:end], fused=True)
+                assert cache.length == end and table.tolist() == list(cache._table.block_ids)
+                start = end
+            # 一次性取回再比对，避免逐 Token 同步；写入值必须与输入逐位相同。
+            host = [tensor.cpu() for tensor in tensors]
+            host_input = (key.cpu(), value.cpu())
+            written = torch.zeros(blocks, 16, dtype=torch.bool)
+            for token in range(length):
+                block = cache._table.block_ids[token // 16]
+                written[block, token % 16] = True
+                for physical, reference in zip(host, host_input):
+                    assert torch.equal(physical[block, :, token % 16], reference[0, :, token])
+            # 未分配块与末块未写尾部仍是哨兵，证明写入不越界、不覆盖已有历史。
+            for physical in host:
+                assert torch.isnan(physical.permute(0, 2, 1, 3)[~written]).all()
+        finally:
+            cache.release()
+        assert storage._pool.num_free_blocks == blocks
+        print(f"[PASS] BF16 批量写入：KV头={kv_heads}，分批={ends}，逐元素一致且块已归还")
+    print("[PASS] BF16分页写入通过：整段Prefill、非对齐批量追加、跨块单Token、非连续物理块；未验证模型或性能")
+
+
+@torch.inference_mode()
 def check_int8() -> None:
     """同一 INT8 数据与 scale 的融合/独立反量化对照，不测试量化前后的模型质量。"""
     generator = torch.Generator().manual_seed(2)
@@ -157,8 +201,8 @@ def check_int8() -> None:
 
 
 def main() -> None:
-    """默认仅检查当前 INT8 算子；保留 BF16 调用基线供后续比较。"""
-    parser = argparse.ArgumentParser(description="INT8 分页 Decode 对照与 BF16 调用基线")
+    """默认检查 BF16 写入与 INT8 算子；保留 BF16 调用基线供后续比较。"""
+    parser = argparse.ArgumentParser(description="分页写入与 INT8 Decode 对照、BF16 调用基线")
     parser.add_argument("--benchmark", action="store_true", help="测量 BF16 SDPA 与 CUDA 调用；不测 INT8")
     args = parser.parse_args()
     if not torch.cuda.is_available():
@@ -166,6 +210,7 @@ def main() -> None:
     if args.benchmark:
         benchmark()
     else:
+        check_bf16_write()
         check_int8()
 
 

@@ -18,8 +18,14 @@ void quantize_write_cuda(const at::Tensor& key, const at::Tensor& value,
                          const at::Tensor& key_scale, const at::Tensor& value_scale,
                          const at::Tensor& table, int64_t start);
 
+// BF16原地批量写入；布局与分工同量化写入，只搬运不改变数值。
+void bf16_write_cuda(const at::Tensor& key, const at::Tensor& value,
+                     const at::Tensor& output_key, const at::Tensor& output_value,
+                     const at::Tensor& table, int64_t start);
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, module) {
   module.def("quantize_write", &quantize_write_cuda, "Prefill/Decode INT8量化与分页写入融合");
+  module.def("bf16_write", &bf16_write_cuda, "Prefill/Decode BF16分页写入融合");
   // 保留原有 Smoke，便于区分扩展链路错误与 Attention 错误。
   module.def("smoke_add", &smoke_add_cuda, "两个 CUDA Tensor 逐元素相加");
   module.def("paged_decode", &paged_decode_cuda, "单请求 BF16 分页 Decode V0");

@@ -88,3 +88,15 @@
   3. 实现方案第 681 行的 V1 量化写入融合，把每 Token 72 次参考量化调用 + 144 次额外同步压成 36 次内核启动，量化侧同步归零（块号检查的 72 次共用同步属另一项优化，需单独处理）。
   4. 扫描 Context 找收益边界；对 8B / 3090 单请求，KV 字节追平权重字节约在十万 Token 量级，远超本机容量——这本身就是结论。
 - **禁止事项**：不得把本分支结论写成"INT8 更快"。
+
+### 2026-09-20 BF16批量分页写入与Prefill路径对齐（待云端验证）
+
+- **作者**：平台q（只改代码，本机无CUDA，未编译未运行）
+- **动机**：上一轮云端3090实测（输入39 Token、输出32，提交`918350e`）BF16/INT8 TTFT为106.497/49.657 ms。当时两条Prefill路径在写入与读回方式上不同：INT8走融合批量写入、SDPA直接用原始BF16 K/V；BF16走参考`append`的逐Token Python复制加`get()`的逐Token切片读回。本轮消除这一实现差异，使两条路径的写入与读回方式相同；**剩余差异仍涉及量化与反量化、KV数据量等，需配对实验验证，本轮不给出归因结论**。上面"不得写成INT8更快"的禁令仍然有效。
+- **改动**：`csrc/paged_decode.cu`新增`bf16_write_kernel`与`bf16_write_cuda`，布局与分工同量化写入（每(Token, KV头)一个warp、32线程覆盖128维），按位复制不经FP32往返；保留设备端块号断言、二维网格上限、64位索引、当前设备与当前stream，只检查CPU可见元数据。`csrc/bindings.cpp`注册`bf16_write`。
+- `ampere_kv/paged_cache.py`融合分支去掉"仅INT8"限制，按`_key_scale`是否为空选择写入入口；块分配、块表上传与返回值两种精度共用。扩展入口存在性、每头128维与KV头数不超过1024都在修改块表之前拒绝，避免登记了未写入的Token；这些条件与CUDA写入入口的检查同源，不另建回滚框架。非融合参考路径与CPU路径不变。
+- `ampere_kv/runner.py`：CUDA分页且块16、每头128维时，BF16/INT8 Prefill共用"先批量写缓存、再用原始BF16 K/V做SDPA"，**BF16不再从分页存储读回全部K/V**；CUDA Decode的单Token追加两种精度都走批量入口并复用返回块表，随之失效的`table is None`回退已删除。GQA映射、causal掩码、scale、dropout、RoPE、残差、MLP、选词与计时边界均未改；连续缓存与非支持设备仍走参考实现。
+- `ampere_kv/paged_decode.py`新增`check_bf16_write`并接入非benchmark入口：两头整段17 Token、八头分批(15, 32, 33)，覆盖空缓存整段写入、非对齐批量追加、跨块单Token追加与非连续物理块映射；核对写入值与输入逐元素相同、既有内容不被破坏、未写位置保持NaN哨兵、返回块表与有效长度正确、块最终归还。六个INT8场景与阈值未改，benchmark计时口径未改。
+- **验证状态**：本地仅做AST解析、`git diff --check`与CUDA声明/定义/绑定/参数/索引静态核对，**未编译、未运行任何GPU测试**。需云端`make build`后依次跑`python -m ampere_kv.paged_decode`、`python -m ampere_kv.runner --mode check --cache paged`（对HF严格对照，会实际走新BF16写入路径）、`--mode cuda-check`与`--mode benchmark`。**性能未测量，不承诺加速幅度**；本轮收益含"移除BF16 Prefill分页读回"，不能全部归因于存储精度或单个内核。
+- **输入长度事实**：用户在同一台3090上更换了输入提示词，本轮输入Token数为39、比上一轮增加，因此本轮与上一轮的TTFT不能直接比较；BF16 TTFT由61.787到106.497 ms的变化不能全部归因于输入长度，本轮也没有做同输入的配对测量。后续每轮benchmark记录输入Token数，便于判断跨轮可比性。
+- **遗留问题**：Decode侧INT8相对BF16仍有约1.4 ms/Token净差，来源未测量；`--mode cuda-check`的Prefill严格对照两侧现在走同一路径，不再能区分新旧BF16写入，该保障由`check_bf16_write`的逐元素对照承担。

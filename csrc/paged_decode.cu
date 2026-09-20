@@ -64,6 +64,31 @@ __global__ void quantize_write_kernel(
   }
 }
 
+// BF16 分页写入：布局与分工同量化写入，每(Token, KV头)一个warp，32线程覆盖128维。
+// 只搬运 BF16，不量化、不改变数值；Prefill 整段与 Decode 单 Token 共用同一内核。
+__global__ void bf16_write_kernel(
+    const c10::BFloat16* key, const c10::BFloat16* value,
+    c10::BFloat16* output_key, c10::BFloat16* output_value,
+    const int64_t* table, int heads, int64_t start, int tokens, int64_t blocks) {
+  const int lane = threadIdx.x;
+  const int head = blockIdx.x;
+  const int token = blockIdx.y;
+  const int64_t position = start + token;
+  const int64_t block = table[position / kBlockSize];
+  // 不回传GPU标量；非法页号在设备端终止，不能越界写入其他缓存。
+  CUDA_KERNEL_ASSERT(block >= 0 && block < blocks);
+  const int offset = position % kBlockSize;
+  const int64_t slot = (static_cast<int64_t>(block) * heads + head) * kBlockSize + offset;
+  const int64_t input = (static_cast<int64_t>(head) * tokens + token) * kDim;
+#pragma unroll
+  for (int group = 0; group < 4; ++group) {
+    const int dim = group * 32 + lane;
+    // 按位复制，不经 FP32 往返；写入值必须与输入逐位相同。
+    output_key[slot * kDim + dim] = key[input + dim];
+    output_value[slot * kDim + dim] = value[input + dim];
+  }
+}
+
 // 一个线程块的四个 warp 分别处理段内不同 Token；每线程仍负责四维。
 // 不创建连续历史副本，不展开 GQA 的 K/V，不使用 Tensor Core 或异步搬运。
 // 只实例化 BF16 与 INT8 两种读取方式，归约和分段合并共用；不是通用类型派发框架。
@@ -316,6 +341,38 @@ void quantize_write_cuda(const at::Tensor& key, const at::Tensor& value,
       key.data_ptr<c10::BFloat16>(), value.data_ptr<c10::BFloat16>(),
       output_key.data_ptr<int8_t>(), output_value.data_ptr<int8_t>(),
       key_scale.data_ptr<c10::Half>(), value_scale.data_ptr<c10::Half>(),
+      table.data_ptr<int64_t>(), static_cast<int>(key.size(1)), start,
+      static_cast<int>(key.size(2)), output_key.size(0));
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+// 只检查CPU可见元数据，不读取GPU标量；BF16 写入不量化，因此没有 scale 相关约束。
+void bf16_write_cuda(const at::Tensor& key, const at::Tensor& value,
+                     const at::Tensor& output_key, const at::Tensor& output_value,
+                     const at::Tensor& table, int64_t start) {
+  TORCH_CHECK(key.is_cuda() && key.dim() == 4 && key.size(0) == 1 &&
+              key.size(2) > 0 && key.size(2) <= 65535 && key.size(3) == kDim &&
+              key.size(1) > 0 && key.size(1) <= 1024,
+              "写入输入必须为CUDA [1, KV头, Token, 128]");
+  for (const auto& tensor : {key, value, output_key, output_value, table})
+    TORCH_CHECK(tensor.device() == key.device() && tensor.is_contiguous(), "写入张量必须同设备且连续");
+  TORCH_CHECK(key.scalar_type() == at::kBFloat16 && value.scalar_type() == at::kBFloat16 &&
+              key.sizes() == value.sizes(), "新K/V必须为同形状BF16");
+  TORCH_CHECK(output_key.dim() == 4 && output_key.size(1) == key.size(1) &&
+              output_key.size(2) == kBlockSize && output_key.size(3) == kDim &&
+              output_key.sizes() == output_value.sizes() &&
+              output_key.scalar_type() == at::kBFloat16 && output_value.scalar_type() == at::kBFloat16,
+              "写入目标必须为BF16 [块数, KV头, 16, 128]");
+  // 只校验写入范围与块表长度自洽。start 等于旧有效长度、块归属正确均由调用方保证；
+  // 本检查本身不证明历史有效区域与末块未写尾部全部受到保护。
+  TORCH_CHECK(table.scalar_type() == at::kLong && table.dim() == 1 && start >= 0 &&
+              start <= table.numel() * kBlockSize - key.size(2), "块表或写入范围无效");
+  const c10::cuda::CUDAGuard guard(key.device());
+  const auto stream = c10::cuda::getCurrentCUDAStream(key.get_device()).stream();
+  const dim3 grid(static_cast<unsigned int>(key.size(1)), static_cast<unsigned int>(key.size(2)));
+  bf16_write_kernel<<<grid, 32, 0, stream>>>(
+      key.data_ptr<c10::BFloat16>(), value.data_ptr<c10::BFloat16>(),
+      output_key.data_ptr<c10::BFloat16>(), output_value.data_ptr<c10::BFloat16>(),
       table.data_ptr<int64_t>(), static_cast<int>(key.size(1)), start,
       static_cast<int>(key.size(2)), output_key.size(0));
   C10_CUDA_KERNEL_LAUNCH_CHECK();

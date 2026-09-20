@@ -108,8 +108,12 @@ def decoder_layer_forward(
     query, key, value = project_qkv(normalized, attention)
     query, key = apply_rope(query, key, position_ids, config)
     # 只有缓存 Attention 的阶段不同，归一化、投影、RoPE、残差与 MLP 共用原实现。
-    if is_prefill and cache._key.dtype == torch.int8:
-        # Prefill Attention仍使用原始BF16 K/V，缓存由批量CUDA入口直接量化写入。
+    # CUDA 分页且块大小16、每头128维时，两种精度的 Prefill 共用批量写入；其余仍走参考实现。
+    fused_prefill = (is_prefill and isinstance(cache, PagedKVCache) and cache._key.is_cuda
+                     and cache._key.shape[2] == 16 and cache._key.shape[3] == 128)
+    if fused_prefill:
+        # 先批量写缓存，再用原始 BF16 K/V 做 SDPA；BF16 也不从分页存储读回历史。
+        # 写入是逐位搬运（INT8 为量化），Attention 输入、GQA 映射、掩码和 scale 都不变。
         cache.append(key, value, fused=True)
         group_size = query.shape[1] // key.shape[1]
         head_output = torch.nn.functional.scaled_dot_product_attention(
@@ -118,13 +122,12 @@ def decoder_layer_forward(
             dropout_p=0.0, is_causal=query.shape[2] > 1, scale=query.shape[-1] ** -0.5,
         )
     elif cuda_decode:
-        # 按缓存类型选择内核；普通SDPA生成不导入扩展。
+        # 按缓存类型选择Decode内核；融合写入在append内部按需导入同一扩展。
         from ampere_kv import _C
 
-        # 单 Token K/V 只追加一次；CUDA 直接读物理存储，不调用 get 或复制 GQA 头。
-        table = cache.append(key, value, fused=cache._key.dtype == torch.int8)
-        if table is None:
-            table = torch.tensor(cache._table.block_ids, dtype=torch.long, device=query.device)
+        # 单 Token K/V 只追加一次；两种精度都走批量写入入口并复用其返回的块表。
+        # CUDA 直接读物理存储，不调用 get 或复制 GQA 头。
+        table = cache.append(key, value, fused=True)
         if cache._key.dtype == torch.int8:
             head_output = _C.paged_decode_int8(
                 query.contiguous(), cache._key, cache._value,
