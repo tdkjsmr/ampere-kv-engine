@@ -147,10 +147,12 @@ def check_int8() -> None:
                     table = cache.append(gpu_key[:, :, start:end], gpu_value[:, :, start:end], fused=True)
                     start = end
             q = query.cuda()
-            # get() 一次性还原逻辑顺序并与 CPU 独立量化对照，用于区分写入错误与读取内核错误。
+            # get() 返回 CUDA 张量，参考值在 CPU；搬到同一设备后一次性对照，
+            # 用于区分写入错误与读取内核错误。
             got_key, got_value = cache.get()
-            torch.testing.assert_close(got_key, torch.cat([d.float() * s.float() for d, s in groups], dim=-1), rtol=0, atol=0)
-            torch.testing.assert_close(got_value, vd.float() * vs.float(), rtol=0, atol=0)
+            reference_key = torch.cat([d.float() * s.float() for d, s in groups], dim=-1)
+            torch.testing.assert_close(got_key.cpu(), reference_key, rtol=0, atol=0)
+            torch.testing.assert_close(got_value.cpu(), vd.float() * vs.float(), rtol=0, atol=0)
             actual = _C.paged_decode_int8(q, *tensors, table, length)
             result = actual.cpu()
             error = (result.double() - expected).abs().max().item()

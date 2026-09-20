@@ -135,3 +135,14 @@
 - **结果**：7 个文件 1932 → 1589 行（−343），检查 132 → 72，注释 289 → 187。**`csrc/paged_decode.cu` 的 30 条 `TORCH_CHECK` 本轮未动**——它们位于扩展入口边界，是 vLLM 也会保留的位置；且本机无法编译，重写表达式若出错要浪费一次云端构建，留待单独一轮。
 - **验证状态**：本地只做 AST 解析与 `git diff --check`，**未编译、未运行**。需云端 `make build` 后重跑 `python -m ampere_kv.paged_decode`、`--mode check --cache paged`、`--mode cuda-check`、`--mode int8-check` 与 `--mode benchmark` 确认无回归。
 - **行为变化**：非法输入现在更可能表现为 PyTorch/CUDA 的底层报错而非中文提示；内部路径出现非法块表仍按上一轮约定视为实现错误并终止运行。
+
+### 2026-09-20 修复 check_int8 设备不匹配并记录精简轮云端结果
+
+- **作者**：平台q
+- **缺陷**：上一提交`6aa66d0`把`check_int8`的逐Token物理写入对照换成`cache.get()`一次性对照时，漏掉了原代码的`.cpu()`——`get()`返回CUDA张量，而CPU独立量化参考在CPU，云端报`values for attribute 'device' do not match: cuda:0 != cpu`。已改为`got_key.cpu()`/`got_value.cpu()`与CPU参考对照，对照强度不变。同轮的`check_bf16_write`因输入本身就在CUDA上，未受影响并已云端通过。
+- **云端结果（`6aa66d0`，3090）**：`check_bf16_write` PASS；`--mode check --cache paged`对HF `rtol=0, atol=0` PASS。`--mode cuda-check`与`--mode int8-check`**未跑成**——执行者给出的命令漏了`--cache paged`，被`runner.py:547`的参数校验拒绝，**不是代码回归**。
+- **性能**：BF16 TTFT 42.443 ms、TPOT 36.937 ms、总耗时1187.642 ms、吞吐26.944 Token/s；INT8为42.530/36.782/1182.873/27.053。TPOT较上一轮37.321/37.178再降约0.39 ms（约1%），量级与本轮删除的每Token约200次Python级校验相符（`apply_rope`三项×36层、`append`融合分支五条件×36层、`append_tokens`类型检查×36层，以及`decoder_layer_forward`与`model_forward`若干）；**未做单变量隔离，属推断归因**。
+- **TTFT不可跨轮比较**：每层物理容量48 Token反推输入≤16 Token，上一轮为36 Token；用户未回传`输入 Token=`行，实际值未知。
+- **容量账本第三个点复现**：BF16 7,077,888 B；INT8 3,538,944 + scale 138,240 = 3,677,184 B；比值仍为1.924812。峰值allocated差3.23 MiB与池字节差3,400,704 B（3.2434 MiB）吻合。
+- **等路径结论再次成立**：TTFT差0.087 ms（方向与上一轮相反）、TPOT差0.155 ms，均不超过组内离散（TTFT 0.382/0.207 ms，TPOT 0.158/0.043 ms），n=3。
+- **验证状态**：本地仅AST解析与`git diff --check`，未编译未运行。需云端重跑`python -m ampere_kv.paged_decode`（含修复后的`check_int8`）与`--mode cuda-check --cache paged`、`--mode int8-check --cache paged`。
