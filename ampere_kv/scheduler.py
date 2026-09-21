@@ -291,8 +291,10 @@ def check_batched_operator(starts: tuple[int, ...] = (0, 16, 64)) -> None:
                           storage._key, storage._value, torch.tensor(row, dtype=torch.long, device=device), 0)
     table = torch.tensor([row + [-1] * (width - len(row)) for row in tables], dtype=torch.long, device=device)
     table_starts = torch.tensor(starts, dtype=torch.long, device=device)
-    new_key = torch.stack([key[:, :, start:].contiguous() for key, start in zip(keys, starts)])
-    new_value = torch.stack([value[:, :, start:].contiguous() for value, start in zip(values, starts)])
+    # 每个切片是 [1, KV头, 1, 128]，要按 dim=0 拼成 [批, KV头, 1, 128]；用 stack 会多出一维，
+    # 被批量写入入口的"必须是四维"边界检查拒绝。cat 的结果本身就是连续张量。
+    new_key = torch.cat([key[:, :, start:] for key, start in zip(keys, starts)], dim=0)
+    new_value = torch.cat([value[:, :, start:] for value, start in zip(values, starts)], dim=0)
     _C.bf16_write_batched(new_key, new_value, storage._key, storage._value, table, table_starts)
     queries = torch.randn(len(starts), q_heads, 1, dim, generator=generator, device=device).to(torch.bfloat16)
     got = _C.paged_decode_batched(queries.contiguous(), storage._key, storage._value, table, table_starts)
