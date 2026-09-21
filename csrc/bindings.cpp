@@ -37,10 +37,22 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, module) {
   module.def("bf16_write", &bf16_write_cuda, "Prefill/Decode BF16分页写入融合");
   // 保留原有 Smoke，便于区分扩展链路错误与 Attention 错误。
   module.def("smoke_add", &smoke_add_cuda, "两个 CUDA Tensor 逐元素相加");
-  module.def("paged_decode", &paged_decode_cuda, "单请求 BF16 分页 Decode V0", py::arg("v3") = false);
-  module.def("paged_decode_int8", &paged_decode_int8_cuda, "单请求 INT8 分页 Decode 融合反量化，输出 BF16", py::arg("v3") = false);
+  // pybind11 要求 py::arg 要么覆盖全部参数、要么一个都不用，只命名末位会在编译期 static_assert 失败；
+  // 所以这里把四个分页 Decode 入口的参数名逐个写全，只有 v3 带默认值。
+  module.def("paged_decode", &paged_decode_cuda, "单请求 BF16 分页 Decode V0",
+             py::arg("query"), py::arg("key"), py::arg("value"), py::arg("table"), py::arg("length"),
+             py::arg("v3") = false);
+  module.def("paged_decode_int8", &paged_decode_int8_cuda, "单请求 INT8 分页 Decode 融合反量化，输出 BF16",
+             py::arg("query"), py::arg("key"), py::arg("value"), py::arg("key_scale"),
+             py::arg("value_scale"), py::arg("table"), py::arg("length"), py::arg("v3") = false);
   // 内部入口只给模型生成路径使用；独立算子检查与外部调用请继续用上面两个受检查入口。
   // v3 需要显式传 True，且只支持 4 倍 GQA；默认 False 仍是 V1，未测量前不替换默认路径。
-  module.def("paged_decode_internal", &paged_decode_internal_cuda, "模型内部 BF16 分页 Decode；无宿主标量取回，块号由内核在访存前保护", py::arg("v3") = false);
-  module.def("paged_decode_int8_internal", &paged_decode_int8_internal_cuda, "模型内部 INT8 分页 Decode；无宿主标量取回，块号由内核在访存前保护", py::arg("v3") = false);
+  module.def("paged_decode_internal", &paged_decode_internal_cuda,
+             "模型内部 BF16 分页 Decode；无宿主标量取回，块号由内核在访存前保护",
+             py::arg("query"), py::arg("key"), py::arg("value"), py::arg("table"), py::arg("length"),
+             py::arg("v3") = false);
+  module.def("paged_decode_int8_internal", &paged_decode_int8_internal_cuda,
+             "模型内部 INT8 分页 Decode；无宿主标量取回，块号由内核在访存前保护",
+             py::arg("query"), py::arg("key"), py::arg("value"), py::arg("key_scale"),
+             py::arg("value_scale"), py::arg("table"), py::arg("length"), py::arg("v3") = false);
 }
