@@ -412,7 +412,12 @@ __global__ void paged_decode_batched_kernel(
   const int row = blockIdx.x;  // 行号 = 请求 * Query 头数 + Query 头，与 [批, 头, 1, 128] 布局一致。
   const int request = row / q_heads;
   const int kv_head = (row % q_heads) / group_size;
-  const int64_t length = starts[request] + 1;
+  const int64_t start = starts[request];
+  // 请求级范围保护，放在任何块表与 K/V 访存之前，且不做宿主同步：起点必须非负，
+  // 且本步写入的位置（start 本身）要落在这一行块表能容纳的 Token 数之内。
+  // 起点为负时 position 会变成负数，而"槽位小于行宽"这类断言挡不住负下标，会先越界读。
+  CUDA_KERNEL_ASSERT(start >= 0 && start < static_cast<int64_t>(table_stride) * kBlockSize);
+  const int64_t length = start + 1;  // 每步每请求写入一个 Token，有效长度即起点 + 1。
   const int64_t* row_table = table + static_cast<int64_t>(request) * table_stride;
   float q[4];
   float accumulator[4] = {0.0f, 0.0f, 0.0f, 0.0f};
@@ -423,10 +428,8 @@ __global__ void paged_decode_batched_kernel(
   const int64_t end = length < begin + kSegmentSize ? length : begin + kSegmentSize;
   // 超出本请求长度的分段整块空转，只写出全零局部结果，由跨段合并按分母为零跳过。
   for (int64_t token = begin + warp; token < end; token += 4) {
-    const int64_t slot = token / kBlockSize;
-    // 块表按行定宽填充，越界说明某请求的有效长度超过了它的行宽；先在读表之前拦住。
-    CUDA_KERNEL_ASSERT(slot < table_stride);
-    const int64_t physical = row_table[slot];
+    // token < length <= 行宽 × 16，所以入口那条起点范围保护已经保证这里不会读出行宽。
+    const int64_t physical = row_table[token / kBlockSize];
     // 与 V1 同一条保护：任何 K/V 访存之前拦下非法块号。
     CUDA_KERNEL_ASSERT(physical >= 0 && physical < blocks);
     const int64_t index = ((physical * kv_heads + kv_head) * kBlockSize + token % kBlockSize) * kDim + 4 * lane;
@@ -503,10 +506,12 @@ __global__ void bf16_write_batched_kernel(
   const int head = blockIdx.y;
   const int request = blockIdx.x / tokens;
   const int token = blockIdx.x % tokens;
-  const int64_t position = starts[request] + token;
-  const int64_t slot = position / kBlockSize;
-  CUDA_KERNEL_ASSERT(slot < table_stride);
-  const int64_t block = table[static_cast<int64_t>(request) * table_stride + slot];
+  const int64_t start = starts[request];
+  // 与批量 Decode 内核同一条保护，且同样不做宿主同步：起点非负，整段写入范围落在这一行内。
+  // 负起点会让 position 变负，而"槽位小于行宽"的断言挡不住负下标，会先越界读。
+  CUDA_KERNEL_ASSERT(start >= 0 && start + tokens <= static_cast<int64_t>(table_stride) * kBlockSize);
+  const int64_t position = start + token;
+  const int64_t block = table[static_cast<int64_t>(request) * table_stride + position / kBlockSize];
   CUDA_KERNEL_ASSERT(block >= 0 && block < blocks);
   const int64_t physical = (block * heads + head) * kBlockSize + position % kBlockSize;
   const int64_t input = ((static_cast<int64_t>(request) * heads + head) * tokens + token) * kDim;
@@ -568,11 +573,11 @@ static at::Tensor paged_decode_impl(const at::Tensor& query, const at::Tensor& k
   const auto kv_type = quantized ? at::kChar : at::kBFloat16;
   TORCH_CHECK(query.scalar_type() == at::kBFloat16 && key.scalar_type() == kv_type && value.scalar_type() == kv_type, "Q 必须是 BF16，K/V 类型必须匹配所选入口");
   TORCH_CHECK(table.scalar_type() == at::kLong && table.dim() == 1, "块表必须是一维 int64");
-  TORCH_CHECK(query.is_contiguous() && key.is_contiguous() && value.is_contiguous() && table.is_contiguous(), "V0 只接受连续布局张量");
+  TORCH_CHECK(query.is_contiguous() && key.is_contiguous() && value.is_contiguous() && table.is_contiguous(), "分页 Decode 只接受连续布局张量");
   TORCH_CHECK(query.dim() == 4 && query.size(0) == 1 && query.size(2) == 1 && query.size(3) == kDim, "Q 必须是 [1, Query头数, 1, 128]");
   TORCH_CHECK(key.dim() == 4 && key.sizes() == value.sizes() && key.size(0) > 0 && key.size(2) == kBlockSize && key.size(3) == kDim, "K/V 必须是 [物理块数, KV头数, 16, 128]");
   const int64_t q_heads = query.size(1), kv_heads = key.size(1);
-  TORCH_CHECK(q_heads > 0 && q_heads <= 1024 && kv_heads > 0 && q_heads % kv_heads == 0, "V0 要求 Query 头数不超过 1024 且是 KV 头数的正整数倍");
+  TORCH_CHECK(q_heads > 0 && q_heads <= 1024 && kv_heads > 0 && q_heads % kv_heads == 0, "Query 头数必须不超过 1024 且是 KV 头数的正整数倍");
   // V3 不支持的配置直接报错，不静默换成 V1：这样"这一轮跑完了"本身就是用的四头内核。
   // 需要跑非 4 倍 GQA 的调用方请继续用默认（v3=false）的 V1 入口。
   TORCH_CHECK(!v3 || q_heads == kv_heads * 4, "V3 只支持每组四个 Query 头，其他配置请使用 V1 入口");

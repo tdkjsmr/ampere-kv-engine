@@ -363,8 +363,8 @@ def benchmark(model, input_ids, *, repeats: int = 3, cache_kind: str = "contiguo
     """同一模型预热一次、重复纯生成；只打印基础统计，不保存输入或结果文件。"""
     if repeats < 1:
         raise ValueError("测量次数必须为正数")
-    # 标签里的 CUDA V0 是默认内部入口（当前跑 V1 内核）；CUDA V3 表示显式选了四头共享载入。
-    backend = "CUDA V3" if cuda_decode and v3 else ("CUDA V0" if cuda_decode else "SDPA")
+    # 标签写实际使用的内核：默认内部入口跑 V1，显式选 v3 时才是四头共享载入。
+    backend = "CUDA V3" if cuda_decode and v3 else ("CUDA V1" if cuda_decode else "SDPA")
     print(f"\n基线路径：缓存={cache_kind}，KV={kv_dtype}，Decode={backend}，Prefill=BF16 SDPA")
     print(f"基线：预热=1 次，测量={repeats} 次，输入 Token={input_ids.shape[1]}，输出上限={MAX_NEW_TOKENS}")
     print("范围：模型与输入已就绪，包含 KV 分配和选词；无 HF 对照、分词、文本解码或终端打印")
@@ -429,7 +429,7 @@ def check_cuda_decode(model, input_ids, v3: bool = False) -> None:
     """
     config = model.config
     if config.head_dim != 128 or PAGED_BLOCK_SIZE != 16:
-        raise ValueError("CUDA V0 只支持每头 128 维和块大小 16")
+        raise ValueError("CUDA Decode 只支持每头 128 维和块大小 16")
     tokens = input_ids.shape[1]
     num_blocks = (tokens + MAX_NEW_TOKENS + PAGED_BLOCK_SIZE - 1) // PAGED_BLOCK_SIZE
     eos_ids = model.generation_config.eos_token_id
