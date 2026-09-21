@@ -13,65 +13,86 @@ from ampere_kv.quantization import quantize_kv
 
 @torch.inference_mode()
 def benchmark() -> None:
-    """固定数据上的算子调用墙钟基线；不包含分页整理，不等于纯内核耗时。"""
+    """SDPA 连续参考与 BF16/INT8 内部 Decode 入口的配对调用基线；不等于纯内核耗时。"""
     generator = torch.Generator().manual_seed(0)
     warmup, repeats, iterations = 5, 3, 20
+    begin, end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
     print(f"调用基线：Q头=32，KV头=8，每头128维，块大小16；预热={warmup} 次，测量={repeats} 组，每组={iterations} 次")
-    print("计时前准备 Q/K/V、GQA 展开和 GPU 块表；计时包含 Python/扩展调用、输出分配、CUDA V0 块号检查同步及组末等待。")
-    print("同一份数据反复读取，可能受硬件缓存影响；SDPA 后端自动选择，本结果不是纯内核时间、请求 TPOT 或原生 GQA 性能。")
-    print("CUDA 段长=64；长度超过 64 时启用分段，临时结果分配与合并调用均计时；修改段长后须重新编译扩展。")
+    print("Q/K/V、量化、GQA 展开与 GPU 块表都在计时外准备；被测的是内部入口，与模型生成路径一致，无宿主块号同步。")
+    print("墙钟含 Python/扩展调用、输出分配与组末等待；GPU 窗口是同一批调用的 CUDA Event 区间，仍含 GPU 等待 CPU")
+    print("派发的空隙，因此不是严格纯内核时间。同一份数据反复读取可能受硬件缓存影响；结果不是请求 TPOT 或原生 GQA 性能。")
+    print("CUDA 段长=64；长度超过 64 时启用分段，临时结果分配与合并调用均计入；修改段长后须重新编译扩展。")
     for length in (64, 256, 1024):
+        blocks = length // 16
         query = torch.randn(1, 32, 1, 128, generator=generator).to(device="cuda", dtype=torch.bfloat16)
         key = torch.randn(1, 8, length, 128, generator=generator).to(device="cuda", dtype=torch.bfloat16)
         value = torch.randn(1, 8, length, 128, generator=generator).to(device="cuda", dtype=torch.bfloat16)
-        storage = PagedKVStorage(8, 128, length // 16, 16, device="cuda")
+        storage = PagedKVStorage(8, 128, blocks, 16, device="cuda")
         cache = PagedKVCache(storage)
+        int8_storage = PagedKVStorage(8, 128, blocks, 16, device="cuda", kv_dtype=torch.int8)
+        int8_cache = PagedKVCache(int8_storage)
         try:
-            # 倒序归还块号，使物理顺序不同于逻辑顺序；准备与追加均不计时。
-            held = [storage._pool.allocate() for _ in range(length // 16)]
-            for block in held:
-                storage._pool.free(block)
-            cache.append(key, value)
-            table = torch.tensor(cache._table.block_ids, dtype=torch.long, device="cuda")
+            # 倒序归还块号使物理顺序不同于逻辑顺序；两种精度共用同一份输入与同一种块号排列。
+            for pool in (storage._pool, int8_storage._pool):
+                held = [pool.allocate() for _ in range(blocks)]
+                for block in held:
+                    pool.free(block)
+            table = cache.append(key, value, fused=True)
+            int8_table = int8_cache.append(key, value, fused=True)
             # SDPA 直接使用原始连续 K/V，不经过分页 get；GQA 展开也在计时外。
             sdpa_key = key.repeat_interleave(4, dim=1).contiguous()
             sdpa_value = value.repeat_interleave(4, dim=1).contiguous()
             def sdpa_call():
                 return torch.nn.functional.scaled_dot_product_attention(
-                    query, sdpa_key, sdpa_value, dropout_p=0.0,
-                    is_causal=False, scale=128 ** -0.5,
-                )
-            def cuda_call():
-                return _C.paged_decode(query, storage._key, storage._value, table, length)
-            expected, actual = sdpa_call(), cuda_call()
-            error = (actual.float() - expected.float()).abs().max().item()
-            print(f"[诊断] 长度={length}，计时外 CUDA / SDPA 最大绝对误差={error:.8g}，rtol=0.01，atol=0.002")
-            assert actual.shape == expected.shape == query.shape
-            assert actual.dtype == expected.dtype == torch.bfloat16
-            assert torch.isfinite(actual).all() and torch.isfinite(expected).all()
-            torch.testing.assert_close(actual, expected, rtol=0.01, atol=0.002)
-            calls = (("SDPA", sdpa_call), ("CUDA V0", cuda_call))
+                    query, sdpa_key, sdpa_value, dropout_p=0.0, is_causal=False, scale=128 ** -0.5)
+            def bf16_call():
+                return _C.paged_decode_internal(query, storage._key, storage._value, table, length)
+            def int8_call():
+                return _C.paged_decode_int8_internal(query, int8_storage._key, int8_storage._value,
+                                                     int8_storage._key_scale, int8_storage._value_scale,
+                                                     int8_table, length)
+            # BF16 对连续 SDPA；INT8 对同一份量化数据反量化后的 FP32 SDPA，量化误差不进入内核对照。
+            expected, actual = sdpa_call(), bf16_call()
+            int8_key, int8_value = int8_cache.get()
+            int8_expected = torch.nn.functional.scaled_dot_product_attention(
+                query.float(), int8_key.repeat_interleave(4, dim=1), int8_value.repeat_interleave(4, dim=1),
+                dropout_p=0.0, is_causal=False, scale=128 ** -0.5)
+            int8_actual = int8_call()
+            assert actual.shape == int8_actual.shape == query.shape
+            assert actual.dtype == int8_actual.dtype == torch.bfloat16
+            for name, got, want in (("BF16/连续SDPA", actual.float(), expected.float()),
+                                    ("INT8/同量化数据", int8_actual.float(), int8_expected)):
+                error = (got - want).abs().max().item()
+                print(f"[诊断] 长度={length}，计时外 {name} 最大绝对误差={error:.8g}，rtol=0.01，atol=0.002")
+                assert torch.isfinite(got).all() and torch.isfinite(want).all()
+                torch.testing.assert_close(got, want, rtol=0.01, atol=0.002)
+            calls = (("SDPA连续", sdpa_call), ("CUDA BF16内部", bf16_call), ("CUDA INT8内部", int8_call))
             for _, call in calls:
                 for _ in range(warmup):
                     call()
-            samples = {name: [] for name, _ in calls}
+            samples = {name: ([], []) for name, _ in calls}
             for run in range(repeats):
                 # 交替先后顺序，减少总是让同一路径先测的影响，但不是严谨统计实验。
                 for name, call in (calls if run % 2 == 0 else calls[::-1]):
                     torch.cuda.synchronize()
                     started = time.perf_counter()
+                    begin.record()
                     for _ in range(iterations):
                         call()
+                    end.record()
                     torch.cuda.synchronize()
-                    per_call_us = (time.perf_counter() - started) * 1e6 / iterations
-                    samples[name].append(per_call_us)
-                    print(f"长度={length}，第 {run + 1} 组，{name}：平均调用耗时={per_call_us:.3f} us")
-            for name, values in samples.items():
-                print(f"[基线] 长度={length}，{name}：组平均调用耗时的中位数={statistics.median(values):.3f} us")
+                    wall, gpu = samples[name]
+                    wall.append((time.perf_counter() - started) * 1e6 / iterations)
+                    gpu.append(begin.elapsed_time(end) * 1e3 / iterations)
+            for name, (wall, gpu) in samples.items():
+                print(f"[基线] 长度={length}，{name}：墙钟中位数={statistics.median(wall):.3f} us"
+                      f"（极差={max(wall) - min(wall):.3f}），GPU窗口中位数={statistics.median(gpu):.3f} us"
+                      f"（极差={max(gpu) - min(gpu):.3f}）")
         finally:
             cache.release()
-            assert storage._pool.num_free_blocks == length // 16
-    print("[完成] 三种长度调用基线；不能据此宣称独立内核或端到端加速比")
+            int8_cache.release()
+        assert storage._pool.num_free_blocks == blocks and int8_storage._pool.num_free_blocks == blocks
+    print("[完成] 三种长度的 SDPA/BF16/INT8 配对基线；不能据此宣称独立内核或端到端加速比")
 
 
 @torch.inference_mode()
@@ -178,7 +199,8 @@ def check_int8() -> None:
 def main() -> None:
     """默认检查 BF16 写入与 INT8 算子；--benchmark 测 BF16 SDPA 与 CUDA 调用基线。"""
     parser = argparse.ArgumentParser(description="分页写入与 INT8 Decode 对照、BF16 调用基线")
-    parser.add_argument("--benchmark", action="store_true", help="测量 BF16 SDPA 与 CUDA 调用；不测 INT8")
+    parser.add_argument("--benchmark", action="store_true",
+                        help="测量 SDPA 连续参考与 BF16/INT8 内部 Decode 入口的配对调用基线")
     args = parser.parse_args()
     if not torch.cuda.is_available():
         raise RuntimeError("需要云端 CUDA GPU 与已编译的扩展")
