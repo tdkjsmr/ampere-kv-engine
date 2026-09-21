@@ -79,6 +79,7 @@ def apply_rope(query: torch.Tensor, key: torch.Tensor, position_ids: torch.Tenso
 def decoder_layer_forward(
     hidden_states: torch.Tensor, layer, position_ids: torch.Tensor,
     cache: ContiguousKVCache | PagedKVCache, config, *, is_prefill: bool, cuda_decode: bool = False,
+    v3: bool = False,
 ) -> torch.Tensor:
     """执行单请求、无填充的整段 Prefill 或单 Token Decode，返回本次隐藏状态。
 
@@ -86,6 +87,7 @@ def decoder_layer_forward(
     不加载模型、不打印结果、不调用 HF 层的 forward，也不进行参考对照。
     不支持分块 Prefill；缓存写入后若计算失败，不自动回滚。
     cuda_decode 用于可选生成与对照，默认仍走 SDPA；当前 CUDA 分支不支持 Graph。
+    v3 只换 Decode 内核版本（同组四个 Query 头共享一次 K/V 载入），Prefill 与写入路径不受影响。
     """
     attention = layer.self_attn
     # Pre-Norm：先归一化，再送入 Attention；原始输入留在残差支路上。
@@ -120,10 +122,10 @@ def decoder_layer_forward(
         if cache._key.dtype == torch.int8:
             head_output = _C.paged_decode_int8_internal(
                 query.contiguous(), cache._key, cache._value,
-                cache._key_scale, cache._value_scale, table, cache.length,
+                cache._key_scale, cache._value_scale, table, cache.length, v3=v3,
             )
         else:
-            head_output = _C.paged_decode_internal(query.contiguous(), cache._key, cache._value, table, cache.length)
+            head_output = _C.paged_decode_internal(query.contiguous(), cache._key, cache._value, table, cache.length, v3=v3)
     else:
         attention_fn = prefill_attention if is_prefill else decode_attention
         head_output = attention_fn(query, key, value, cache)
@@ -157,17 +159,18 @@ def finish_decoder_layer(hidden_states: torch.Tensor, head_output: torch.Tensor,
 
 
 @torch.no_grad()
-def model_forward(model, input_ids, position_ids, caches, *, is_prefill: bool, cuda_decode: bool = False):
+def model_forward(model, input_ids, position_ids, caches, *, is_prefill: bool, cuda_decode: bool = False, v3: bool = False):
     """自建模型级前向：返回本次最后一个位置的 logits，并更新各层缓存。
 
     只读取 HF 对象持有的权重，不调用 HF 模型、层或输出头的 forward。
     不负责分词、选词、打印或对照；不提供缓存写入失败后的跨层回滚。
+    v3 只影响 Decode 内核版本，由 decoder_layer_forward 传给 CUDA 入口。
     """
     layers = model.model.layers
     hidden_states = model.model.embed_tokens.weight[input_ids]
     for layer, cache in zip(layers, caches):
         hidden_states = decoder_layer_forward(
-            hidden_states, layer, position_ids, cache, model.config, is_prefill=is_prefill, cuda_decode=cuda_decode,
+            hidden_states, layer, position_ids, cache, model.config, is_prefill=is_prefill, cuda_decode=cuda_decode, v3=v3,
         )
     # Prefill 和 Decode 共用末尾归一化与输出投影，不另写一套生成计算。
     return final_logits(model, hidden_states)
@@ -181,11 +184,12 @@ def final_logits(model, hidden_states):
 
 
 @torch.inference_mode()
-def generate_tokens(model, input_ids, *, max_new_tokens: int = MAX_NEW_TOKENS, verify: bool = False, timings: dict | None = None, cache_kind: str = "contiguous", cuda_decode: bool = False, kv_dtype: torch.dtype = torch.bfloat16, ignore_eos: bool = False) -> list[int]:
+def generate_tokens(model, input_ids, *, max_new_tokens: int = MAX_NEW_TOKENS, verify: bool = False, timings: dict | None = None, cache_kind: str = "contiguous", cuda_decode: bool = False, kv_dtype: torch.dtype = torch.bfloat16, ignore_eos: bool = False, v3: bool = False) -> list[int]:
     """返回新 Token IDs；每次请求创建独立缓存，不向调用方保留 GPU 张量。
 
     verify 额外执行 HF 参考与诊断，timings 写入请求级墙钟指标，两者互斥；模式组合与
     输入张量由 main 保证，这里不重复校验。cuda_decode 只切换 Decode，Prefill 始终用 SDPA。
+    v3 进一步选择四头共享载入的 Decode 内核，只在 cuda_decode 为真时有意义。
     """
     tokens = input_ids.shape[1]
     if timings is not None:
@@ -223,7 +227,7 @@ def generate_tokens(model, input_ids, *, max_new_tokens: int = MAX_NEW_TOKENS, v
     for step in range(max_new_tokens):
         # 首轮处理整段输入，后续只处理一个 Token；绝对位置从历史有效长度继续。
         positions = torch.arange(used_tokens, used_tokens + current_input.shape[1], device=input_ids.device).unsqueeze(0)
-        logits = model_forward(model, current_input, positions, caches, is_prefill=(step == 0), cuda_decode=cuda_decode and step > 0)
+        logits = model_forward(model, current_input, positions, caches, is_prefill=(step == 0), cuda_decode=cuda_decode and step > 0, v3=v3)
         used_tokens += current_input.shape[1]
         next_id = logits[0, 0].argmax().item()
         if timings is not None:
@@ -288,11 +292,12 @@ def generate_tokens(model, input_ids, *, max_new_tokens: int = MAX_NEW_TOKENS, v
     return generated_ids
 
 
-def benchmark(model, input_ids, *, repeats: int = 3, cache_kind: str = "contiguous", cuda_decode: bool = False, reference_ids: list[int] | None = None, kv_dtype: torch.dtype = torch.bfloat16) -> list[int]:
+def benchmark(model, input_ids, *, repeats: int = 3, cache_kind: str = "contiguous", cuda_decode: bool = False, reference_ids: list[int] | None = None, kv_dtype: torch.dtype = torch.bfloat16, v3: bool = False) -> list[int]:
     """同一模型预热一次、重复纯生成；只打印基础统计，不保存输入或结果文件。"""
     if repeats < 1:
         raise ValueError("测量次数必须为正数")
-    backend = "CUDA V0" if cuda_decode else "SDPA"
+    # 标签里的 CUDA V0 是默认内部入口（当前跑 V1 内核）；CUDA V3 表示显式选了四头共享载入。
+    backend = "CUDA V3" if cuda_decode and v3 else ("CUDA V0" if cuda_decode else "SDPA")
     print(f"\n基线路径：缓存={cache_kind}，KV={kv_dtype}，Decode={backend}，Prefill=BF16 SDPA")
     print(f"基线：预热=1 次，测量={repeats} 次，输入 Token={input_ids.shape[1]}，输出上限={MAX_NEW_TOKENS}")
     print("范围：模型与输入已就绪，包含 KV 分配和选词；无 HF 对照、分词、文本解码或终端打印")
@@ -302,7 +307,7 @@ def benchmark(model, input_ids, *, repeats: int = 3, cache_kind: str = "contiguo
         print("分页 SDPA 包含逻辑读回与 GQA 临时复制；CUDA Decode 包含块表创建/上传和块号检查同步；两边均包含 KV 追加。")
     # 预热不计入结果；每次调用都新建请求缓存，不复用上个请求的有效内容。
     expected_ids = generate_tokens(model, input_ids, cache_kind=cache_kind, cuda_decode=cuda_decode,
-                                   kv_dtype=kv_dtype, ignore_eos=True)
+                                   kv_dtype=kv_dtype, ignore_eos=True, v3=v3)
     if reference_ids is not None:
         if kv_dtype == torch.int8:
             print(f"[观测] 与BF16固定长度序列一致={expected_ids == reference_ids}；各自选词，历史可能不同，不是精度验收")
@@ -320,7 +325,7 @@ def benchmark(model, input_ids, *, repeats: int = 3, cache_kind: str = "contiguo
         torch.cuda.reset_peak_memory_stats(device)
         metrics = {}
         generated_ids = generate_tokens(model, input_ids, timings=metrics, cache_kind=cache_kind,
-                                        cuda_decode=cuda_decode, kv_dtype=kv_dtype, ignore_eos=True)
+                                        cuda_decode=cuda_decode, kv_dtype=kv_dtype, ignore_eos=True, v3=v3)
         torch.cuda.synchronize(device)
         allocated = torch.cuda.memory_allocated(device)
         reserved = torch.cuda.memory_reserved(device)
@@ -350,8 +355,11 @@ def benchmark(model, input_ids, *, repeats: int = 3, cache_kind: str = "contiguo
 
 
 @torch.inference_mode()
-def check_cuda_decode(model, input_ids) -> None:
-    """两套独立分页缓存做有界贪心生成；首次选词不一致即停止，不强制喂参考 Token。"""
+def check_cuda_decode(model, input_ids, v3: bool = False) -> None:
+    """两套独立分页缓存做有界贪心生成；首次选词不一致即停止，不强制喂参考 Token。
+
+    v3 只作用于 CUDA 那一套；参考那一套始终走 SDPA，保持起点相同。
+    """
     config = model.config
     if config.head_dim != 128 or PAGED_BLOCK_SIZE != 16:
         raise ValueError("CUDA V0 只支持每头 128 维和块大小 16")
@@ -371,13 +379,13 @@ def check_cuda_decode(model, input_ids) -> None:
                 )))
         all_caches = actual_caches + reference_caches
         actual_input, reference_input = input_ids, input_ids
-        print(f"对照上限={MAX_NEW_TOKENS} 个新 Token，输入长度={tokens}，每层物理容量={num_blocks * PAGED_BLOCK_SIZE}")
+        print(f"对照上限={MAX_NEW_TOKENS} 个新 Token，输入长度={tokens}，每层物理容量={num_blocks * PAGED_BLOCK_SIZE}，CUDA 内核={'V3 四头共享载入' if v3 else 'V1 默认'}")
         for step in range(MAX_NEW_TOKENS):
             is_prefill = step == 0
             # 第一次 Decode 的位置为 tokens；此后每步只增加一个位置。
             positions = torch.arange(tokens, device=input_ids.device).unsqueeze(0) if is_prefill else torch.tensor([[tokens + step - 1]], device=input_ids.device)
             # 各自完整走一遍模型，上一层自己的输出直接进入下一层，不能换回参考状态。
-            actual = model_forward(model, actual_input, positions, actual_caches, is_prefill=is_prefill, cuda_decode=not is_prefill)
+            actual = model_forward(model, actual_input, positions, actual_caches, is_prefill=is_prefill, cuda_decode=not is_prefill, v3=v3)
             reference = model_forward(model, reference_input, positions, reference_caches, is_prefill=is_prefill)
             assert torch.isfinite(actual).all().item() and torch.isfinite(reference).all().item()
             used = tokens + step
@@ -429,8 +437,11 @@ def check_cuda_decode(model, input_ids) -> None:
 
 
 @torch.inference_mode()
-def check_int8_decode(model, input_ids) -> None:
-    """共享BF16 Prefill，按BF16选词驱动两条CUDA路径；仅同历史对照，不测性能。"""
+def check_int8_decode(model, input_ids, v3: bool = False) -> None:
+    """共享BF16 Prefill，按BF16选词驱动两条CUDA路径；仅同历史对照，不测性能。
+
+    v3 同时作用于两套 CUDA 路径，使差异只来自精度而不是内核版本。
+    """
     config = model.config
     length = input_ids.shape[1]
     blocks = (length + MAX_NEW_TOKENS - 1 + PAGED_BLOCK_SIZE - 1) // PAGED_BLOCK_SIZE
@@ -473,9 +484,9 @@ def check_int8_decode(model, input_ids) -> None:
             current_input = input_ids.new_tensor([[current_id]])
             positions = input_ids.new_tensor([[length + step]])
             reference = model_forward(model, current_input, positions, reference_caches,
-                                      is_prefill=False, cuda_decode=True)
+                                      is_prefill=False, cuda_decode=True, v3=v3)
             actual = model_forward(model, current_input, positions, quantized_caches,
-                                   is_prefill=False, cuda_decode=True)
+                                   is_prefill=False, cuda_decode=True, v3=v3)
             assert torch.isfinite(reference).all().item() and torch.isfinite(actual).all().item()
             reference_scores, actual_scores = reference.float().flatten(), actual.float().flatten()
             delta = actual_scores - reference_scores
@@ -541,6 +552,8 @@ def main() -> None:
     parser.add_argument("--cache", choices=("contiguous", "paged"), default="contiguous", help="默认连续缓存；paged 为每块 16 Token 的分页参考")
     parser.add_argument("--kv-dtype", choices=("bf16", "int8"), default="bf16",
                         help="生成的KV类型；benchmark选int8则比较BF16/INT8 CUDA，均需paged；诊断模式自行选择")
+    parser.add_argument("--decode-kernel", choices=("v1", "v3"), default="v1",
+                        help="Decode CUDA 内核：v1 每块一个 Query 头（默认），v3 同组四个 Query 头共享一次 K/V 载入")
     args = parser.parse_args()
     if args.repeats < 1:
         parser.error("--repeats 必须为正数")
@@ -548,6 +561,12 @@ def main() -> None:
         parser.error("CUDA 对照模式需要显式指定 --cache paged")
     if args.kv_dtype == "int8" and (args.mode not in ("generate", "benchmark") or args.cache != "paged"):
         parser.error("--kv-dtype int8 仅用于 generate/benchmark 且需 --cache paged")
+    # v3 只在真正调用 CUDA Decode 的组合下有意义，否则会被 SDPA 路径静默忽略，不能当作 V3 证据。
+    if args.decode_kernel == "v3" and not (
+            args.mode in ("cuda-check", "int8-check")
+            or (args.mode == "benchmark" and args.cache == "paged")
+            or (args.mode == "generate" and args.kv_dtype == "int8")):
+        parser.error("--decode-kernel v3 需要实际走 CUDA Decode 的组合：cuda-check/int8-check、benchmark --cache paged 或 generate --kv-dtype int8")
     if not torch.cuda.is_available():
         raise RuntimeError("模型生成需要在云端 CUDA 环境运行")
     text = input("请输入一段文本：")
@@ -570,19 +589,20 @@ def main() -> None:
     if model.config.hidden_act != "silu" or any(layer.self_attn.sliding_window is not None for layer in model.model.layers):
         raise ValueError("当前只支持SiLU且无滑动窗口的Qwen3")
     if args.mode == "int8-check":
-        check_int8_decode(model, input_ids)
+        check_int8_decode(model, input_ids, v3=args.decode_kernel == "v3")
         return  # 同历史对照不等于INT8独立生成，不进入普通生成输出。
     if args.mode == "cuda-check":
-        check_cuda_decode(model, input_ids)
+        check_cuda_decode(model, input_ids, v3=args.decode_kernel == "v3")
         return  # 对照入口自行汇总，不能落入下面的普通生成结果打印。
     if args.mode == "benchmark":
         if args.kv_dtype == "int8":
             # 同一模型、同一输入、相同输出步数；先BF16再INT8，固定顺序仍可能受时钟漂移影响。
             # 这里不执行SDPA陪跑；质量检查由int8-check承担，量化写入开销包含在计时内。
             print("配对基线：BF16 CUDA → INT8 CUDA；各自独立选词，不要求跨精度序列完全一致。")
-            reference_ids = benchmark(model, input_ids, repeats=args.repeats, cache_kind="paged", cuda_decode=True)
+            v3 = args.decode_kernel == "v3"
+            reference_ids = benchmark(model, input_ids, repeats=args.repeats, cache_kind="paged", cuda_decode=True, v3=v3)
             benchmark(model, input_ids, repeats=args.repeats, cache_kind="paged", cuda_decode=True,
-                      kv_dtype=torch.int8, reference_ids=reference_ids)
+                      kv_dtype=torch.int8, reference_ids=reference_ids, v3=v3)
             print("[完成] 固定长度BF16/INT8 CUDA初步基线；不代表正式精度或稳定加速比验收")
             return
         generated_ids = benchmark(model, input_ids, repeats=args.repeats, cache_kind=args.cache)
@@ -591,17 +611,18 @@ def main() -> None:
             # 先 SDPA 后 CUDA 仅用于初步基线，固定顺序和少量重复不能代表稳定加速比。
             generated_ids = benchmark(
                 model, input_ids, repeats=args.repeats, cache_kind="paged",
-                cuda_decode=True, reference_ids=generated_ids,
+                cuda_decode=True, reference_ids=generated_ids, v3=args.decode_kernel == "v3",
             )
         return  # benchmark忽略EOS，不把固定工作量输出打印为正常回答或EOS停止。
     else:
         # INT8直接复用循环，由自身logits选词；不创建BF16陪跑缓存。
         use_int8 = args.kv_dtype == "int8"
         if args.mode == "generate":
-            print(f"生成路径：KV={args.kv_dtype}，Prefill=BF16 SDPA，Decode={'INT8 CUDA' if use_int8 else 'BF16 SDPA'}")
+            print(f"生成路径：KV={args.kv_dtype}，Prefill=BF16 SDPA，Decode={'INT8 CUDA' if use_int8 else 'BF16 SDPA'}，Decode内核={args.decode_kernel}")
         generated_ids = generate_tokens(
             model, input_ids, verify=(args.mode == "check"), cache_kind=args.cache,
             cuda_decode=use_int8, kv_dtype=torch.int8 if use_int8 else torch.bfloat16,
+            v3=args.decode_kernel == "v3",
         )
     eos_ids = model.generation_config.eos_token_id
     eos_ids = [eos_ids] if isinstance(eos_ids, int) else (eos_ids or [])
