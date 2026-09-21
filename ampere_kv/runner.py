@@ -19,6 +19,28 @@ MAX_NEW_TOKENS = 32
 PAGED_BLOCK_SIZE = 16
 
 
+def encode_prompt(tokenizer, text: str) -> torch.Tensor:
+    """按 Qwen3 对话模板把一句输入编码成 [1, P] 的 CUDA Token IDs。"""
+    formatted = tokenizer.apply_chat_template(
+        [{"role": "user", "content": text}],
+        tokenize=False, add_generation_prompt=True, enable_thinking=False,
+    )
+    return tokenizer(formatted, add_special_tokens=False, return_tensors="pt")["input_ids"].to("cuda")
+
+
+def load_model_and_tokenizer():
+    """加载固定版本 Qwen3-8B 与分词器；单请求生成与多请求调度共用这一份加载逻辑。"""
+    model = AutoModelForCausalLM.from_pretrained(
+        MODEL_ID, revision=MODEL_REVISION, torch_dtype=torch.bfloat16,
+        attn_implementation="sdpa", local_files_only=True,
+    ).to("cuda")
+    model.eval()
+    # 固定模型结构仅在加载后检查一次，不在36层的每次前向里重复判断。
+    if model.config.hidden_act != "silu" or any(layer.self_attn.sliding_window is not None for layer in model.model.layers):
+        raise ValueError("当前只支持SiLU且无滑动窗口的Qwen3")
+    return model, AutoTokenizer.from_pretrained(MODEL_ID, revision=MODEL_REVISION, local_files_only=True)
+
+
 def rms_norm(hidden_states: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.Tensor:
     """沿最后一维做 RMSNorm；按 Qwen3 的顺序保留归一化后的类型转换位置。"""
 
@@ -573,21 +595,9 @@ def main() -> None:
     if not text.strip():
         raise ValueError("输入不能为空")
     # 输入只保留在进程内；不保存文本，也不增加下载或配置文件。
-    tokenizer = AutoTokenizer.from_pretrained(MODEL_ID, revision=MODEL_REVISION, local_files_only=True)
-    formatted_text = tokenizer.apply_chat_template(
-        [{"role": "user", "content": text}],
-        tokenize=False, add_generation_prompt=True, enable_thinking=False,
-    )
-    input_ids = tokenizer(formatted_text, add_special_tokens=False, return_tensors="pt")["input_ids"].to("cuda")
     print(f"正在从本地缓存加载固定版本 Qwen3-8B，模式={args.mode}，缓存={args.cache}……")
-    model = AutoModelForCausalLM.from_pretrained(
-        MODEL_ID, revision=MODEL_REVISION, torch_dtype=torch.bfloat16,
-        attn_implementation="sdpa", local_files_only=True,
-    ).to("cuda")
-    model.eval()
-    # 固定模型结构仅在加载后检查一次，不在36层的每次前向里重复判断。
-    if model.config.hidden_act != "silu" or any(layer.self_attn.sliding_window is not None for layer in model.model.layers):
-        raise ValueError("当前只支持SiLU且无滑动窗口的Qwen3")
+    model, tokenizer = load_model_and_tokenizer()
+    input_ids = encode_prompt(tokenizer, text)
     if args.mode == "int8-check":
         check_int8_decode(model, input_ids, v3=args.decode_kernel == "v3")
         return  # 同历史对照不等于INT8独立生成，不进入普通生成输出。
