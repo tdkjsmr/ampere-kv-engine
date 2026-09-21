@@ -52,6 +52,15 @@ class PagedKVCache:
         """返回有效 Token 数；仅在 append 正常完成后才保证对应数据完整。"""
         return self._table.length
 
+    def reserve(self, num_tokens: int) -> tuple[int, ...]:
+        """只登记尾部新增 Token 所需的块并返回最新块表，不写入任何 K/V。
+
+        批量路径用它把"更新块表"与"融合写入"拆开：B 个请求各调用一次，再由一个批量内核一次写完。
+        有效长度会随之增长，所以调用方必须先记下旧长度作为写入起点；登记后写入失败不自动回滚。
+        """
+        self._table.append_tokens(num_tokens)
+        return self._table.block_ids
+
     @torch.no_grad()
     def append(self, key: torch.Tensor, value: torch.Tensor, *, fused: bool = False) -> torch.Tensor | None:
         """追加BF16 K/V；融合分支返回GPU块表供Decode复用，参考分支返回None。"""

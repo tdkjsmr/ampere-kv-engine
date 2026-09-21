@@ -394,6 +394,131 @@ __global__ void paged_decode_v3_kernel(
   }
 }
 
+// G6-B 批量分页 Decode：一次启动同时推进 B 个请求的当前 Token，每个块负责一个 (请求, Query 头)。
+// 与 V1 的唯一区别是索引来源：块表是 [B, 每请求最大块数] 的行，各请求的写入起点从设备端 starts
+// 读取（每步每请求一个 Token，有效长度即 起点+1）。因此不把任何请求的历史读回连续显存，
+// 也不把长度搬回宿主——每步仍只有设备端可见的元数据。
+// 每个 (请求, 头) 的算术次序与 V1 逐条相同：同样段长、四 warp 交错、连续四维打包与归约台阶。
+// 只实例化 BF16；INT8 多请求按计划推到基础链路稳定之后。分段合并仍用 merge_decode_kernel，
+// 只是行号由 Query 头号换成 (请求, 头) 行号。
+__global__ void paged_decode_batched_kernel(
+    const c10::BFloat16* query, const c10::BFloat16* key, const c10::BFloat16* value,
+    const int64_t* table, const int64_t* starts,
+    c10::BFloat16* output, float* partials,
+    int q_heads, int kv_heads, int group_size, int table_stride, int segments, int64_t blocks) {
+  const int lane = threadIdx.x % 32;
+  const int warp = threadIdx.x / 32;
+  __shared__ float local[4][kDim + 2];
+  const int row = blockIdx.x;  // 行号 = 请求 * Query 头数 + Query 头，与 [批, 头, 1, 128] 布局一致。
+  const int request = row / q_heads;
+  const int kv_head = (row % q_heads) / group_size;
+  const int64_t length = starts[request] + 1;
+  const int64_t* row_table = table + static_cast<int64_t>(request) * table_stride;
+  float q[4];
+  float accumulator[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+  load4(query + static_cast<int64_t>(row) * kDim + 4 * lane, q);
+  float maximum = -INFINITY, denominator = 0.0f;
+
+  const int64_t begin = static_cast<int64_t>(blockIdx.y) * kSegmentSize;
+  const int64_t end = length < begin + kSegmentSize ? length : begin + kSegmentSize;
+  // 超出本请求长度的分段整块空转，只写出全零局部结果，由跨段合并按分母为零跳过。
+  for (int64_t token = begin + warp; token < end; token += 4) {
+    const int64_t slot = token / kBlockSize;
+    // 块表按行定宽填充，越界说明某请求的有效长度超过了它的行宽；先在读表之前拦住。
+    CUDA_KERNEL_ASSERT(slot < table_stride);
+    const int64_t physical = row_table[slot];
+    // 与 V1 同一条保护：任何 K/V 访存之前拦下非法块号。
+    CUDA_KERNEL_ASSERT(physical >= 0 && physical < blocks);
+    const int64_t index = ((physical * kv_heads + kv_head) * kBlockSize + token % kBlockSize) * kDim + 4 * lane;
+    float k4[4];
+    load4(key + index, k4);
+    float sum = 0.0f;
+#pragma unroll
+    for (int i = 0; i < 4; ++i) sum += q[i] * k4[i];
+    for (int delta = 16; delta > 0; delta /= 2) sum += __shfl_down_sync(0xffffffffu, sum, delta);
+    float old_scale = 0.0f, new_weight = 0.0f;
+    if (lane == 0) {
+      const float score = sum * rsqrtf(static_cast<float>(kDim));
+      const float next_maximum = fmaxf(maximum, score);
+      old_scale = expf(maximum - next_maximum);
+      new_weight = expf(score - next_maximum);
+      denominator = denominator * old_scale + new_weight;
+      maximum = next_maximum;
+    }
+    old_scale = __shfl_sync(0xffffffffu, old_scale, 0);
+    new_weight = __shfl_sync(0xffffffffu, new_weight, 0);
+    float v4[4];
+    load4(value + index, v4);
+#pragma unroll
+    for (int i = 0; i < 4; ++i) accumulator[i] = accumulator[i] * old_scale + new_weight * v4[i];
+  }
+#pragma unroll
+  for (int i = 0; i < 4; ++i) local[warp][4 * lane + i] = accumulator[i];
+  if (lane == 0) {
+    local[warp][kDim] = maximum;
+    local[warp][kDim + 1] = denominator;
+  }
+  __syncthreads();
+  if (warp != 0) return;
+  maximum = -INFINITY;
+#pragma unroll
+  for (int w = 0; w < 4; ++w) maximum = fmaxf(maximum, local[w][kDim]);
+  denominator = 0.0f;
+#pragma unroll
+  for (int i = 0; i < 4; ++i) accumulator[i] = 0.0f;
+#pragma unroll
+  for (int w = 0; w < 4; ++w) {
+    // 空 warp 与空分段都不参与指数计算；末段不足四个 Token 时同样适用。
+    if (local[w][kDim + 1] > 0.0f) {
+      const float scale = expf(local[w][kDim] - maximum);
+      denominator += scale * local[w][kDim + 1];
+#pragma unroll
+      for (int i = 0; i < 4; ++i) accumulator[i] += scale * local[w][4 * lane + i];
+    }
+  }
+  if (partials == nullptr) {
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+      output[static_cast<int64_t>(row) * kDim + 4 * lane + i] = c10::BFloat16(accumulator[i] / denominator);
+    }
+  } else {
+    const int64_t base = (static_cast<int64_t>(row) * segments + blockIdx.y) * (kDim + 2);
+#pragma unroll
+    for (int i = 0; i < 4; ++i) partials[base + 4 * lane + i] = accumulator[i];
+    if (lane == 0) {
+      partials[base + kDim] = maximum;
+      partials[base + kDim + 1] = denominator;
+    }
+  }
+}
+
+// G6-B 批量 BF16 写入：每个 (请求, KV 头) 一个 warp，把 [B, KV头, Token, 128] 的新 K/V
+// 按各自块表写进同一层的共享存储。起点与批量 Decode 内核读同一份设备端 starts，宿主不看任何标量。
+__global__ void bf16_write_batched_kernel(
+    const c10::BFloat16* key, const c10::BFloat16* value,
+    c10::BFloat16* output_key, c10::BFloat16* output_value,
+    const int64_t* table, const int64_t* starts,
+    int heads, int table_stride, int tokens, int64_t blocks) {
+  const int lane = threadIdx.x;  // 固定 32 线程，分工与单请求 bf16_write_kernel 相同。
+  const int head = blockIdx.y;
+  const int request = blockIdx.x / tokens;
+  const int token = blockIdx.x % tokens;
+  const int64_t position = starts[request] + token;
+  const int64_t slot = position / kBlockSize;
+  CUDA_KERNEL_ASSERT(slot < table_stride);
+  const int64_t block = table[static_cast<int64_t>(request) * table_stride + slot];
+  CUDA_KERNEL_ASSERT(block >= 0 && block < blocks);
+  const int64_t physical = (block * heads + head) * kBlockSize + position % kBlockSize;
+  const int64_t input = ((static_cast<int64_t>(request) * heads + head) * tokens + token) * kDim;
+#pragma unroll
+  for (int group = 0; group < 4; ++group) {
+    const int dim = group * 32 + lane;
+    // 按位复制，不经 FP32 往返；与单请求写入内核逐位一致。
+    output_key[physical * kDim + dim] = key[input + dim];
+    output_value[physical * kDim + dim] = value[input + dim];
+  }
+}
+
 // 同一 CUDA 流上的第二次启动保证所有局部结果已写好，不需要 CPU 同步。
 __global__ void merge_decode_kernel(const float* partials, c10::BFloat16* output, int segments) {
   const int dim = threadIdx.x;
@@ -594,4 +719,90 @@ at::Tensor paged_decode_int8_internal_cuda(const at::Tensor& query, const at::Te
                                           const at::Tensor& value, const at::Tensor& key_scale,
                                           const at::Tensor& value_scale, const at::Tensor& table, int64_t length, bool v3) {
   return paged_decode_impl(query, key, value, table, length, true, false, key_scale, value_scale, v3);
+}
+
+// 批量 BF16 写入：table 是 [批, 每请求块数]，starts 是每请求的写入起点（有效长度之前的位置）。
+// 起点与块数都在设备端，宿主只检查元数据形状，不取回任何标量。
+void bf16_write_batched_cuda(const at::Tensor& key, const at::Tensor& value,
+                             const at::Tensor& output_key, const at::Tensor& output_value,
+                             const at::Tensor& table, const at::Tensor& starts) {
+  TORCH_CHECK(key.is_cuda() && key.dim() == 4 && key.size(0) > 0 && key.size(1) > 0 && key.size(1) <= 1024 &&
+              key.size(2) > 0 && key.size(3) == kDim, "批量写入输入必须是 CUDA [批, KV头, Token, 128]");
+  TORCH_CHECK(key.sizes() == value.sizes() && key.scalar_type() == at::kBFloat16 &&
+              value.scalar_type() == at::kBFloat16, "新 K/V 必须为同形状 BF16");
+  TORCH_CHECK(output_key.sizes() == output_value.sizes() && output_key.dim() == 4 &&
+              output_key.scalar_type() == at::kBFloat16 && output_key.size(1) == key.size(1) &&
+              output_key.size(2) == kBlockSize && output_key.size(3) == kDim,
+              "写入目标必须是 BF16 [块数, KV头, 16, 128]");
+  TORCH_CHECK(table.dim() == 2 && table.scalar_type() == at::kLong && table.size(0) == key.size(0) &&
+              table.size(1) > 0, "块表必须是二维定宽 int64 [批, 每请求块数]");
+  TORCH_CHECK(starts.dim() == 1 && starts.scalar_type() == at::kLong && starts.size(0) == key.size(0),
+              "写入起点必须是每请求一个 int64");
+  TORCH_CHECK(key.device() == value.device() && key.device() == output_key.device() &&
+              key.device() == output_value.device() && key.device() == table.device() &&
+              key.device() == starts.device(), "批量写入张量必须位于同一设备");
+  for (const auto& tensor : {key, value, output_key, output_value, table, starts})
+    TORCH_CHECK(tensor.is_contiguous(), "批量写入只接受连续布局");
+  // 每请求的写入范围是否越出其块表行，由内核在读表之前用设备端断言拦截；这里不做宿主扫描，
+  // 因为那需要把 starts 搬回 CPU。
+  const c10::cuda::CUDAGuard guard(key.device());
+  const auto stream = c10::cuda::getCurrentCUDAStream(key.get_device()).stream();
+  const dim3 grid(static_cast<unsigned int>(key.size(0) * key.size(2)), static_cast<unsigned int>(key.size(1)));
+  bf16_write_batched_kernel<<<grid, 32, 0, stream>>>(
+      key.data_ptr<c10::BFloat16>(), value.data_ptr<c10::BFloat16>(),
+      output_key.data_ptr<c10::BFloat16>(), output_value.data_ptr<c10::BFloat16>(),
+      table.data_ptr<int64_t>(), starts.data_ptr<int64_t>(), static_cast<int>(key.size(1)),
+      static_cast<int>(table.size(1)), static_cast<int>(key.size(2)), output_key.size(0));
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+// 批量 Decode 入口：一次启动处理 B 个请求各一个 Token，返回与 query 同形状的 [批, Query头, 1, 128]。
+// 分段数按块表行宽上界确定，因此不需要读取设备端长度；超出某请求实际长度的分段整块空转，
+// 由跨段合并按分母为零跳过，结果与逐请求单独调用 V1 内核的分段方式一致。
+at::Tensor paged_decode_batched_cuda(const at::Tensor& query, const at::Tensor& key, const at::Tensor& value,
+                                     const at::Tensor& table, const at::Tensor& starts) {
+  TORCH_CHECK(query.is_cuda() && key.is_cuda() && value.is_cuda() && table.is_cuda() && starts.is_cuda(),
+              "批量 Decode 输入必须全部位于 CUDA");
+  TORCH_CHECK(query.device() == key.device() && key.device() == value.device() &&
+              key.device() == table.device() && key.device() == starts.device(), "输入必须位于同一设备");
+  TORCH_CHECK(query.scalar_type() == at::kBFloat16 && key.scalar_type() == at::kBFloat16 &&
+              value.scalar_type() == at::kBFloat16, "批量 Decode 本轮只支持 BF16");
+  TORCH_CHECK(query.dim() == 4 && query.size(0) > 0 && query.size(1) > 0 && query.size(1) <= 1024 &&
+              query.size(2) == 1 && query.size(3) == kDim, "批量 Q 必须是 [批, Query头, 1, 128]");
+  TORCH_CHECK(key.sizes() == value.sizes() && key.dim() == 4 && key.size(0) > 0 && key.size(1) > 0 &&
+              key.size(2) == kBlockSize && key.size(3) == kDim, "K/V 必须是 [块数, KV头, 16, 128]");
+  TORCH_CHECK(table.dim() == 2 && table.scalar_type() == at::kLong && table.size(0) == query.size(0) &&
+              table.size(1) > 0, "块表必须是二维定宽 int64 [批, 每请求块数]");
+  TORCH_CHECK(starts.dim() == 1 && starts.scalar_type() == at::kLong && starts.size(0) == query.size(0),
+              "写入起点必须是每请求一个 int64");
+  const int64_t q_heads = query.size(1), kv_heads = key.size(1);
+  TORCH_CHECK(q_heads % kv_heads == 0, "Query 头数必须是 KV 头数的正整数倍");
+  for (const auto& tensor : {query, key, value, table, starts})
+    TORCH_CHECK(tensor.is_contiguous(), "批量 Decode 只接受连续布局");
+  const int64_t rows = query.size(0) * q_heads;
+  const int64_t segment_count = (table.size(1) * kBlockSize + kSegmentSize - 1) / kSegmentSize;
+  TORCH_CHECK(segment_count <= 65535 && rows <= 65535, "批量网格超过二维 CUDA 网格上限");
+  const int segments = static_cast<int>(segment_count);
+  const c10::cuda::CUDAGuard guard(query.device());
+  auto output = at::empty_like(query);
+  const auto stream = c10::cuda::getCurrentCUDAStream(query.get_device()).stream();
+  at::Tensor partials;
+  float* partial_ptr = nullptr;
+  if (segments > 1) {
+    partials = at::empty({rows, segment_count, kDim + 2}, query.options().dtype(at::kFloat));
+    partial_ptr = partials.data_ptr<float>();
+  }
+  const dim3 grid(static_cast<unsigned int>(rows), static_cast<unsigned int>(segments));
+  paged_decode_batched_kernel<<<grid, 128, 0, stream>>>(
+      query.data_ptr<c10::BFloat16>(), key.data_ptr<c10::BFloat16>(), value.data_ptr<c10::BFloat16>(),
+      table.data_ptr<int64_t>(), starts.data_ptr<int64_t>(), output.data_ptr<c10::BFloat16>(), partial_ptr,
+      static_cast<int>(q_heads), static_cast<int>(kv_heads), static_cast<int>(q_heads / kv_heads),
+      static_cast<int>(table.size(1)), segments, key.size(0));
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+  if (segments > 1) {
+    merge_decode_kernel<<<static_cast<unsigned int>(rows), kDim, 0, stream>>>(
+        partial_ptr, output.data_ptr<c10::BFloat16>(), segments);
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+  }
+  return output;
 }

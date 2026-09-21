@@ -32,9 +32,24 @@ void bf16_write_cuda(const at::Tensor& key, const at::Tensor& value,
                      const at::Tensor& output_key, const at::Tensor& output_value,
                      const at::Tensor& table, int64_t start);
 
+// G6-B 批量入口：块表是 [批, 每请求块数]，starts 是每请求写入起点；两者都留在设备端，宿主不取标量。
+void bf16_write_batched_cuda(const at::Tensor& key, const at::Tensor& value,
+                             const at::Tensor& output_key, const at::Tensor& output_value,
+                             const at::Tensor& table, const at::Tensor& starts);
+
+at::Tensor paged_decode_batched_cuda(const at::Tensor& query, const at::Tensor& key, const at::Tensor& value,
+                                     const at::Tensor& table, const at::Tensor& starts);
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, module) {
   module.def("quantize_write", &quantize_write_cuda, "Prefill/Decode INT8量化与分页写入融合");
   module.def("bf16_write", &bf16_write_cuda, "Prefill/Decode BF16分页写入融合");
+  // G6-B 批量路径：一次写入 B 个请求的当前 Token，一次注意力读取 B 个请求各自的块表。
+  module.def("bf16_write_batched", &bf16_write_batched_cuda, "批量 BF16 分页写入：每请求按各自块表写入同一层共享存储",
+             py::arg("key"), py::arg("value"), py::arg("output_key"), py::arg("output_value"),
+             py::arg("table"), py::arg("starts"));
+  module.def("paged_decode_batched", &paged_decode_batched_cuda,
+             "批量 BF16 分页 Decode：一次启动处理 B 个请求各一个 Token，历史不回读为连续 KV",
+             py::arg("query"), py::arg("key"), py::arg("value"), py::arg("table"), py::arg("starts"));
   // 保留原有 Smoke，便于区分扩展链路错误与 Attention 错误。
   module.def("smoke_add", &smoke_add_cuda, "两个 CUDA Tensor 逐元素相加");
   // pybind11 要求 py::arg 要么覆盖全部参数、要么一个都不用，只命名末位会在编译期 static_assert 失败；

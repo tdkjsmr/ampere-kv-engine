@@ -181,6 +181,51 @@ def finish_decoder_layer(hidden_states: torch.Tensor, head_output: torch.Tensor,
 
 
 @torch.no_grad()
+def decoder_layer_batched_forward(
+    hidden_states: torch.Tensor, layer, positions: torch.Tensor, caches: list, config,
+) -> torch.Tensor:
+    """一次处理 B 个请求各一个 Token 的 Decode 层：批量投影 + 批量分页 Attention。
+
+    `caches` 是**本层** B 个请求各自的 PagedKVCache，它们共享同一份物理 K/V 张量与块池
+    （由调度器保证，这里不逐层复查）。每个请求保留自己的 RoPE 位置、块表和有效长度：
+    历史既不读回连续显存，也不跨请求拼接——这是"真批量"与"把 KV 摊平再算"的分界。
+    本层只启动一次写入和一次注意力；块表与起点都留在设备端，宿主不在层内取标量。
+    """
+    from ampere_kv import _C
+
+    attention = layer.self_attn
+    normalized = rms_norm(hidden_states, layer.input_layernorm.weight, layer.input_layernorm.variance_epsilon)
+    query, key, value = project_qkv(normalized, attention)
+    query, key = apply_rope(query, key, positions, config)
+    shared_key, shared_value = caches[0]._key, caches[0]._value
+    # 起点必须在登记新块之前取：reserve 之后 length 已含本步 Token，而写入位置仍是旧长度。
+    starts = torch.tensor([cache.length for cache in caches], dtype=torch.long, device=hidden_states.device)
+    rows = [cache.reserve(1) for cache in caches]
+    width = max(len(row) for row in rows)
+    # 块表按行定宽填充 0；内核只索引到各请求自己的有效长度，填充列不会被读到，
+    # 越界情况由内核在读表之前的设备端断言拦截。
+    table = torch.tensor([list(row) + [0] * (width - len(row)) for row in rows],
+                         dtype=torch.long, device=hidden_states.device)
+    _C.bf16_write_batched(key.contiguous(), value.contiguous(), shared_key, shared_value, table, starts)
+    head_output = _C.paged_decode_batched(query.contiguous(), shared_key, shared_value, table, starts)
+    return finish_decoder_layer(hidden_states, head_output, layer)
+
+
+@torch.no_grad()
+def model_forward_batched(model, token_ids: torch.Tensor, positions: torch.Tensor, layer_caches: list):
+    """批量 Decode 的模型级前向：一次算完 B 个请求的当前 Token，返回 [B, 1, 词表] logits。
+
+    `layer_caches[layer][request]` 是该层该请求的缓存；由调用方从各请求的逐层列表转置得到。
+    只处理批量 Decode，Prefill 仍走单请求的 model_forward。
+    """
+    hidden_states = model.model.embed_tokens.weight[token_ids]
+    for layer, caches in zip(model.model.layers, layer_caches):
+        hidden_states = decoder_layer_batched_forward(hidden_states, layer, positions, caches, model.config)
+    # 各请求都只有一个新 Token，末尾位置即该 Token，与单请求路径共用同一个输出头。
+    return final_logits(model, hidden_states)
+
+
+@torch.no_grad()
 def model_forward(model, input_ids, position_ids, caches, *, is_prefill: bool, cuda_decode: bool = False, v3: bool = False):
     """自建模型级前向：返回本次最后一个位置的 logits，并更新各层缓存。
 
