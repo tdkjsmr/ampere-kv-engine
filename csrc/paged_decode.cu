@@ -6,12 +6,33 @@
 #include <c10/cuda/CUDAGuard.h>
 #include <c10/cuda/CUDAStream.h>
 #include <c10/cuda/CUDAException.h>
+#include <cuda_bf16.h>
 #include <cmath>
 
 namespace {
 constexpr int kDim = 128;
 constexpr int kBlockSize = 16;
 constexpr int kSegmentSize = 64;  // 与此前 256 段长做单变量实验，不代表最终最优值。
+
+// 每线程连续四维的打包视图：BF16 走 8 字节，INT8 走 4 字节；起始地址都对齐到位宽。
+// 行首是 128 的整数倍，4*lane 再按元素宽度对齐，因此 reinterpret 后的宽载入合法。
+union Bf16x4 { float2 wide; __nv_bfloat162 pair[2]; };
+union I8x4 { int32_t wide; int8_t value[4]; };
+
+__device__ __forceinline__ void load4(const c10::BFloat16* src, float (&out)[4]) {
+  Bf16x4 packed;
+  packed.wide = *reinterpret_cast<const float2*>(src);
+  const float2 low = __bfloat1622float2(packed.pair[0]);
+  const float2 high = __bfloat1622float2(packed.pair[1]);
+  out[0] = low.x; out[1] = low.y; out[2] = high.x; out[3] = high.y;
+}
+
+__device__ __forceinline__ void load4(const int8_t* src, float (&out)[4]) {
+  I8x4 packed;
+  packed.wide = *reinterpret_cast<const int32_t*>(src);
+#pragma unroll
+  for (int i = 0; i < 4; ++i) out[i] = static_cast<float>(packed.value[i]);
+}
 
 // 每个(Token, KV头)一个warp；Prefill批量写入，Decode复用同一内核。
 // 调用方保证输入有限且scale可用FP16表示；这是模型内部快路径，不清洗外部数据。
@@ -89,9 +110,11 @@ __global__ void bf16_write_kernel(
   }
 }
 
-// 一个线程块的四个 warp 分别处理段内不同 Token；每线程仍负责四维。
+// 一个线程块的四个 warp 分别处理段内不同 Token；每线程负责连续四维，用打包载入一次取回。
 // 不创建连续历史副本，不展开 GQA 的 K/V，不使用 Tensor Core 或异步搬运。
 // 只实例化 BF16 与 INT8 两种读取方式，归约和分段合并共用；不是通用类型派发框架。
+// V1 的收益在依赖链而不在带宽：本长度下每 SM 只有 1~25 个 warp，掩盖不了流水线气泡，
+// 所以缩短 load→scale→乘→累加 的链长比少读字节更关键；INT8 的 K scale 广播已由四次减为一次。
 template <typename KV>
 __global__ void paged_decode_kernel(
     const c10::BFloat16* query, const KV* key,
@@ -105,13 +128,11 @@ __global__ void paged_decode_kernel(
   __shared__ float local[4][kDim + 2];
   const int query_head = blockIdx.x;
   const int kv_head = query_head / group_size;
+  // V1：每线程持有连续四维 4*lane..4*lane+3，一次 8 字节打包载入取代四条标量载入。
   // 固定四元素数组配合展开供编译器标量化；实际寄存器占用以编译结果为准。
   float q[4];
   float accumulator[4] = {0.0f, 0.0f, 0.0f, 0.0f};
-#pragma unroll
-  for (int i = 0; i < 4; ++i) {
-    q[i] = static_cast<float>(query[query_head * kDim + lane + i * 32]);
-  }
+  load4(query + query_head * kDim + 4 * lane, q);
   // 仅 lane 0 更新段内最大值与分母，其他 lane 通过 shuffle 获取所需数据。
   float maximum = -INFINITY, denominator = 0.0f;
 
@@ -126,25 +147,28 @@ __global__ void paged_decode_kernel(
     // 归属由块池与块表生命周期保证。
     CUDA_KERNEL_ASSERT(physical >= 0 && physical < blocks);
     const int offset = token % kBlockSize;
-    const int64_t index = ((physical * kv_heads + kv_head) * kBlockSize + offset) * kDim + lane;
+    const int64_t index = ((physical * kv_heads + kv_head) * kBlockSize + offset) * kDim + 4 * lane;
     float k_scale = 1.0f, v_scale = 1.0f;
     if constexpr (std::is_same_v<KV, int8_t>) {
       // K scale末维4、V末维1；必须使用KV头而非Query头。
       const int64_t scale_index = (physical * kv_heads + kv_head) * kBlockSize + offset;
-      // lane 0..3各读一组K scale，下面按维度组编号广播，不需要共享内存。
+      // 本线程的连续四维同属一组（组号 = 4*lane/32 = lane/8），所以 K scale 只需一次广播；
+      // 仍由 lane 0..3 各取一组，广播源取 lane/8，不改成 0/8/16/24 装载。
       if (lane < 4) k_scale = static_cast<float>(key_scale[scale_index * 4 + lane]);
+      k_scale = __shfl_sync(0xffffffffu, k_scale, lane / 8);
       if (lane == 0) {
         v_scale = static_cast<float>(value_scale[scale_index]);
       }
       v_scale = __shfl_sync(0xffffffffu, v_scale, 0);
     }
+    // 相邻 lane 读相邻 8/4 字节，一条指令覆盖整行；scale 已在循环外广播好，链上少三次 shuffle。
+    float k4[4];
+    load4(key + index, k4);
     float sum = 0.0f;
-    // 每轮 i 中相邻 lane 读取相邻维度：lane、lane+32、lane+64、lane+96。
 #pragma unroll
     for (int i = 0; i < 4; ++i) {
-      float k = static_cast<float>(key[index + i * 32]);
-      // lane+i*32属于第i组；全部lane参与shuffle，从lane i获取该组scale。
-      if constexpr (std::is_same_v<KV, int8_t>) k *= __shfl_sync(0xffffffffu, k_scale, i);
+      float k = k4[i];
+      if constexpr (std::is_same_v<KV, int8_t>) k *= k_scale;  // 先缩放再点积，与 V0 的乘法次序一致。
       sum += q[i] * k;
     }
     // 先合并线程内四项，再做 warp 归约；只使用 lane 0 的最终和。
@@ -166,18 +190,21 @@ __global__ void paged_decode_kernel(
     // 分支外由全部 lane 广播系数，不依赖隐式锁步或共享内存。
     old_scale = __shfl_sync(0xffffffffu, old_scale, 0);
     new_weight = __shfl_sync(0xffffffffu, new_weight, 0);
+    float v4[4];
+    load4(value + index, v4);
 #pragma unroll
     for (int i = 0; i < 4; ++i) {
-      float v = static_cast<float>(value[index + i * 32]);
+      float v = v4[i];
       if constexpr (std::is_same_v<KV, int8_t>) v *= v_scale;
       accumulator[i] = accumulator[i] * old_scale + new_weight * v;
     }
     // Token 循环内仍只有私有状态与 warp shuffle，没有块级屏障。
   }
   // 即使没有分到 Token，也写出初始值：分子和分母为零，最大值为负无穷。
+  // 以下四处统一按 4*lane+i 还原成自然维度序，merge_decode_kernel 的接口与编号不变。
 #pragma unroll
   for (int i = 0; i < 4; ++i) {
-    local[warp][lane + i * 32] = accumulator[i];
+    local[warp][4 * lane + i] = accumulator[i];
   }
   if (lane == 0) {
     local[warp][kDim] = maximum;
@@ -203,7 +230,7 @@ __global__ void paged_decode_kernel(
       denominator += scale * local[w][kDim + 1];
 #pragma unroll
       for (int i = 0; i < 4; ++i) {
-        accumulator[i] += scale * local[w][lane + i * 32];
+        accumulator[i] += scale * local[w][4 * lane + i];
       }
     }
   }
@@ -211,7 +238,7 @@ __global__ void paged_decode_kernel(
     // 单段保留原路径：不分配临时张量，也不启动合并内核。
 #pragma unroll
     for (int i = 0; i < 4; ++i) {
-      output[query_head * kDim + lane + i * 32] = c10::BFloat16(accumulator[i] / denominator);
+      output[query_head * kDim + 4 * lane + i] = c10::BFloat16(accumulator[i] / denominator);
     }
   } else {
     // 布局 [Query头, 段, 128维分子 + 最大值 + 分母]，全程保存 FP32。
@@ -219,7 +246,7 @@ __global__ void paged_decode_kernel(
     const int64_t base = (static_cast<int64_t>(query_head) * segments + blockIdx.y) * (kDim + 2);
 #pragma unroll
     for (int i = 0; i < 4; ++i) {
-      partials[base + lane + i * 32] = accumulator[i];
+      partials[base + 4 * lane + i] = accumulator[i];
     }
     if (lane == 0) {
       partials[base + kDim] = maximum;
