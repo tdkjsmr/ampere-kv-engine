@@ -1,12 +1,4 @@
-"""G6 多请求引擎：一个请求对象、一个 FIFO 调度器，共用每层的分页物理存储。
-
-G6-A 建立生命周期：等待/活动/完成、容量预留、完成即回收、新请求复用归还的块。
-G6-B 增加批量 Decode：`max_batch > 1` 时把一组请求的当前 Token 合成一次模型前向，各请求保留
-自己的位置、块表与有效长度，历史既不读回连续显存也不跨请求拼接。`max_batch = 1` 时仍是
-G6-A 的逐请求路径，走默认 V1 内核，行为与上一节点完全一致。
-本轮仍不是完整的 Continuous Batching：Prefill 还是整段一次做完、每轮至多接入一个新请求，
-Chunked Prefill 与 CUDA Graph 在 G6-C/G6-E；只支持 BF16 KV，INT8 与 V3 的多请求未接入。
-"""
+"""单线程 BF16 引擎：共享分页存储、批量 Decode、每轮至多一个 Prefill Chunk。"""
 
 import torch
 
@@ -14,11 +6,11 @@ from ampere_kv.paged_cache import PagedKVCache, PagedKVStorage
 from ampere_kv.runner import (PAGED_BLOCK_SIZE, encode_prompt, generate_tokens,
                               load_model_and_tokenizer, model_forward, model_forward_batched)
 
-WAITING, RUNNING, FINISHED = "waiting", "running", "finished"
+WAITING, PREFILLING, RUNNING, FINISHED = "waiting", "prefilling", "running", "finished"
 
 
 class Request:
-    """一个请求的输入、输出与逐层缓存；状态只分等待/活动/完成三态。
+    """一个请求的输入、输出与逐层缓存；Prefill 未结束时不进入 Decode 集合。
 
     能推导的量不再存第二份：有效历史长度读自 `caches[0].length`，下一个输入 Token 就是
     `output_ids` 的最后一个。EOS 与达到上限都只写 `stop_reason`，不各建一套状态。
@@ -46,21 +38,24 @@ class Scheduler:
     """
 
     def __init__(self, model, blocks_per_layer: int, *, block_size: int = PAGED_BLOCK_SIZE,
-                 device="cuda", max_batch: int = 1):
+                 device="cuda", max_batch: int = 1, prefill_chunk_size: int = 0):
+        # 参数边界只查一次；0 保留整段 Prefill，正常前向不重复检查自身产生的状态。
+        if max_batch < 1 or prefill_chunk_size < 0:
+            raise ValueError("max_batch 必须为正，prefill_chunk_size 不能为负")
         config = model.config
         self.model = model
         self.block_size = block_size
         self.device = device
         # max_batch=1 时完全保持 G6-A 的逐请求路径；>1 才把一组请求的当前 Token 合成一次前向。
         self.max_batch = max_batch
+        self.prefill_chunk_size = prefill_chunk_size
         self.blocks_per_layer = blocks_per_layer
         # 每层一份共享物理张量与块池；请求接入时只新建块表，不再分配或复制张量。
         self.storages = [PagedKVStorage(config.num_key_value_heads, config.head_dim, blocks_per_layer,
                                         block_size, device=device) for _ in model.model.layers]
         self.waiting: list[Request] = []
         self.running: list[Request] = []
-        # 只保留"还没结束"的请求。完成的请求由 step() 交回调用方，调度器不长期积累历史，
-        # 否则长时间运行会让这两个列表无上限增长，而引擎本身并不需要它们。
+        self.prefilling: Request | None = None
         # 各层需求相同，所以一个计数就是每层已预留的块数之和。
         self.reserved_blocks = 0
         eos = model.generation_config.eos_token_id
@@ -75,8 +70,7 @@ class Scheduler:
             raise ValueError("Token IDs 必须是 CUDA 上的 int64 张量")
         if max_new_tokens <= 0:
             raise ValueError("新 Token 上限必须为正数")
-        # 预算按每层向上取整，并保守多留一个 Token：最后选出的 Token（含 EOS）不再写入 KV，
-        # 但决定它的那次 Decode 已经把该 Token 的 K/V 追加进去了。
+        # 保留既有保守预算；实际最终 KV 长度是 P+N-1，最后选出的 Token 不再写回。
         need = (input_ids.shape[1] + max_new_tokens + self.block_size) // self.block_size
         # 只看当前空闲块会高估容量：多个请求会同时消耗尚未兑现的增长空间，最后在 Decode
         # 中途耗尽块池。所以准入用预留额度判断；预算超过整层的请求在提交边界直接拒绝。
@@ -95,18 +89,23 @@ class Scheduler:
             request.stop_reason = "EOS"
 
     def _advance(self, request: Request, *, prefill: bool) -> None:
-        """G6-A 的逐请求路径：一个请求一次前向，Decode 走默认 V1 内核。"""
+        """推进一个 Prefill Chunk 或一次逐请求 Decode；中间块只更新 KV。"""
         start = request.caches[0].length
+        output_logits = True
         if prefill:
-            input_ids = request.input_ids
+            length = request.input_ids.shape[1]
+            end = min(start + (self.prefill_chunk_size or length), length)
+            input_ids = request.input_ids[:, start:end]
+            output_logits = end == length
         else:
             input_ids = request.input_ids.new_tensor([[request.output_ids[-1]]])
         positions = torch.arange(start, start + input_ids.shape[1], device=input_ids.device).unsqueeze(0)
         # Prefill 始终走 SDPA；Decode 用默认 V1 内核，与单请求生成路径完全相同。
         logits = model_forward(self.model, input_ids, positions, request.caches,
-                               is_prefill=prefill, cuda_decode=not prefill)
+                               is_prefill=prefill, cuda_decode=not prefill, output_logits=output_logits)
         # argmax 之后的 item() 是停止判断本身需要的同步，不属于"为检查而同步"。
-        self._commit(request, logits[0, 0].argmax().item())
+        if output_logits:
+            self._commit(request, logits[0, 0].argmax().item())
 
     def _decode_batch(self, group: list[Request]) -> None:
         """G6-B：一组请求的当前 Token 合成一次模型前向，各请求仍用自己的块表与位置。"""
@@ -130,7 +129,7 @@ class Scheduler:
         """
         sizes: list[int] = []
         if self.max_batch == 1:
-            for request in list(self.running):
+            for request in self.running:
                 self._advance(request, prefill=False)
                 sizes.append(1)
             return sizes
@@ -140,18 +139,15 @@ class Scheduler:
             sizes.append(len(group))
         return sizes
 
-    def _admit(self) -> Request | None:
-        """每轮最多接入队首一个请求；队首暂时装不下就整队等待，不跳过、也不抢占别人。"""
+    def _admit(self) -> None:
+        """接入队首到唯一 Prefill 槽位；预算不足时保留 FIFO 等待。"""
         if not self.waiting or self.reserved_blocks + self.waiting[0].budget_blocks > self.blocks_per_layer:
-            return None
+            return
         request = self.waiting.pop(0)
         self.reserved_blocks += request.budget_blocks
         request.caches = [PagedKVCache(storage) for storage in self.storages]
-        request.status = RUNNING
-        self.running.append(request)
-        # 新请求立即执行完整 Prefill 并取得首个 Token；停止条件可能在这一步就满足。
-        self._advance(request, prefill=True)
-        return request
+        request.status = PREFILLING
+        self.prefilling = request
 
     def _retire(self, request: Request) -> None:
         """唯一的释放点：归还全部层的块、扣回预留额度，并把请求移出活动集合。"""
@@ -162,7 +158,7 @@ class Scheduler:
         self.reserved_blocks -= request.budget_blocks
 
     def step(self) -> tuple[list[Request], list[int]]:
-        """一次调度轮次：活动请求各 Decode 一步 → 回收完成者 → 至多接入一个新请求。
+        """一次调度轮次：Decode → 回收 → 一个 Prefill Chunk。
 
         返回 (本轮完成的请求, 每批实际处理的请求数)。完成的请求只在这一刻交回调用方，
         调度器自己不留历史；结果需要留存的由调用方持有引用。
@@ -172,12 +168,20 @@ class Scheduler:
         for request in finished:
             self.running.remove(request)
             self._retire(request)
-        admitted = self._admit()
-        if admitted is not None and admitted.stop_reason:
-            # 首个 Token 就满足停止条件：直接完成，不强行让它进入 Decode。
-            self.running.remove(admitted)
-            self._retire(admitted)
-            finished.append(admitted)
+        if self.prefilling is None:
+            self._admit()
+        request = self.prefilling
+        if request is not None:
+            self._advance(request, prefill=True)
+            # 只有最后一块会选词；空输出意味着还在 Prefill，不得提前送入 Decode。
+            if request.output_ids:
+                self.prefilling = None
+                if request.stop_reason:
+                    self._retire(request)
+                    finished.append(request)
+                else:
+                    request.status = RUNNING
+                    self.running.append(request)
         return finished, sizes
 
 
@@ -315,7 +319,7 @@ def check_batched_operator(starts: tuple[int, ...] = (0, 16, 64)) -> None:
                                    key[0, :, start], rtol=0, atol=0)
         assert torch.isnan(storage._key[row[tail // block], :, tail % block]).all(), f"r{index} 多写了一格"
     print(f"[PASS] 批量算子对照：同组长度 {tuple(lengths)} 的数值、新写入位置与未写哨兵全部符合；"
-          "块表填充列用 -1，未被读到即断言失败")
+          "块表填充列用 -1，若被误读则断言失败")
 
 
 def main() -> None:
@@ -329,8 +333,8 @@ def main() -> None:
     base = prompts[0]
     check_batched(model, [base, base.repeat(1, 3), base.repeat(1, 6), prompts[1].repeat(1, 2), prompts[2]],
                   (3, 6, 4, 8, 2), 4)
-    print("[完成] 批量算子对照、G6-A 四组与 G6-B 批量三方一致通过；Prefill 仍是整段一次做完，"
-          "未覆盖 Chunked Prefill、CUDA Graph、取消与超时回收，也没有任何吞吐或延迟结论")
+    print("[完成] 整段 Prefill 模式的既有回归通过；分块检查请运行 ampere_kv.check_chunked；"
+          "未验证 CUDA Graph、取消与超时或性能")
 
 
 if __name__ == "__main__":

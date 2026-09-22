@@ -1,12 +1,6 @@
-"""G6-B 任务二：批量 Decode 收益与 Prefill 插入干扰两组受控基线；只做实验驱动与统计。
+"""受控基线：纯 Decode 吞吐、整段/分块 Prefill 干扰；合成输入与忽略 EOS 只用于计时。
 
-不新增 benchmark 基类、配置系统或自动报告框架；调度器只多了一个"忽略 EOS 以固定工作量"的
-开关，逐步计时全部由本文件在外部完成，普通生成路径不保存任何逐步历史。
-两组实验都在计时外完成 Prefill 与数据准备，计时包含模型前向、KV 追加、块表等元数据上传、
-选词与必要同步（都是调度器本来就要做的那些）。
-输出不作质量展示：Prompt 由短句重复拼接后截断到固定长度，EOS 被忽略只为固定工作量。
-口径红线：**不能把批量轮次耗时除以 B 冒充用户 TPOT**——那是吞吐折算，不是单个请求两次输出
-之间的等待时间。每轮墙钟才是间隔，每轮推进的请求数除以它才是吞吐。
+包含 KV 追加、元数据上传和参考读回；轮次耗时不是逐请求 Token 间隔，更不能除以 B 当作 TPOT。
 """
 
 import argparse
@@ -39,14 +33,13 @@ def make_prompts(tokenizer, batch: int, history: int) -> list[torch.Tensor]:
     return prompts
 
 
-def prepare(model, prompts, max_new: int, capacity: int, batch: int):
+def prepare(model, prompts, max_new: int, capacity: int, batch: int, scheduler_type=Scheduler):
     """计时外准备：提交全部请求并跑完各自的完整 Prefill（调度器每轮至多接入一个）。"""
-    scheduler = Scheduler(model, capacity, max_batch=batch)
-    requests = [scheduler.submit(f"r{index}", prompt, max_new, ignore_eos=True)
+    scheduler = scheduler_type(model, capacity, max_batch=batch)
+    # 依次准入时前面的请求已经 Decode；补偿这部分输出，计时开始后每条都剩 max_new-1 步。
+    requests = [scheduler.submit(f"r{index}", prompt, max_new + len(prompts) - 1 - index, ignore_eos=True)
                 for index, prompt in enumerate(prompts)]
     for _ in range(len(prompts)):
-        if not scheduler.waiting:
-            break
         scheduler.step()
     assert len(scheduler.running) == len(prompts) and not scheduler.waiting, "Prefill 没在计时外全部完成"
     return scheduler, requests
@@ -69,6 +62,7 @@ def check_batched_result(model, prompts, capacity: int, tokens: int = 5) -> None
     B 大于既有验收覆盖值时没有正确性证据，不能把"B=4 通过"外推过来。
     """
     batch = len(prompts)
+    tokens = max(tokens, batch + 1)  # 所有请求接入前不能已有请求退场，否则未真正验证该 B。
     scheduler = Scheduler(model, capacity, max_batch=batch)
     requests = [scheduler.submit(f"c{index}", prompt, tokens, ignore_eos=True)
                 for index, prompt in enumerate(prompts)]
@@ -89,8 +83,9 @@ def bench_decode(model, tokenizer, history: int, steps: int, repeats: int, batch
           "Prefill 全在计时外，计时含前向、KV 追加、元数据上传、选词与必要同步")
     for batch in batches:
         prompts = make_prompts(tokenizer, batch, history)
+        print(f"[实验A] B={batch}，计时起始各请求KV长度={[history + batch - 1 - i for i in range(batch)]}")
         max_new = steps + 1  # 首 Token 来自 Prefill，之后正好 steps 个纯 Decode 轮
-        capacity = sum(budget(history, max_new) for _ in prompts)
+        capacity = sum(budget(history, max_new + batch - 1 - i) for i in range(batch))
         if batch > 4:
             check_batched_result(model, prompts, capacity)
         # B=1 时逐条与批量是同一条内核调用路径，只测一次，不制造两条相同曲线。
@@ -100,6 +95,7 @@ def bench_decode(model, tokenizer, history: int, steps: int, repeats: int, batch
             for _ in range(repeats):
                 scheduler, _ = prepare(model, prompts, max_new, capacity, size)
                 walls, groups = timed_rounds(scheduler, steps)
+                assert all(sum(group) == batch for group in groups), "计时内有请求提前退出，工作量不固定"
                 medians.append(statistics.median(walls))
                 spreads.append(max(walls) - min(walls))
                 throughputs.append(sum(sum(group) for group in groups) / (sum(walls) / 1000))
@@ -109,52 +105,66 @@ def bench_decode(model, tokenizer, history: int, steps: int, repeats: int, batch
                   f"单次内轮间极差中位数={statistics.median(spreads):.3f}），"
                   f"实际批量={sorted(set(sizes_seen))}，吞吐中位数={statistics.median(throughputs):.1f} Token/s")
         if batch > 1:
-            print(f"[实验A] B={batch}：每轮墙钟即每个请求两次输出之间的间隔；"
-                  f"批量轮次 ÷ {batch} 只是吞吐折算，不是用户 TPOT")
+            print(f"[实验A] B={batch}：报告轮次墙钟；轮次 ÷ B 不是用户 TPOT")
+
+
+class TimedScheduler(Scheduler):
+    """仅实验使用：在 CPU 已拿到 Token 时记时，不给正常调度器增加逐步历史。"""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.ready = {}
+
+    def _commit(self, request, token):
+        now = time.perf_counter()
+        super()._commit(request, token)
+        self.ready.setdefault(request.request_id, []).append(now)
 
 
 def bench_insert(model, tokenizer, history: int, steps: int, insert_at: int,
-                 insert_histories: tuple[int, ...], repeats: int, active: int = 4) -> None:
-    """实验 B：固定 active 个请求在解码，第 insert_at 轮插入一个新请求做完整 Prefill。
-
-    测三件事：新请求从提交到首 Token 的墙钟（含等待）、原有请求插入前后的每轮间隔、
-    插入那一轮被拉长多少。容量按"提交后当轮即可接入"配好，所以这里测的是完整 Prefill 本身
-    的阻塞，不含排队；这是受控干扰实验，不是在线服务压测，样本少就报原始值与最大值。
-    """
+                 insert_histories: tuple[int, ...], repeats: int, active: int = 4,
+                 chunks: tuple[int, ...] = (0, 128)) -> None:
+    """同一负载配对比较整段/分块：原请求输出间隔、新请求 TTFT、全部请求完成时间。"""
     prompts = make_prompts(tokenizer, active, history)
     max_new = steps + 1
-    base_capacity = sum(budget(history, max_new) for _ in prompts)
+    base_capacity = sum(budget(history, max_new + active - 1 - i) for i in range(active))
     for insert_history in insert_histories:
         extra = make_prompts(tokenizer, 1, insert_history)[0]
         capacity = base_capacity + budget(insert_history, 8)
-        ttfts, baselines, stretched, overall = [], [], [], []
-        for _ in range(repeats):
-            scheduler, _ = prepare(model, prompts, max_new, capacity, active)
-            late = submitted = first_token = None
-            walls = []
-            for round_index in range(steps):
-                if round_index == insert_at:
-                    late = scheduler.submit("late", extra, 8, ignore_eos=True)
-                    submitted = time.perf_counter()
+        samples = {chunk: [] for chunk in chunks}
+        # 每种模式一轮预热；正式重复交替顺序，避免始终先测整段。
+        for run in range(-1, repeats):
+            for chunk in (chunks if run % 2 == 0 else chunks[::-1]):
+                scheduler, requests = prepare(model, prompts, max_new, capacity, active, TimedScheduler)
+                scheduler.prefill_chunk_size = chunk
+                for key in scheduler.ready:
+                    scheduler.ready[key] = scheduler.ready[key][-1:]
                 started = time.perf_counter()
-                scheduler.step()
-                now = time.perf_counter()
-                walls.append((now - started) * 1000)
-                if late is not None and first_token is None and late.output_ids:
-                    first_token = now
-            assert late is not None and late.output_ids, "插入的新请求没有被接入，容量或准入有问题"
-            ttfts.append((first_token - submitted) * 1000)
-            baselines.append(statistics.median(walls[:insert_at]))
-            stretched.append(max(walls[insert_at:]))
-            overall.append(statistics.median(walls))
-        print(f"[实验B] 活动={active}，历史={history}，插入轮={insert_at}/{steps}，新请求输入={insert_history} Token")
-        print(f"  首 Token 墙钟（提交到首 Token，含等待）={[round(v, 1) for v in ttfts]} ms，"
-              f"中位数={statistics.median(ttfts):.1f} ms")
-        print(f"  原有请求插入前每轮间隔中位数={[round(v, 2) for v in baselines]} ms；"
-              f"插入后最长一轮={[round(v, 1) for v in stretched]} ms")
-        print(f"  被拉长倍数={[round(s / b, 1) for s, b in zip(stretched, baselines)]}；"
-              f"整段每轮中位数={[round(v, 2) for v in overall]} ms")
-        print("  少量样本，只报原始值、中位数与最大值；未做 P99、SLO 或 Goodput 结论")
+                round_index = 0
+                while scheduler.running or scheduler.prefilling is not None or scheduler.waiting:
+                    if round_index == insert_at:
+                        submitted = time.perf_counter()
+                        scheduler.submit("late", extra, 8, ignore_eos=True)
+                    scheduler.step()
+                    round_index += 1
+                total = (time.perf_counter() - started) * 1000
+                before, after = [], []
+                for request in requests:
+                    ready = scheduler.ready[request.request_id]
+                    for left, right in zip(ready, ready[1:]):
+                        (after if right >= submitted else before).append((right - left) * 1000)
+                ttft = (scheduler.ready["late"][0] - submitted) * 1000
+                assert scheduler.reserved_blocks == 0
+                if run >= 0:
+                    samples[chunk].append((statistics.median(before), max(after), ttft, total))
+        print(f"[实验B] 活动={active}，历史={history}，插入轮={insert_at}，新请求输入={insert_history} Token")
+        for chunk, rows in samples.items():
+            print(f"  Chunk={chunk}（0=整段；后续块含分页读回与显式掩码）")
+            for index, name in enumerate(("插入前Token间隔中位数", "插入后最大Token间隔", "新请求TTFT", "全部请求完成时间")):
+                values = [row[index] for row in rows]
+                print(f"  {name}：{[round(v, 2) for v in values]} ms；中位数={statistics.median(values):.2f}，"
+                      f"极差={max(values) - min(values):.2f}")
+        print("  Token间隔按实际选词就绪时间计算；少量重复不代表 P99、SLO 或 Goodput")
 
 
 def revision() -> str:
@@ -176,11 +186,12 @@ def main() -> None:
     parser.add_argument("--insert-at", type=int, default=32, help="实验 B 在第几轮插入新请求")
     parser.add_argument("--insert-history", type=int, nargs="+", default=(512, 2048), help="实验 B 新请求输入长度")
     parser.add_argument("--only", choices=("decode", "insert"), help="只跑其中一组")
+    parser.add_argument("--chunks", type=int, nargs="+", default=(0, 128), help="实验 B 的固定块长，0 为整段")
     args = parser.parse_args()
-    if not torch.cuda.is_available():
-        raise RuntimeError("基线需要云端 CUDA GPU 与已编译扩展")
     if args.repeats < 1 or args.steps < 2 or not 0 < args.insert_at < args.steps:
         parser.error("--repeats/--steps 必须为正，--insert-at 必须在 1 到 --steps-1 之间")
+    if min(args.history, *args.batches, *args.insert_history) < 1 or min(args.chunks) < 0:
+        parser.error("输入长度与 Batch 必须为正，Chunk 不能为负")
     device = torch.cuda.get_device_properties(0)
     print(f"[环境] 设备={device.name}，显存={device.total_memory / 1024**3:.0f} GiB，"
           f"torch={torch.__version__}，代码版本={revision()}")
@@ -189,9 +200,9 @@ def main() -> None:
         bench_decode(model, tokenizer, args.history, args.steps, args.repeats, tuple(args.batches))
     if args.only in (None, "insert"):
         bench_insert(model, tokenizer, args.history, args.steps, args.insert_at,
-                     tuple(args.insert_history), args.repeats)
+                     tuple(args.insert_history), args.repeats, chunks=tuple(dict.fromkeys(args.chunks)))
     print("[完成] 两组基线只说明本次硬件与代码版本下的相对关系：不是请求级 SLO、不是多用户压测，"
-          "也不覆盖 INT8/V3 多请求、Chunked Prefill 或 CUDA Graph")
+          "也不覆盖 INT8/V3 多请求或 CUDA Graph")
 
 
 if __name__ == "__main__":

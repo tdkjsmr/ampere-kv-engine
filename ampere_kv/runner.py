@@ -7,7 +7,7 @@ import time
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
-from ampere_kv.kv_cache import ContiguousKVCache, prefill_attention, decode_attention
+from ampere_kv.kv_cache import ContiguousKVCache, prefill_attention, decode_attention, sdpa_attention
 from ampere_kv.paged_cache import PagedKVCache, PagedKVStorage
 # 模型与分词器共用固定版本；旧参考演示由本文件的 check 模式取代。
 MODEL_ID = "Qwen/Qwen3-8B"
@@ -103,11 +103,11 @@ def decoder_layer_forward(
     cache: ContiguousKVCache | PagedKVCache, config, *, is_prefill: bool, cuda_decode: bool = False,
     v3: bool = False,
 ) -> torch.Tensor:
-    """执行单请求、无填充的整段 Prefill 或单 Token Decode，返回本次隐藏状态。
+    """执行单请求、无填充的整段/分块 Prefill 或单 Token Decode，返回本次隐藏状态。
 
     调用方提供该层专用缓存并显式选择阶段；写入 RoPE 后的 K 和未旋转的 V。
     不加载模型、不打印结果、不调用 HF 层的 forward，也不进行参考对照。
-    不支持分块 Prefill；缓存写入后若计算失败，不自动回滚。
+    BF16 分块 Prefill 可回看历史；缓存写入后若计算失败，不自动回滚。
     cuda_decode 用于可选生成与对照，默认仍走 SDPA；当前 CUDA 分支不支持 Graph。
     v3 只换 Decode 内核版本（同组四个 Query 头共享一次 K/V 载入），Prefill 与写入路径不受影响。
     """
@@ -122,15 +122,12 @@ def decoder_layer_forward(
     fused_prefill = (is_prefill and isinstance(cache, PagedKVCache) and cache._key.is_cuda
                      and cache._key.shape[2] == 16 and cache._key.shape[3] == 128)
     if fused_prefill:
-        # 先批量写缓存，再用原始 BF16 K/V 做 SDPA；BF16 也不从分页存储读回历史。
-        # 写入是逐位搬运（INT8 为量化），Attention 输入、GQA 映射、掩码和 scale 都不变。
+        history = cache.length
         cache.append(key, value, fused=True)
-        group_size = query.shape[1] // key.shape[1]
-        head_output = torch.nn.functional.scaled_dot_product_attention(
-            query.contiguous(), key.repeat_interleave(group_size, dim=1).contiguous(),
-            value.repeat_interleave(group_size, dim=1).contiguous(),
-            dropout_p=0.0, is_causal=query.shape[2] > 1, scale=query.shape[-1] ** -0.5,
-        )
+        # 首块沿用原始 BF16 K/V；后续块读回包含本块的完整历史。读回成本属于分块参考路径。
+        if history:
+            key, value = cache.get()
+        head_output = sdpa_attention(query, key, value, history=history, causal=True)
     elif cuda_decode:
         # 按缓存类型选择Decode内核；融合写入在append内部按需导入同一扩展。
         from ampere_kv import _C
@@ -226,13 +223,16 @@ def model_forward_batched(model, token_ids: torch.Tensor, positions: torch.Tenso
 
 
 @torch.no_grad()
-def model_forward(model, input_ids, position_ids, caches, *, is_prefill: bool, cuda_decode: bool = False, v3: bool = False):
+def model_forward(model, input_ids, position_ids, caches, *, is_prefill: bool, cuda_decode: bool = False,
+                  v3: bool = False, output_logits: bool = True):
     """自建模型级前向：返回本次最后一个位置的 logits，并更新各层缓存。
 
     只读取 HF 对象持有的权重，不调用 HF 模型、层或输出头的 forward。
     不负责分词、选词、打印或对照；不提供缓存写入失败后的跨层回滚。
-    v3 只影响 Decode 内核版本，由 decoder_layer_forward 传给 CUDA 入口。
+    中间 Prefill 块只推进全部层 KV，output_logits=False 时不执行 Final Norm/LM Head。
     """
+    if is_prefill and caches[0].length and caches[0]._key.dtype == torch.int8:
+        raise ValueError("分块 Prefill 当前只支持 BF16 KV")
     layers = model.model.layers
     hidden_states = model.model.embed_tokens.weight[input_ids]
     for layer, cache in zip(layers, caches):
@@ -240,7 +240,7 @@ def model_forward(model, input_ids, position_ids, caches, *, is_prefill: bool, c
             hidden_states, layer, position_ids, cache, model.config, is_prefill=is_prefill, cuda_decode=cuda_decode, v3=v3,
         )
     # Prefill 和 Decode 共用末尾归一化与输出投影，不另写一套生成计算。
-    return final_logits(model, hidden_states)
+    return final_logits(model, hidden_states) if output_logits else None
 
 
 def final_logits(model, hidden_states):

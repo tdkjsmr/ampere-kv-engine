@@ -39,10 +39,10 @@ class ContiguousKVCache:
 def prefill_attention(
     query: torch.Tensor, key: torch.Tensor, value: torch.Tensor, cache,
 ) -> torch.Tensor:
-    """向空缓存写入整段 BF16 K/V，返回全部输入位置的因果 Attention 输出。
+    """追加整段或分块 Prefill，返回本段输入位置的因果 Attention 输出。
 
     BF16 缓存输出 BF16；INT8 分页缓存反量化后用 FP32 计算并输出，仅作参考。
-    不支持分块 Prefill 或填充输入；追加后若计算失败，不自动回滚缓存。
+    不支持填充输入；追加后若计算失败，不自动回滚缓存。
     """
     return _cached_attention(query, key, value, cache, is_causal=True)
 
@@ -56,7 +56,7 @@ def decode_attention(
 
     接受提供 length、append、get 的连续或分页缓存；无需继承公共基类。
     调用前必须已有历史，调用方不要提前追加当前 K/V；重复调用会重复追加。
-    输入检查在写入前完成；追加后若计算失败，不自动回滚缓存，不能盲目重试。
+    追加后若计算失败，不自动回滚缓存，不能盲目重试。
     这是推理参考计算，不包含 QKV 投影、位置编码、头合并或输出投影。
     """
     if cache.length == 0:
@@ -67,19 +67,28 @@ def decode_attention(
 @torch.no_grad()
 def _cached_attention(query, key, value, cache, *, is_causal: bool) -> torch.Tensor:
     """共用缓存写入、GQA 展开与 SDPA；Q/K/V 由调用方的模型前向产出，这里不再重复校验。"""
+    history = cache.length
     cache.append(key, value)
     cached_key, cached_value = cache.get()
-    # INT8 缓存的 get 已还原 FP32 历史，Query 同步转 FP32，避免精度混用。
-    compute_query = query.float() if cache._key.dtype == torch.int8 else query
-    compute_key, compute_value = cached_key, cached_value
+    return sdpa_attention(query, cached_key, cached_value, history=history, causal=is_causal)
+
+
+def sdpa_attention(query, key, value, *, history: int = 0, causal: bool = False):
+    """连续 K/V 的共用参考计算；有历史的 Prefill 使用绝对位置偏移掩码。"""
+    # INT8 参考读回是 FP32；普通 BF16 路径不改变精度。
+    query = query.to(key.dtype)
     group_size = query.shape[1] // key.shape[1]
     if group_size > 1:
-        # GQA 按 [KV0, KV0, KV1, KV1] 连续重复头；只是参考路径的临时副本，不改变缓存本体。
-        compute_key = compute_key.repeat_interleave(group_size, dim=1)
-        compute_value = compute_value.repeat_interleave(group_size, dim=1)
-    # Prefill 从空缓存开始，Q/K 等长，用下三角掩码；Decode 的 Q 只对应最后一个位置。
+        key = key.repeat_interleave(group_size, dim=1)
+        value = value.repeat_interleave(group_size, dim=1)
+    mask = None
+    if causal and history:
+        # SDPA 的 bool True 表示允许访问：本段第 i 个 Query 可见 j <= history+i。
+        q_position = history + torch.arange(query.shape[2], device=query.device)
+        k_position = torch.arange(key.shape[2], device=query.device)
+        mask = k_position[None, :] <= q_position[:, None]
     return torch.nn.functional.scaled_dot_product_attention(
-        compute_query.contiguous(), compute_key.contiguous(), compute_value.contiguous(),
-        dropout_p=0.0, is_causal=is_causal and query.shape[2] > 1,
+        query.contiguous(), key.contiguous(), value.contiguous(), attn_mask=mask,
+        dropout_p=0.0, is_causal=causal and mask is None and query.shape[2] > 1,
         scale=query.shape[-1] ** -0.5,
     )
