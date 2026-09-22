@@ -33,9 +33,13 @@ def make_prompts(tokenizer, batch: int, history: int) -> list[torch.Tensor]:
     return prompts
 
 
-def prepare(model, prompts, max_new: int, capacity: int, batch: int, scheduler_type=Scheduler):
-    """计时外准备：提交全部请求并跑完各自的完整 Prefill（调度器每轮至多接入一个）。"""
-    scheduler = scheduler_type(model, capacity, max_batch=batch)
+def prepare(model, prompts, max_new: int, capacity: int, batch: int, scheduler_type=Scheduler, **kwargs):
+    """计时外准备：提交全部请求并跑完各自的完整 Prefill（调度器每轮至多接入一个）。
+
+    `kwargs` 只用来透传构造开关（例如实验侧的 `mixed=True`）；块长由调用方在准备之后设置，
+    因为既有请求一律整段 Prefill。混合与分离在准备阶段的每轮 Decode 数相同，补偿公式不变。
+    """
+    scheduler = scheduler_type(model, capacity, max_batch=batch, **kwargs)
     # 依次准入时前面的请求已经 Decode；补偿这部分输出，计时开始后每条都剩 max_new-1 步。
     requests = [scheduler.submit(f"r{index}", prompt, max_new + len(prompts) - 1 - index, ignore_eos=True)
                 for index, prompt in enumerate(prompts)]
@@ -123,19 +127,25 @@ class TimedScheduler(Scheduler):
 
 def bench_insert(model, tokenizer, history: int, steps: int, insert_at: int,
                  insert_histories: tuple[int, ...], repeats: int, active: int = 4,
-                 chunks: tuple[int, ...] = (0, 128)) -> None:
-    """同一负载配对比较整段/分块：原请求输出间隔、新请求 TTFT、全部请求完成时间。"""
+                 chunks: tuple[int, ...] = (0, 128), executions: tuple[str, ...] = ("separate",)) -> None:
+    """同一负载配对比较整段/分块与分离/混合：原请求输出间隔、新请求 TTFT、全部请求完成时间。
+
+    `executions` 默认只有 `separate`，即原默认路径；加 `mixed` 时两组在同一进程内交替跑同一
+    负载。混合路径把一次块与本轮 Decode 合成一次前向，首个受影响的 Token 仍按真实取回时刻记录。
+    """
     prompts = make_prompts(tokenizer, active, history)
     max_new = steps + 1
     base_capacity = sum(budget(history, max_new + active - 1 - i) for i in range(active))
+    variants = [(chunk, execution) for chunk in chunks for execution in executions]
     for insert_history in insert_histories:
         extra = make_prompts(tokenizer, 1, insert_history)[0]
         capacity = base_capacity + budget(insert_history, 8)
-        samples = {chunk: [] for chunk in chunks}
-        # 每种模式一轮预热；正式重复交替顺序，避免始终先测整段。
+        samples = {variant: [] for variant in variants}
+        # 每种组合一轮预热；正式重复交替顺序，避免始终先测同一种。
         for run in range(-1, repeats):
-            for chunk in (chunks if run % 2 == 0 else chunks[::-1]):
-                scheduler, requests = prepare(model, prompts, max_new, capacity, active, TimedScheduler)
+            for chunk, execution in (variants if run % 2 == 0 else variants[::-1]):
+                scheduler, requests = prepare(model, prompts, max_new, capacity, active, TimedScheduler,
+                                              mixed=execution == "mixed")
                 scheduler.prefill_chunk_size = chunk
                 for key in scheduler.ready:
                     scheduler.ready[key] = scheduler.ready[key][-1:]
@@ -156,14 +166,19 @@ def bench_insert(model, tokenizer, history: int, steps: int, insert_at: int,
                 ttft = (scheduler.ready["late"][0] - submitted) * 1000
                 assert scheduler.reserved_blocks == 0
                 if run >= 0:
-                    samples[chunk].append((statistics.median(before), max(after), ttft, total))
+                    samples[(chunk, execution)].append(
+                        (statistics.median(before), max(after), ttft, total,
+                         scheduler.mixed_rounds, scheduler.fallback_rounds))
         print(f"[实验B] 活动={active}，历史={history}，插入轮={insert_at}，新请求输入={insert_history} Token")
-        for chunk, rows in samples.items():
-            print(f"  Chunk={chunk}（0=整段；后续块含分页读回与显式掩码）")
-            for index, name in enumerate(("插入前Token间隔中位数", "插入后最大Token间隔", "新请求TTFT", "全部请求完成时间")):
+        for (chunk, execution), rows in samples.items():
+            print(f"  execution={execution}，Chunk={chunk}（0=整段；后续块含分页读回与显式掩码）")
+            for index, name in enumerate(("插入前Token间隔中位数", "插入后最大Token间隔", "新请求TTFT",
+                                          "全部请求完成时间")):
                 values = [row[index] for row in rows]
                 print(f"  {name}：{[round(v, 2) for v in values]} ms；中位数={statistics.median(values):.2f}，"
                       f"极差={max(values) - min(values):.2f}")
+            print(f"  调度轮计数：混合轮={[row[4] for row in rows]}，回退轮={[row[5] for row in rows]}"
+                  "（混合轮数为 0 说明开关没生效，该组不能算混合结果）")
         print("  Token间隔按实际选词就绪时间计算；少量重复不代表 P99、SLO 或 Goodput")
 
 
@@ -284,6 +299,8 @@ def main() -> None:
     parser.add_argument("--chunks", type=int, nargs="+", default=(0, 128), help="实验 B 的固定块长，0 为整段")
     parser.add_argument("--pending-history", type=int, nargs="+", default=(0, 512),
                         help="实验 C 待插入请求在计时前已处理的 Token 数，0 表示测首块")
+    parser.add_argument("--mixed", action="store_true",
+                        help="实验 B 与分离路径在同一进程内配对测混合调度；默认只测分离，行为不变")
     args = parser.parse_args()
     if args.repeats < 1 or args.steps < 2 or not 0 < args.insert_at < args.steps:
         parser.error("--repeats/--steps 必须为正，--insert-at 必须在 1 到 --steps-1 之间")
@@ -294,6 +311,8 @@ def main() -> None:
     # 标定只认正块长：CLI 里的 chunk=0 表示整段 Prefill，不是"本轮不插块"，不能当候选混进矩阵。
     if args.only == "calibrate" and min(args.chunks) < 1:
         parser.error("标定矩阵的 --chunks 必须是正块长；整段对照请继续用 --only insert")
+    if args.mixed and args.only in ("decode", "calibrate"):
+        parser.error("--mixed 只作用于实验 B（insert）；纯 Decode 与标定矩阵没有混合路径")
     device = torch.cuda.get_device_properties(0)
     print(f"[环境] 设备={device.name}，显存={device.total_memory / 1024**3:.0f} GiB，"
           f"torch={torch.__version__}，代码版本={revision()}")
@@ -306,7 +325,8 @@ def main() -> None:
         bench_decode(model, tokenizer, args.history, args.steps, args.repeats, tuple(args.batches))
     if args.only in (None, "insert"):
         bench_insert(model, tokenizer, args.history, args.steps, args.insert_at,
-                     tuple(args.insert_history), args.repeats, chunks=tuple(dict.fromkeys(args.chunks)))
+                     tuple(args.insert_history), args.repeats, chunks=tuple(dict.fromkeys(args.chunks)),
+                     executions=("separate", "mixed") if args.mixed else ("separate",))
     print("[完成] 三组都只说明本次硬件与代码版本下的相对关系：不是请求级 SLO、不是多用户压测，"
           "也不覆盖 INT8/V3 多请求或 CUDA Graph")
 

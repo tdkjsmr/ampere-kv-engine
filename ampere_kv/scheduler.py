@@ -5,8 +5,8 @@ import time
 import torch
 
 from ampere_kv.paged_cache import PagedKVCache, PagedKVStorage
-from ampere_kv.runner import (PAGED_BLOCK_SIZE, encode_prompt, generate_tokens,
-                              load_model_and_tokenizer, model_forward, model_forward_batched)
+from ampere_kv.runner import (PAGED_BLOCK_SIZE, encode_prompt, generate_tokens, load_model_and_tokenizer,
+                              model_forward, model_forward_batched, model_forward_mixed)
 
 WAITING, PREFILLING, RUNNING, FINISHED = "waiting", "prefilling", "running", "finished"
 
@@ -42,7 +42,7 @@ class Scheduler:
     """
 
     def __init__(self, model, blocks_per_layer: int, *, block_size: int = PAGED_BLOCK_SIZE,
-                 device="cuda", max_batch: int = 1, prefill_chunk_size: int = 0):
+                 device="cuda", max_batch: int = 1, prefill_chunk_size: int = 0, mixed: bool = False):
         # 参数边界只查一次；0 保留整段 Prefill，正常前向不重复检查自身产生的状态。
         if max_batch < 1 or prefill_chunk_size < 0:
             raise ValueError("max_batch 必须为正，prefill_chunk_size 不能为负")
@@ -53,6 +53,11 @@ class Scheduler:
         # max_batch=1 时完全保持 G6-A 的逐请求路径；>1 才把一组请求的当前 Token 合成一次前向。
         self.max_batch = max_batch
         self.prefill_chunk_size = prefill_chunk_size
+        # mixed 默认关闭：已验证的分离路径不被默默替换，实验侧显式选择才走混合前向。
+        self.mixed = mixed
+        # 两个计数器只服务一件事：报告开关到底生效了几轮、回退了几轮，防止"没混合也报收益"。
+        self.mixed_rounds = 0
+        self.fallback_rounds = 0
         self.blocks_per_layer = blocks_per_layer
         # 每层一份共享物理张量与块池；请求接入时只新建块表，不再分配或复制张量。
         self.storages = [PagedKVStorage(config.num_key_value_heads, config.head_dim, blocks_per_layer,
@@ -155,6 +160,39 @@ class Scheduler:
             sizes.append(len(group))
         return sizes
 
+    def _mixed_round(self) -> int:
+        """混合轮：一组 Decode Token 与一个 Prefill 块合成一次逐 Token 前向，返回本批 Decode 数。
+
+        调用方已保证有 pending 且活动数不超过 `max_batch`。块长与"是不是最后一块"在前向之前
+        就定死：中间块不选词，末块才产出新请求的首 Token，所以新请求不会在同一轮又被 Decode。
+        本轮需要的 Token 一次取回——Decode 的就绪时间因此晚于整次混合计算，这是实测必须体现的成本。
+        """
+        group = self.running
+        pending = self.prefilling
+        decode_ids = torch.tensor([[request.output_ids[-1]] for request in group],
+                                  dtype=torch.long, device=self.device)
+        # 各请求的绝对位置来自自己的缓存长度，与打包进同一次前向的块 Token 无关。
+        decode_positions = torch.tensor([[request.caches[0].length] for request in group],
+                                        dtype=torch.long, device=self.device)
+        layer_caches = [[request.caches[layer] for request in group] for layer in range(len(self.storages))]
+        start = pending.caches[0].length
+        length = pending.input_ids.shape[1]
+        end = min(start + (self.prefill_chunk_size or length), length)
+        prefill_ids = pending.input_ids[:, start:end]
+        prefill_positions = torch.arange(start, end, device=self.device).unsqueeze(0)
+        final = end == length
+        decode_logits, prefill_logits = model_forward_mixed(
+            self.model, decode_ids, decode_positions, layer_caches,
+            prefill_ids, prefill_positions, pending.caches, output_prefill_logits=final)
+        picks = (decode_logits[:, 0] if prefill_logits is None
+                 else torch.cat((decode_logits[:, 0], prefill_logits[:, 0])))
+        tokens = picks.argmax(dim=-1).tolist()  # 一次同步取回 B 个（末块时 B+1 个）Token
+        for request, token in zip(group, tokens):
+            self._commit(request, token)
+        if final:
+            self._commit(pending, tokens[-1])
+        return len(group)
+
     def _admit(self) -> None:
         """接入队首到唯一 Prefill 槽位；预算不足时保留 FIFO 等待。"""
         if not self.waiting or self.reserved_blocks + self.waiting[0].budget_blocks > self.blocks_per_layer:
@@ -202,14 +240,25 @@ class Scheduler:
         request.status = FINISHED
 
     def step(self) -> tuple[list[Request], list[int]]:
-        """一次调度轮次：合作式停止检查 → Decode → 回收 → 一个 Prefill Chunk。
+        """一次调度轮次：合作式停止检查 → Decode（开关打开时可与一个 Prefill 块混合）→ 回收 → Prefill 推进。
 
         取消与到期只在轮次起点生效：不打断已经发出的 GPU 工作，也不加 `cuda.synchronize` 去
         模拟硬实时，所以轮内到期的请求可能多拿到本轮 Token——这是明示边界。返回的完成请求
         （本轮被停下的加上正常结束的）每轮只交回一次，调度器自己不留历史。
         """
         finished = self._stop_round(time.monotonic())
-        sizes = self._decode_round()
+        if self.mixed and self.prefilling is None:
+            # 混合模式在前向之前先试一次准入，块才能与本轮 Decode 合成一次前向；预算判断照旧，
+            # 本轮腾不出空间就只 Decode、下轮起点再准入，不透支尚未回收的块。
+            self._admit()
+        mixed = self.mixed and self.prefilling is not None and 0 < len(self.running) <= self.max_batch
+        if mixed:
+            self.mixed_rounds += 1
+            sizes = [self._mixed_round()]
+        else:
+            if self.mixed and self.prefilling is not None and self.running:
+                self.fallback_rounds += 1  # 活动数超过一批：本原型明确退回分离路径，不新建跨组策略
+            sizes = self._decode_round()
         for request in [r for r in self.running if r.stop_reason]:
             self.running.remove(request)
             self._retire(request)
@@ -217,17 +266,18 @@ class Scheduler:
         if self.prefilling is None:
             self._admit()
         request = self.prefilling
-        if request is not None:
+        if request is not None and not mixed:
             self._advance(request, prefill=True)
-            # 只有最后一块会选词；空输出意味着还在 Prefill，不得提前送入 Decode。
-            if request.output_ids:
-                self.prefilling = None
-                if request.stop_reason:
-                    self._retire(request)
-                    finished.append(request)
-                else:
-                    request.status = RUNNING
-                    self.running.append(request)
+        # 只有最后一块会选词；空输出意味着还在 Prefill，不得提前送入 Decode。
+        # 混合轮里末块已经在 `_mixed_round` 内算完，这里只做同一套收尾，不再推进第二次。
+        if request is not None and request.output_ids:
+            self.prefilling = None
+            if request.stop_reason:
+                self._retire(request)
+                finished.append(request)
+            else:
+                request.status = RUNNING
+                self.running.append(request)
         return finished, sizes
 
 

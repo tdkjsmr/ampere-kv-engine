@@ -1,4 +1,7 @@
-"""混合前向原型对照：不接调度器，不代表请求TTFT、SLO或完整独立生成通过。"""
+"""混合前向原型与调度接入对照：B 个 Decode Token 与一个 Prefill 块共用一次逐 Token 计算。
+
+独立前向、调度接入与有限负载配对三部分都在这里；不代表请求 TTFT、SLO 或完整独立生成通过。
+"""
 
 import argparse
 import statistics
@@ -10,7 +13,7 @@ from ampere_kv.bench_scheduler import make_prompts, revision
 from ampere_kv.paged_cache import PagedKVCache
 from ampere_kv.runner import (load_model_and_tokenizer, model_forward,
                               model_forward_batched, model_forward_mixed)
-from ampere_kv.scheduler import Scheduler
+from ampere_kv.scheduler import FINISHED, Scheduler
 
 
 def positions(ids, start):
@@ -114,6 +117,94 @@ def run_case(model, tokenizer, batch, history, chunks, *, alternate=False, last_
     return {name: sum(values) for name, values in timings.items()}
 
 
+@torch.inference_mode()
+def run_schedule(model, tokenizer, batch, chunk, *, mixed, max_batch=None, stop_after_mixed=None):
+    """真实调度跑一遍：返回每请求序列、实际 Decode 轮数、新请求首 Token 轮次与收尾账目。
+
+    既有请求用不同的生成上限，一次覆盖"中途正常完成"与"空位后新请求准入"两类分支；新请求
+    Prompt 为 `3*C+1`，所以混合轮既遇到中间块、也遇到 1 Token 末块。`stop_after_mixed` 在跑满
+    若干混合轮后取消正在 Prefill 的新请求，用来确认之后确实切回纯 Decode。
+    """
+    prompts = [make_prompts(tokenizer, 1, 33 + 11 * i)[0] for i in range(batch)]
+    limits = [4, 6, 3, 5, 2, 2, 2, 2][:batch]
+    pending = make_prompts(tokenizer, 1, 3 * chunk + 1)[0]
+    capacity = (sum((p.shape[1] + n + 15) // 16 for p, n in zip(prompts, limits))
+                + (pending.shape[1] + 8 + 15) // 16)
+    scheduler = Scheduler(model, capacity, max_batch=max_batch or batch, prefill_chunk_size=chunk, mixed=mixed)
+    requests = [scheduler.submit(f"r{index}", prompt, limit, ignore_eos=True)
+                for index, (prompt, limit) in enumerate(zip(prompts, limits))]
+    new = scheduler.submit("new", pending, 8, ignore_eos=True)
+    tracked = requests + [new]
+    decoded = {request.request_id: 0 for request in tracked}
+    mixed_flags, first = [], None
+    for rounds in range(64):
+        active = [request.request_id for request in scheduler.running]  # 本轮起点参与 Decode 的集合
+        was_mixed = scheduler.mixed_rounds
+        if (stop_after_mixed is not None and scheduler.mixed_rounds >= stop_after_mixed
+                and scheduler.prefilling is new and not new.stop_reason):
+            scheduler.cancel(new)  # 只在轮次边界取消，已发出的 GPU 工作不打断
+        scheduler.step()
+        for request_id in active:
+            decoded[request_id] += 1
+        mixed_flags.append(scheduler.mixed_rounds > was_mixed)
+        if first is None and new.output_ids:
+            first = rounds
+        if all(request.status == FINISHED for request in tracked):
+            break
+    else:
+        raise AssertionError(f"调度未在 64 轮内收尾：已 Decode {decoded}")
+    return {"seqs": [request.output_ids for request in requests], "new_seq": new.output_ids,
+            "decoded": decoded, "first": first, "limits": limits, "mixed_flags": mixed_flags,
+            "mixed_rounds": scheduler.mixed_rounds, "fallback_rounds": scheduler.fallback_rounds,
+            "reserved": scheduler.reserved_blocks, "capacity": capacity, "new_status": new.status,
+            "new_reason": new.stop_reason,
+            "free": all(storage._pool.num_free_blocks == capacity for storage in scheduler.storages)}
+
+
+def check_schedule(model, tokenizer, batch=4, chunk=16) -> None:
+    """混合与分离调度的同负载对照，外加"混合轮后取消"与"超过一批回退"两个小覆盖。
+
+    序列分歧先报告轮次与序列，不放宽容差也不删检查；`mixed` 与 `separate` 的差异来自打包形状
+    改变线性层执行形状，逐位相同从来不是前提，所以比的是每请求选词序列。
+    """
+    separate = run_schedule(model, tokenizer, batch, chunk, mixed=False)
+    mixed = run_schedule(model, tokenizer, batch, chunk, mixed=True)
+    assert separate["mixed_rounds"] == 0, f"默认路径混进了混合轮：{separate['mixed_rounds']}"
+    assert mixed["mixed_rounds"] > 0 and mixed["fallback_rounds"] == 0, f"混合开关没生效：{mixed}"
+    assert mixed["seqs"] == separate["seqs"] and mixed["new_seq"] == separate["new_seq"], (
+        f"选词分歧：旧请求混合={mixed['seqs']} 分离={separate['seqs']}；"
+        f"新请求混合={mixed['new_seq']} 分离={separate['new_seq']}；先定位轮次与 logits，不放宽检查")
+    assert mixed["decoded"] == separate["decoded"], (
+        f"实际 Decode 次数不一致：混合={mixed['decoded']}，分离={separate['decoded']}")
+    assert mixed["first"] == separate["first"], (
+        f"新请求首 Token 轮次不一致：混合={mixed['first']}，分离={separate['first']}")
+    for name, result in (("分离", separate), ("混合", mixed)):
+        assert result["reserved"] == 0 and result["free"], f"{name}收尾账目不对：{result}"
+        assert all(len(seq) == limit for seq, limit in zip(result["seqs"], result["limits"])), (
+            f"{name}路径没有请求按各自上限正常完成：{[len(s) for s in result['seqs']]}")
+    print(f"[PASS] 调度对照 B={batch} 块长={chunk}：混合 {mixed['mixed_rounds']} 轮、回退 0 轮，"
+          f"序列/Decode 次数/新请求首 Token 轮次({mixed['first']})与分离一致，"
+          f"额度归零、每层 {mixed['capacity']} 块全归还")
+    cancelled = run_schedule(model, tokenizer, batch, chunk, mixed=True, stop_after_mixed=1)
+    flags = cancelled["mixed_flags"]
+    assert cancelled["new_status"] == FINISHED and cancelled["new_reason"] == "已取消", f"{cancelled}"
+    assert cancelled["first"] is None and not cancelled["new_seq"], f"被取消的新请求仍选了词：{cancelled}"
+    assert any(flags) and not any(flags[flags.index(True) + 1:]), f"取消后没切回纯 Decode：{flags}"
+    assert all(len(seq) == limit for seq, limit in zip(cancelled["seqs"], cancelled["limits"])), (
+        f"取消新请求后邻座没继续到各自上限：{[len(s) for s in cancelled['seqs']]}")
+    assert cancelled["reserved"] == 0 and cancelled["free"], f"取消后收尾账目不对：{cancelled}"
+    print(f"[PASS] 混合轮后取消新请求：{flags.count(True)} 个混合轮后停止混合，新请求未选词即归还块，"
+          f"其余请求仍按各自上限完成")
+    fallback = run_schedule(model, tokenizer, 2, chunk, mixed=True, max_batch=1)
+    assert fallback["fallback_rounds"] > 0, f"没走到超过一批的回退分支：{fallback}"
+    assert all(len(seq) == limit for seq, limit in zip(fallback["seqs"], fallback["limits"])), (
+        f"回退轮里请求没跑完：{[len(s) for s in fallback['seqs']]}")
+    assert fallback["reserved"] == 0 and fallback["free"], f"回退收尾账目不对：{fallback}"
+    print(f"[PASS] 活动数超过一批时回退分离路径：B=2/max_batch=1 下 {fallback['fallback_rounds']} 轮回退"
+          f"（同场另有 {fallback['mixed_rounds']} 轮单请求混合），回退轮不算混合成功，"
+          f"请求仍各自跑满上限且块全归还")
+
+
 def main():
     parser = argparse.ArgumentParser(description="BF16混合前向独立原型验证")
     parser.add_argument("--benchmark", action="store_true", help="正确性通过后加测B4、C128中间块")
@@ -138,7 +229,9 @@ def main():
             for name in ("分离", "混合"):
                 values = [row[name] for row in rows]
                 print(f"[基线] H={history} {name}：样本={values} ms，中位数={statistics.median(values):.3f}")
-    print("[完成] 独立混合前向原型；未接调度器，非HF独立对照、自由生成或SLO验收")
+    check_schedule(model, tokenizer)
+    print("[完成] 独立混合前向 + 可选混合调度接入对照通过；未做 INT8、Graph 与自适应块长，"
+          "非自由生成或 SLO 验收")
 
 
 if __name__ == "__main__":
