@@ -167,6 +167,86 @@ def bench_insert(model, tokenizer, history: int, steps: int, insert_at: int,
         print("  Token间隔按实际选词就绪时间计算；少量重复不代表 P99、SLO 或 Goodput")
 
 
+def calibrate_sample(model, tokenizer, batch: int, history: int, processed: int | None, chunk: int):
+    """一个格子的一个样本：返回 (被撑长的输出间隔, 块所在轮墙钟, 下一轮墙钟)，单位 ms。
+
+    `processed` 是待插入请求在计时开始前已处理的 Token 数，None 表示这一格不插入任何 Prefill，
+    用来拿 Decode-only 对照。待插入 Prompt 长度恒为 `processed + chunk + 1`，所以计时窗口里跑的
+    那个块**永远不是最后一块**：值不含最终选词，不能当完整 TTFT。`processed=0` 走首块路径
+    （不读回历史），`>0` 走分页读回加显式偏移掩码那条路径，两类成本不同，必须分开记录。
+    """
+    prompts = make_prompts(tokenizer, batch, history)
+    max_new = 8  # 只要保证窗口里既有请求都不退场；输出本身不用于质量评价。
+    capacity = sum(budget(history, max_new + batch - 1 - i) for i in range(batch))
+    pending = None
+    if processed is not None:
+        total = processed + chunk + 1
+        pending = make_prompts(tokenizer, 1, total)[0]
+        capacity += budget(total, 8)  # 插入请求另占一份预算，否则块池容量被低估。
+    scheduler, requests = prepare(model, prompts, max_new, capacity, batch, TimedScheduler)
+    if pending is not None:
+        scheduler.submit("pending", pending, 8, ignore_eos=True)
+        if processed:
+            # 计时外把待插入请求推进恰好 processed 个 Token；它必须还留在 Prefill 槽位里，
+            # 否则下面测到的就是"最终块 + 选词"，不是中间块。
+            scheduler.prefill_chunk_size = processed
+            scheduler.step()
+            assert scheduler.prefilling is not None, "待插入请求已提前选词，测的不是中间块"
+    scheduler.prefill_chunk_size = chunk if processed is not None else 0
+    for key in scheduler.ready:
+        scheduler.ready[key] = scheduler.ready[key][-1:]  # 只留"上一 Token 就绪"作为窗口起点。
+    started = time.perf_counter()
+    scheduler.step()  # 轮 R：既有请求 Decode，随后才执行那个 C Token 中间块
+    block_wall = (time.perf_counter() - started) * 1000
+    started = time.perf_counter()
+    scheduler.step()  # 轮 R+1：step 是先 Decode 后 Prefill，块的影响体现在这一轮的间隔里
+    next_wall = (time.perf_counter() - started) * 1000
+    assert len(scheduler.running) == batch, "计时窗口内有请求退场，工作量不固定"
+    delay = max((scheduler.ready[request.request_id][-1] - scheduler.ready[request.request_id][-2]) * 1000
+                for request in requests)
+    return delay, block_wall, next_wall
+
+
+def bench_calibrate(model, tokenizer, batches: tuple[int, ...], history: int,
+                    processed_values: tuple[int, ...], chunks: tuple[int, ...], samples: int) -> None:
+    """G6-D1 筛查矩阵：每个 (B,H,C) 的中间块干扰，除以同 B/L 的 Decode-only 对照判可行性。
+
+    只报原始样本、中位数、最大值与极差，不称 P99/SLO/Goodput；1.25× 是实验阈值，不是线上保证。
+    """
+    cells = [(batch, None, 0) for batch in batches] + [
+        (batch, processed, chunk) for batch in batches for processed in processed_values for chunk in chunks]
+    found = {cell: [] for cell in cells}
+    print(f"[标定] 活动历史={history}，B={list(batches)}，H={list(processed_values)}，"
+          f"C={list(chunks)}，每格有效样本={samples}；另加一轮预热丢弃，块大小固定 16 Token")
+    print("[口径] 值取既有请求『上一 Token 就绪 → 下一 Token 就绪』的最大间隔；中间块在该轮 Decode 之后"
+          "执行，所以影响落在下一轮。待插入 Prompt 恒为 H+C+1，块永远是中间块，不含最终选词，不是 TTFT。")
+    for index in range(samples + 1):
+        offset = index % len(cells)  # 确定性轮换：每轮从不同格子起步，对照与候选同轮穿插
+        for cell in cells[offset:] + cells[:offset]:
+            batch, processed, chunk = cell
+            sample = calibrate_sample(model, tokenizer, batch, history, processed, chunk)
+            if index:
+                found[cell].append(sample)
+    for batch in batches:
+        control = found[(batch, None, 0)]
+        base = statistics.median(row[0] for row in control)
+        print(f"[标定] B={batch} Decode-only 对照：样本={[round(row[0], 2) for row in control]} ms，"
+              f"中位数={base:.2f}，实验预算 1.25×={base * 1.25:.2f}")
+        for processed in processed_values:
+            for chunk in chunks:
+                rows = found[(batch, processed, chunk)]
+                delays = [row[0] for row in rows]
+                median = statistics.median(delays)
+                print(f"[标定] B={batch} H={processed} C={chunk}：样本={[round(v, 2) for v in delays]} ms，"
+                      f"中位数={median:.2f}，最大={max(delays):.2f}，极差={max(delays) - min(delays):.2f}，"
+                      f"相对基线={median / base:.2f}× → "
+                      f"{'块长可行' if median <= base * 1.25 else '超预算'}"
+                      f"（轮墙钟中位数：块所在轮={statistics.median(row[1] for row in rows):.2f}，"
+                      f"下一轮={statistics.median(row[2] for row in rows):.2f} ms）")
+    print("[标定] 只给趋势与可行性：候选全部超预算时直接报告无可行块长，不增大系数、不换更松指标、"
+          "不拿最小块冒充满足；轮墙钟另列一栏，不替代实际间隔")
+
+
 def revision() -> str:
     """记录被测代码版本；取不到就写 unknown，不让基线因为环境问题跑不起来。"""
     try:
@@ -185,23 +265,34 @@ def main() -> None:
     parser.add_argument("--batches", type=int, nargs="+", default=(1, 2, 4, 8), help="实验 A 的活动请求数")
     parser.add_argument("--insert-at", type=int, default=32, help="实验 B 在第几轮插入新请求")
     parser.add_argument("--insert-history", type=int, nargs="+", default=(512, 2048), help="实验 B 新请求输入长度")
-    parser.add_argument("--only", choices=("decode", "insert"), help="只跑其中一组")
+    parser.add_argument("--only", choices=("decode", "insert", "calibrate"), help="只跑其中一组")
     parser.add_argument("--chunks", type=int, nargs="+", default=(0, 128), help="实验 B 的固定块长，0 为整段")
+    parser.add_argument("--pending-history", type=int, nargs="+", default=(0, 512),
+                        help="实验 C 待插入请求在计时前已处理的 Token 数，0 表示测首块")
     args = parser.parse_args()
     if args.repeats < 1 or args.steps < 2 or not 0 < args.insert_at < args.steps:
         parser.error("--repeats/--steps 必须为正，--insert-at 必须在 1 到 --steps-1 之间")
     if min(args.history, *args.batches, *args.insert_history) < 1 or min(args.chunks) < 0:
         parser.error("输入长度与 Batch 必须为正，Chunk 不能为负")
+    if min(args.pending_history) < 0:
+        parser.error("已处理 Token 数不能为负")
+    # 标定只认正块长：CLI 里的 chunk=0 表示整段 Prefill，不是"本轮不插块"，不能当候选混进矩阵。
+    if args.only == "calibrate" and min(args.chunks) < 1:
+        parser.error("标定矩阵的 --chunks 必须是正块长；整段对照请继续用 --only insert")
     device = torch.cuda.get_device_properties(0)
     print(f"[环境] 设备={device.name}，显存={device.total_memory / 1024**3:.0f} GiB，"
           f"torch={torch.__version__}，代码版本={revision()}")
     model, tokenizer = load_model_and_tokenizer()
+    if args.only == "calibrate":
+        bench_calibrate(model, tokenizer, tuple(dict.fromkeys(args.batches)), args.history,
+                        tuple(dict.fromkeys(args.pending_history)), tuple(dict.fromkeys(args.chunks)),
+                        args.repeats)
     if args.only in (None, "decode"):
         bench_decode(model, tokenizer, args.history, args.steps, args.repeats, tuple(args.batches))
     if args.only in (None, "insert"):
         bench_insert(model, tokenizer, args.history, args.steps, args.insert_at,
                      tuple(args.insert_history), args.repeats, chunks=tuple(dict.fromkeys(args.chunks)))
-    print("[完成] 两组基线只说明本次硬件与代码版本下的相对关系：不是请求级 SLO、不是多用户压测，"
+    print("[完成] 三组都只说明本次硬件与代码版本下的相对关系：不是请求级 SLO、不是多用户压测，"
           "也不覆盖 INT8/V3 多请求或 CUDA Graph")
 
 
