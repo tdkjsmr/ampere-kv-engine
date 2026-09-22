@@ -3,7 +3,7 @@
 import torch
 
 from ampere_kv.kv_cache import sdpa_attention
-from ampere_kv.paged_cache import PagedKVCache
+from ampere_kv.paged_cache import PagedKVCache, PagedKVStorage
 from ampere_kv.runner import encode_prompt, load_model_and_tokenizer, model_forward
 from ampere_kv.scheduler import FINISHED, Scheduler
 
@@ -25,6 +25,45 @@ def check_mask():
 
 
 @torch.inference_mode()
+def check_read_back():
+    """BF16 批量读回与 locate 逐位置参考逐位一致，并确认副本、非连续块序与部分尾块。
+
+    这是对"换一种索引写法"的等价性检查，不是新的测试框架：只覆盖分块 Prefill 真正依赖的
+    那条读回路径，INT8 分支本轮没改所以不在此处重复验证。
+    """
+    heads, size, dim, blocks = 2, 16, 128, 6
+    storage = PagedKVStorage(heads, dim, blocks, size, device="cuda")
+    storage._key.fill_(float("nan"))
+    storage._value.fill_(float("nan"))
+    cache = PagedKVCache(storage)
+    # 按分配顺序归还，让后取到的物理编号倒序：逻辑顺序 0,1,2 对应物理 4,3,2。
+    held = [storage._pool.allocate() for _ in range(5)]
+    for block in held:
+        storage._pool.free(block)
+    generator = torch.Generator(device="cuda").manual_seed(5)
+    key = torch.randn(1, heads, 33, dim, generator=generator, device="cuda").to(torch.bfloat16)
+    value = torch.randn(1, heads, 33, dim, generator=generator, device="cuda").to(torch.bfloat16)
+    try:
+        for start, end in ((0, 16), (16, 32), (32, 33)):  # 33 Token 只用掉最后一块的第 1 格
+            cache.append(key[:, :, start:end], value[:, :, start:end])
+        assert cache._table.block_ids == (4, 3, 2), "用例前提被破坏：块表不是非连续顺序"
+        read_key, read_value = cache.get()
+        slots = [cache._table.locate(position) for position in range(33)]
+        for got, source, original in ((read_key, storage._key, key), (read_value, storage._value, value)):
+            assert got.shape == (1, heads, 33, dim)
+            want = torch.stack([source[block, :, offset] for block, offset in slots], dim=1).unsqueeze(0)
+            torch.testing.assert_close(got, want, rtol=0, atol=0)      # 与 locate 定义逐位一致
+            torch.testing.assert_close(got, original, rtol=0, atol=0)  # 还原成逻辑顺序即输入顺序
+            before = source.clone()
+            got.fill_(0.0)                                            # 读回必须是独立副本
+            torch.testing.assert_close(source, before, rtol=0, atol=0, equal_nan=True)
+        tail_block, tail_offset = cache._table.locate(32)
+        assert torch.isnan(storage._key[tail_block, :, tail_offset + 1:]).all(), "尾块未写部分被写过"
+    finally:
+        cache.release()
+    print("[PASS] BF16 批量读回：非连续块表、部分尾块、独立副本与 locate 逐位置参考一致")
+
+
 def check_model(model, prompt, chunk=128):
     """整段/分块各自完成 Prefill 和短 Decode；logits 报误差，不预设跨形状逐位一致。"""
     length, new_tokens = prompt.shape[1], 8
@@ -96,6 +135,7 @@ def check_interleaved(model, prompt, expected, chunk=128):
 
 def main():
     check_mask()
+    check_read_back()          # 两条不加载模型的检查排在前面，失败时不必先等 16 GB 权重
     model, tokenizer = load_model_and_tokenizer()
     ids = encode_prompt(tokenizer, "用一句话解释 KV 缓存。")
     prompt = ids.repeat(1, (257 + ids.shape[1] - 1) // ids.shape[1])[:, :257]

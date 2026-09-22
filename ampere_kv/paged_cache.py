@@ -106,19 +106,31 @@ class PagedKVCache:
             shape = (1, self._key.shape[1], 0, self._key.shape[3])
             dtype = torch.float32 if self._key_scale is not None else torch.bfloat16
             return self._key.new_empty(shape, dtype=dtype), self._value.new_empty(shape, dtype=dtype)
+        if self._key_scale is None:
+            # BF16 批量读回：一次算出展平行号，K 与 V 共用，避免把块表上传两遍。
+            # 行号 = (物理块 · KV头 + 头) · 块大小 + 块内位；索引只由有效长度生成，所以尾块
+            # 未写部分取不到，物理块连不连续也无关。逐 Token 切片再 stack 会为一段历史造出
+            # 长度份视图和一次 L 路拼接拷贝，分块 Prefill 下每层每个张量都要付一遍。
+            blocks, heads, size = self._key.shape[:3]
+            positions = torch.arange(self.length, device=self._key.device)
+            physical = torch.tensor(self._table.block_ids, dtype=torch.long,
+                                    device=self._key.device)[positions // size]
+            head_range = torch.arange(heads, device=self._key.device)[:, None]
+            rows = ((physical[None, :] * heads + head_range) * size + (positions % size)[None, :]).reshape(-1)
+            return tuple(tensor.reshape(-1, tensor.shape[-1]).index_select(0, rows)
+                         .view(1, heads, self.length, -1) for tensor in (self._key, self._value))
+        # INT8 分支保持逐 Token 读回：本轮不同时改反量化的数值路径，留给有证据的单独一轮。
         slots = [self._table.locate(position) for position in range(self.length)]
 
         def gather(tensor):
             return torch.stack([tensor[block, :, offset, :] for block, offset in slots], dim=1).unsqueeze(0)
 
         key, value = gather(self._key), gather(self._value)
-        if self._key_scale is not None:
-            # 按相同顺序拆组反量化，再还原每个 Token 的 128 维；不展开 GQA 头。
-            grouped_key = key.reshape(1, key.shape[1], self.length * 4, 32)
-            scales = gather(self._key_scale).reshape(1, key.shape[1], self.length * 4, 1)
-            return (dequantize_kv(grouped_key, scales).reshape(key.shape),
-                    dequantize_kv(value, gather(self._value_scale)))
-        return key, value
+        # 按相同顺序拆组反量化，再还原每个 Token 的 128 维；不展开 GQA 头。
+        grouped_key = key.reshape(1, key.shape[1], self.length * 4, 32)
+        scales = gather(self._key_scale).reshape(1, key.shape[1], self.length * 4, 1)
+        return (dequantize_kv(grouped_key, scales).reshape(key.shape),
+                dequantize_kv(value, gather(self._value_scale)))
 
     def release(self) -> None:
         """归还请求占用的块；保留物理张量，不清零旧数据，不释放底层显存。"""
