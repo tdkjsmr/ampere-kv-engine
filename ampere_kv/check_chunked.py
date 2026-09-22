@@ -137,47 +137,55 @@ def check_interleaved(model, prompt, expected, chunk=128):
 def check_stop(model, long_prompt, short_prompt, chunk=64):
     """合作式取消与到期：三个活动容器各停一次，原因可区分，邻座序列与块归还都不受影响。
 
-    用例不 sleep：等待到期直接用"已经过去的时刻"，活动到期用"比一轮前向更早到期的时刻"——
-    一轮分块 Prefill 实测在百毫秒量级，50 ms 的截止必然在下一轮起点被看到，这正是合作式语义。
-    容量取"一条长请求 + 一条短请求"，让等待与被队首挡住必然出现，不依赖 Prompt 具体长度。
+    到期一律用"已经过去的时刻"制造，**绝不让用例依赖某一轮前向要花多少毫秒**：等待到期在提交时
+    给一个过去的时刻，活动到期在它被接入并推进一块之后才改期。容量取"一条长请求 + 一条短请求"，
+    让"等待"与"被队首挡住"必然出现，不依赖 Prompt 具体长度。
     """
     long_budget, short_budget = _budgets([long_prompt, short_prompt], (8, 4))
     capacity = long_budget + short_budget
     scheduler = Scheduler(model, capacity, max_batch=1, prefill_chunk_size=chunk)
+
+    def snapshot():
+        """断言失败时直接把三个容器和额度打出来；上一版只留一个裸 AssertionError，白烧一轮。"""
+        alive = scheduler.waiting + scheduler.running + [x for x in (scheduler.prefilling,) if x]
+        return (f"额度={scheduler.reserved_blocks} 容器="
+                f"{[(r.request_id, r.status, r.stop_reason or '-') for r in alive]}")
+
     prefilling = scheduler.submit("prefilling", long_prompt, 8)
     waiting = scheduler.submit("waiting", short_prompt, 4)
     waiting_expired = scheduler.submit("waiting_expired", short_prompt, 4, deadline=time.monotonic() - 1)
     stopped, _ = scheduler.step()  # 长请求接入并吃掉第一个 Chunk，两个短请求留在等待队列里。
-    assert stopped == [waiting_expired] and waiting_expired.stop_reason == "已超时"
+    assert stopped == [waiting_expired] and waiting_expired.stop_reason == "已超时", snapshot()
     assert waiting_expired.status == FINISHED and waiting_expired not in scheduler.waiting
-    assert scheduler.reserved_blocks == long_budget, "等待中到期的请求被扣了额度，或准入没记上额度"
+    assert scheduler.reserved_blocks == long_budget, f"准入未计额度或等待到期被误扣：{snapshot()}"
     held = set(prefilling.caches[0]._table.block_ids)
     scheduler.cancel(waiting)      # 等待中取消：从未计入预留额度，退休时不能扣。
     scheduler.cancel(prefilling)   # Prefill 中途取消：额度与已分配的块都要归还。
-    # 队首清空后新提交的活动请求会在本轮接入；它的截止落在下一轮起点之前。
-    active = scheduler.submit("active", long_prompt, 8, deadline=time.monotonic() + 0.05)
+    active = scheduler.submit("active", long_prompt, 8)  # 队首已空，本轮就会接入它。
     stopped, _ = scheduler.step()
-    assert [request.request_id for request in stopped] == ["waiting", "prefilling"]
+    assert [request.request_id for request in stopped] == ["waiting", "prefilling"], snapshot()
     assert waiting.status == FINISHED and not waiting.caches and waiting.stop_reason == "已取消"
     assert prefilling.stop_reason == "已取消"
     assert not prefilling.output_ids, "Prefill 中途被取消的请求不得已经选过词"
-    assert scheduler.reserved_blocks == long_budget, f"额度不对账：{scheduler.reserved_blocks}"
-    assert active.status == PREFILLING, "取消队首后没有接入下一个 FIFO 请求"
+    assert scheduler.reserved_blocks == long_budget, f"额度不对账：{snapshot()}"
+    assert active.status == PREFILLING, f"取消队首后没有接入下一个 FIFO 请求：{snapshot()}"
     assert set(active.caches[0]._table.block_ids) & held, "新请求没有复用到刚归还的块"
+    # 此刻 active 已在 Prefill 槽位里推进了一块，把截止改成已过去：下一轮起点必然看到它到期。
+    active.deadline = time.monotonic() - 1
     clean = scheduler.submit("clean", short_prompt, 4, ignore_eos=True)
     stopped, _ = scheduler.step()  # 活动请求到期；对照请求在同一轮起点接入并跑完单块 Prefill。
-    assert stopped == [active] and active.stop_reason == "已超时" and active.status == FINISHED
-    assert clean.status == RUNNING and len(clean.output_ids) == 1, "对照请求没被接入或提前多选了词"
-    assert scheduler.reserved_blocks == short_budget, f"到期未扣回额度或对照请求未计入：{scheduler.reserved_blocks}"
+    assert stopped == [active] and active.stop_reason == "已超时" and active.status == FINISHED, snapshot()
+    assert clean.status == RUNNING and len(clean.output_ids) == 1, f"对照请求没被接入或提前多选词：{snapshot()}"
+    assert scheduler.reserved_blocks == short_budget, f"到期未扣回额度或对照请求未计入：{snapshot()}"
     runner = scheduler.submit("runner", short_prompt, 4, ignore_eos=True)
     stopped, _ = scheduler.step()  # 对照请求解出第二个 Token，第二个短请求接入并完成 Prefill。
-    assert not stopped and clean in scheduler.running and runner in scheduler.running
-    assert scheduler.reserved_blocks == 2 * short_budget, f"两条活动请求的额度不对：{scheduler.reserved_blocks}"
+    assert not stopped and clean in scheduler.running and runner in scheduler.running, snapshot()
+    assert scheduler.reserved_blocks == 2 * short_budget, f"两条活动请求的额度不对：{snapshot()}"
     scheduler.cancel(runner)       # Decode 途中取消：从 running 摘掉，只交回一次。
     stopped, _ = scheduler.step()
-    assert stopped == [runner] and runner.status == FINISHED and runner.stop_reason == "已取消"
+    assert stopped == [runner] and runner.status == FINISHED and runner.stop_reason == "已取消", snapshot()
     assert runner not in scheduler.running and clean in scheduler.running
-    assert scheduler.reserved_blocks == short_budget, f"取消活动请求后额度不对：{scheduler.reserved_blocks}"
+    assert scheduler.reserved_blocks == short_budget, f"取消活动请求后额度不对：{snapshot()}"
     for _ in range(64):
         if clean.status == FINISHED:
             break
