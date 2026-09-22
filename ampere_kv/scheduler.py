@@ -24,12 +24,14 @@ class Request:
     `output_ids` 的最后一个。EOS 与达到上限都只写 `stop_reason`，不各建一套状态。
     """
 
-    def __init__(self, request_id: str, input_ids: torch.Tensor, max_new_tokens: int, budget_blocks: int):
+    def __init__(self, request_id: str, input_ids: torch.Tensor, max_new_tokens: int, budget_blocks: int,
+                 ignore_eos: bool = False):
         self.request_id = request_id
         self.input_ids = input_ids  # [1, P] CUDA int64；提交后不再修改。
         self.max_new_tokens = max_new_tokens
         # 调度器级预留额度，与"已分配块数""有效长度"是三回事，见 Scheduler.submit 的注释。
         self.budget_blocks = budget_blocks
+        self.ignore_eos = ignore_eos  # 只用于固定工作量的基线；正常生成仍遇 EOS 停止。
         self.status = WAITING
         self.caches: list[PagedKVCache] = []
         self.output_ids: list[int] = []
@@ -64,7 +66,8 @@ class Scheduler:
         eos = model.generation_config.eos_token_id
         self.eos_ids = {eos} if isinstance(eos, int) else set(eos or [])
 
-    def submit(self, request_id: str, input_ids: torch.Tensor, max_new_tokens: int) -> Request:
+    def submit(self, request_id: str, input_ids: torch.Tensor, max_new_tokens: int,
+               ignore_eos: bool = False) -> Request:
         """边界校验集中在提交时；内部模型调用不再重复检查自己产出的形状与设备。"""
         if input_ids.ndim != 2 or input_ids.shape[0] != 1 or input_ids.shape[1] == 0:
             raise ValueError("当前只支持单条非空 Token 序列")
@@ -79,7 +82,7 @@ class Scheduler:
         # 中途耗尽块池。所以准入用预留额度判断；预算超过整层的请求在提交边界直接拒绝。
         if need > self.blocks_per_layer:
             raise ValueError(f"单请求预算 {need} 块超过每层容量 {self.blocks_per_layer} 块")
-        request = Request(request_id, input_ids, max_new_tokens, need)
+        request = Request(request_id, input_ids, max_new_tokens, need, ignore_eos)
         self.waiting.append(request)
         return request
 
@@ -88,7 +91,7 @@ class Scheduler:
         request.output_ids.append(token)
         if len(request.output_ids) >= request.max_new_tokens:
             request.stop_reason = "达到生成上限"
-        elif token in self.eos_ids:
+        elif token in self.eos_ids and not request.ignore_eos:
             request.stop_reason = "EOS"
 
     def _advance(self, request: Request, *, prefill: bool) -> None:
