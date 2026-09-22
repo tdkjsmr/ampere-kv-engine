@@ -188,24 +188,65 @@ def decoder_layer_batched_forward(
     历史既不读回连续显存，也不跨请求拼接——这是"真批量"与"把 KV 摊平再算"的分界。
     本层只启动一次写入和一次注意力；块表与起点都留在设备端，宿主不在层内取标量。
     """
-    from ampere_kv import _C
-
     attention = layer.self_attn
     normalized = rms_norm(hidden_states, layer.input_layernorm.weight, layer.input_layernorm.variance_epsilon)
     query, key, value = project_qkv(normalized, attention)
     query, key = apply_rope(query, key, positions, config)
+    head_output = batched_decode_attention(query, key, value, caches)
+    return finish_decoder_layer(hidden_states, head_output, layer)
+
+
+def batched_decode_attention(query, key, value, caches):
+    """复用批量写入与 V1 Attention；输入是每请求一个 Token，不做模型投影。"""
+    from ampere_kv import _C
+
     shared_key, shared_value = caches[0]._key, caches[0]._value
     # 起点必须在登记新块之前取：reserve 之后 length 已含本步 Token，而写入位置仍是旧长度。
-    starts = torch.tensor([cache.length for cache in caches], dtype=torch.long, device=hidden_states.device)
+    starts = torch.tensor([cache.length for cache in caches], dtype=torch.long, device=query.device)
     rows = [cache.reserve(1) for cache in caches]
     width = max(len(row) for row in rows)
     # 块表按行定宽填充 0；内核只索引到各请求自己的有效长度，填充列不会被读到，
     # 越界情况由内核在读表之前的设备端断言拦截。
     table = torch.tensor([list(row) + [0] * (width - len(row)) for row in rows],
-                         dtype=torch.long, device=hidden_states.device)
+                         dtype=torch.long, device=query.device)
     _C.bf16_write_batched(key.contiguous(), value.contiguous(), shared_key, shared_value, table, starts)
-    head_output = _C.paged_decode_batched(query.contiguous(), shared_key, shared_value, table, starts)
-    return finish_decoder_layer(hidden_states, head_output, layer)
+    return _C.paged_decode_batched(query.contiguous(), shared_key, shared_value, table, starts)
+
+
+@torch.no_grad()
+def model_forward_mixed(model, decode_ids, decode_positions, layer_caches,
+                        prefill_ids, prefill_positions, prefill_caches, *, output_prefill_logits=False):
+    """最小 BF16 混合前向：B 个 Decode Token 加一个 C Token 块，共用逐 Token 计算。
+
+    打包后是[1,B+C,D]，不是同一请求：Attention必须拆开，位置与KV仍各自独立。
+    layer_caches按层/请求排列，与批量Decode相同；调用方保证共享BF16池与有效输入。
+    只返回B个Decode logits，以及可选的块末logits；中间块不能选首Token。
+    """
+    batch = decode_ids.shape[0]
+    ids = torch.cat((decode_ids.reshape(1, batch), prefill_ids), dim=1)
+    positions = torch.cat((decode_positions.reshape(1, batch), prefill_positions), dim=1)
+    hidden = model.model.embed_tokens.weight[ids]
+    for layer, caches, prefill_cache in zip(model.model.layers, layer_caches, prefill_caches):
+        norm = layer.input_layernorm
+        normalized = rms_norm(hidden, norm.weight, norm.variance_epsilon)
+        query, key, value = project_qkv(normalized, layer.self_attn)
+        query, key = apply_rope(query, key, positions, model.config)
+        # 前B个位置改成[B,头,1,维]供既有批量内核使用；绝不把它们当一条长历史。
+        dq, dk, dv = (tensor[:, :, :batch].permute(2, 1, 0, 3) for tensor in (query, key, value))
+        decoded = batched_decode_attention(dq, dk, dv, caches).permute(2, 1, 0, 3)
+        pq, pk, pv = (tensor[:, :, batch:] for tensor in (query, key, value))
+        history = prefill_cache.length
+        prefill_cache.append(pk, pv, fused=True)
+        if history:
+            pk, pv = prefill_cache.get()
+        prefilled = sdpa_attention(pq, pk, pv, history=history, causal=True)
+        # Attention仍分开执行；合并的是输出投影、残差与MLP，不修改注意力数学。
+        hidden = finish_decoder_layer(hidden, torch.cat((decoded, prefilled), dim=2), layer)
+    selected = hidden[:, :batch]
+    if output_prefill_logits:
+        selected = torch.cat((selected, hidden[:, -1:]), dim=1)
+    logits = final_logits(model, selected.transpose(0, 1))
+    return logits[:batch], logits[batch:] if output_prefill_logits else None
 
 
 @torch.no_grad()
