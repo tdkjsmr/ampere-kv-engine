@@ -1,11 +1,13 @@
-"""固定 Chunk 验收：偏移掩码、真实模型对照和交错调度；不在生产热路径放检查。"""
+"""固定 Chunk 验收：偏移掩码、批量读回等价、真实模型对照、交错调度与合作式取消/到期。"""
+
+import time
 
 import torch
 
 from ampere_kv.kv_cache import sdpa_attention
 from ampere_kv.paged_cache import PagedKVCache, PagedKVStorage
-from ampere_kv.runner import encode_prompt, load_model_and_tokenizer, model_forward
-from ampere_kv.scheduler import FINISHED, Scheduler
+from ampere_kv.runner import encode_prompt, load_model_and_tokenizer, model_forward, generate_tokens
+from ampere_kv.scheduler import FINISHED, PREFILLING, RUNNING, Scheduler, _budgets
 
 
 def check_mask():
@@ -125,12 +127,75 @@ def check_interleaved(model, prompt, expected, chunk=128):
         scheduler.step()
     assert long.status == short.status == FINISHED and long.output_ids == expected
     # 短请求也对独立运行，防止只检查推进数量而漏掉跨请求混写。
-    from ampere_kv.runner import generate_tokens
     assert short.output_ids == generate_tokens(model, prompt[:, :17], max_new_tokens=8,
                                                cache_kind="paged", cuda_decode=True, ignore_eos=True)
     assert scheduler.reserved_blocks == 0
     assert all(storage._pool.num_free_blocks == 32 for storage in scheduler.storages)
     print("[PASS] 分块期间 Decode 持续推进、未提前选词、交错序列与独立一致，全部块归还")
+
+
+def check_stop(model, long_prompt, short_prompt, chunk=64):
+    """合作式取消与到期：三个活动容器各停一次，原因可区分，邻座序列与块归还都不受影响。
+
+    用例不 sleep：等待到期直接用"已经过去的时刻"，活动到期用"比一轮前向更早到期的时刻"——
+    一轮分块 Prefill 实测在百毫秒量级，50 ms 的截止必然在下一轮起点被看到，这正是合作式语义。
+    容量取"一条长请求 + 一条短请求"，让等待与被队首挡住必然出现，不依赖 Prompt 具体长度。
+    """
+    long_budget, short_budget = _budgets([long_prompt, short_prompt], (8, 4))
+    capacity = long_budget + short_budget
+    scheduler = Scheduler(model, capacity, max_batch=1, prefill_chunk_size=chunk)
+    prefilling = scheduler.submit("prefilling", long_prompt, 8)
+    waiting = scheduler.submit("waiting", short_prompt, 4)
+    waiting_expired = scheduler.submit("waiting_expired", short_prompt, 4, deadline=time.monotonic() - 1)
+    stopped, _ = scheduler.step()  # 长请求接入并吃掉第一个 Chunk，两个短请求留在等待队列里。
+    assert stopped == [waiting_expired] and waiting_expired.stop_reason == "已超时"
+    assert waiting_expired.status == FINISHED and waiting_expired not in scheduler.waiting
+    assert scheduler.reserved_blocks == long_budget, "等待中到期的请求被扣了额度，或准入没记上额度"
+    held = set(prefilling.caches[0]._table.block_ids)
+    scheduler.cancel(waiting)      # 等待中取消：从未计入预留额度，退休时不能扣。
+    scheduler.cancel(prefilling)   # Prefill 中途取消：额度与已分配的块都要归还。
+    # 队首清空后新提交的活动请求会在本轮接入；它的截止落在下一轮起点之前。
+    active = scheduler.submit("active", long_prompt, 8, deadline=time.monotonic() + 0.05)
+    stopped, _ = scheduler.step()
+    assert [request.request_id for request in stopped] == ["waiting", "prefilling"]
+    assert waiting.status == FINISHED and not waiting.caches and waiting.stop_reason == "已取消"
+    assert prefilling.stop_reason == "已取消"
+    assert not prefilling.output_ids, "Prefill 中途被取消的请求不得已经选过词"
+    assert scheduler.reserved_blocks == long_budget, f"额度不对账：{scheduler.reserved_blocks}"
+    assert active.status == PREFILLING, "取消队首后没有接入下一个 FIFO 请求"
+    assert set(active.caches[0]._table.block_ids) & held, "新请求没有复用到刚归还的块"
+    clean = scheduler.submit("clean", short_prompt, 4, ignore_eos=True)
+    stopped, _ = scheduler.step()  # 活动请求到期；对照请求在同一轮起点接入并跑完单块 Prefill。
+    assert stopped == [active] and active.stop_reason == "已超时" and active.status == FINISHED
+    assert clean.status == RUNNING and len(clean.output_ids) == 1, "对照请求没被接入或提前多选了词"
+    assert scheduler.reserved_blocks == short_budget, f"到期未扣回额度或对照请求未计入：{scheduler.reserved_blocks}"
+    runner = scheduler.submit("runner", short_prompt, 4, ignore_eos=True)
+    stopped, _ = scheduler.step()  # 对照请求解出第二个 Token，第二个短请求接入并完成 Prefill。
+    assert not stopped and clean in scheduler.running and runner in scheduler.running
+    assert scheduler.reserved_blocks == 2 * short_budget, f"两条活动请求的额度不对：{scheduler.reserved_blocks}"
+    scheduler.cancel(runner)       # Decode 途中取消：从 running 摘掉，只交回一次。
+    stopped, _ = scheduler.step()
+    assert stopped == [runner] and runner.status == FINISHED and runner.stop_reason == "已取消"
+    assert runner not in scheduler.running and clean in scheduler.running
+    assert scheduler.reserved_blocks == short_budget, f"取消活动请求后额度不对：{scheduler.reserved_blocks}"
+    for _ in range(64):
+        if clean.status == FINISHED:
+            break
+        scheduler.step()
+    else:
+        raise AssertionError("对照请求没能收尾；检查取消是否留下了占着额度的残留")
+    # 对照请求与单独运行同一路径：证明取消/到期只摘掉自己，没有污染邻居的 KV 或位置。
+    alone = generate_tokens(model, short_prompt, max_new_tokens=4, cache_kind="paged",
+                            cuda_decode=True, ignore_eos=True)
+    assert clean.output_ids == alone, f"邻座序列被取消动作影响：{clean.output_ids} != {alone}"
+    assert clean.stop_reason == "达到生成上限", f"正常结束与取消/超时原因不可区分：{clean.stop_reason}"
+    for request in (waiting, waiting_expired, prefilling, active, runner, clean):
+        scheduler.cancel(request)  # 重复取消已完成对象必须无作用：不重复扣额度、不重复归还。
+    scheduler.step()
+    assert scheduler.reserved_blocks == 0 and not scheduler.waiting and not scheduler.running
+    assert all(storage._pool.num_free_blocks == capacity for storage in scheduler.storages)
+    print(f"[PASS] 合作式取消/到期：等待、Prefill、Decode 三处各停一次，到期不覆盖取消原因，"
+          f"复用归还块，邻座序列与单独运行一致，收尾额度 0 且每层 {capacity} 块全部归还")
 
 
 def main():
@@ -142,7 +207,10 @@ def main():
     print("[配置] BF16/V1；输入257 Token，Chunk=128，尾块1 Token")
     expected = check_model(model, prompt)
     check_interleaved(model, prompt, expected)
-    print("[完成] 固定 Chunk 语义与调度验收；未验证取消、超时、SLO、Graph 或性能")
+    print("[配置] 合作式停止用例：长请求 257 Token 按 Chunk=64 分块，短请求单独一条作对照")
+    check_stop(model, prompt, ids)
+    print("[完成] 固定 Chunk 语义、交错调度与合作式取消/到期通过；"
+          "未验证抢占、SLO/P99、CUDA Graph 或性能")
 
 
 if __name__ == "__main__":

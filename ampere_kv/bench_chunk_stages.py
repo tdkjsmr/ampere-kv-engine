@@ -1,9 +1,17 @@
-"""阶段归因：分块 Prefill 每块的读回/展开/掩码/SDPA 耗时配对；不加载模型权重。
+"""分块 Prefill 的逐块耗时探针：配对测读回、GQA 展开、掩码和整次 Attention 调用；不加载模型权重。
 
-真实形状、不接常驻路径，也不参与验收：只回答"每个块多付的那笔开销落在哪一段"。
+真实形状、不接常驻路径，也不参与验收：只回答"每个块额外付了哪几笔毫秒"，不回答"分块总共慢在哪"。
 新旧两种读回写法在**同一次运行、同一份数据**上配对测量，避免跨轮次比较。
 每段用 CUDA Event 包住并在测量后 synchronize，免得把异步派发的返回时间当成 GPU 完成时间。
-"×36 层"只是线性外推，不是端到端实测；端到端仍以 bench_scheduler 为准。
+
+口径（读数字前必看）：
+- 列**不可相加**：`SDPA整调用*` 是完整的 `sdpa_attention()`，内部已经包含展开、掩码构造和
+  `contiguous()`，与 `GQA展开`、`掩码` 两列重叠；它们只能逐列横向比较新旧或有无掩码。
+- `SDPA整调用无偏移掩码` 那一列仍走同一条包装调用（`history=0` 时由 `is_causal=True` 承担因果，
+  按左上角对齐），不是"去掉因果约束的裸 SDPA"；它与带掩码列的差值混着后端选择，不是纯掩码开销。
+- 四块都调 `get()`，而生产首块 `history=0` 直接用本段 K/V、不读回，所以块1 的读回列在真实前向里不存在。
+- "×36 层"是线性外推：不含投影、MLP、归一化与写入内核，也不含同步与宿主派发造成的 GPU 空闲；
+  分段 Event 区间与模型级墙钟不是同一口径，不能互加减。端到端仍以 bench_scheduler 为准。
 """
 
 import statistics
@@ -17,7 +25,8 @@ from ampere_kv.paged_cache import PagedKVCache, PagedKVStorage
 HEADS, Q_HEADS, DIM, SIZE, CHUNK, BLOCKS = 8, 32, 128, 16, 128, 4
 GROUP = Q_HEADS // HEADS
 REPEATS = 7
-STAGES = ("读回新", "读回旧", "GQA展开", "掩码", "SDPA带掩码", "SDPA无掩码", "块表上传")
+# 标签写死重叠关系：整调用两列包含展开与掩码，不与前面两列构成互斥分解。
+STAGES = ("读回新", "读回旧", "GQA展开", "掩码", "SDPA整调用带掩码", "SDPA整调用无偏移掩码", "块表上传")
 
 
 def timed(function):
@@ -37,7 +46,10 @@ def timed(function):
 
 
 def old_read_back(cache, tensor):
-    """改动前的写法：逐 Token 切片再 stack，用来在同一份数据上与新实现配对比较。"""
+    """改动前的写法：逐 Token 取块内位置切片再 `stack`，与当前实现配对比较。
+
+    切片本身通常只是视图，主要开销在 K 与 V 各一次 L 路拼接；绝对毫秒含逐次同步，只用于横向比较斜率。
+    """
     slots = [cache._table.locate(position) for position in range(cache.length)]
     return torch.stack([tensor[block, :, offset, :] for block, offset in slots], dim=1).unsqueeze(0)
 
@@ -48,7 +60,7 @@ def main():
           f"torch={torch.__version__}，代码版本={revision()}")
     print(f"[形状] KV头={HEADS}，Query头={Q_HEADS}，维度={DIM}，块={SIZE}，Chunk={CHUNK}，"
           f"块数={BLOCKS}，重复={REPEATS}")
-    # 先填满整个池再逐块读回，令每块的偏移与 bench_insert 的 512 Token 新请求一致。
+    # 逐块追加、每块测"到此为止"的整段历史：形状与偏移对齐 bench_insert 的 512 Token 新请求。
     storage = PagedKVStorage(HEADS, DIM, CHUNK * BLOCKS // SIZE, SIZE, device="cuda")
     cache = PagedKVCache(storage)
     generator = torch.Generator(device="cuda").manual_seed(0)
@@ -63,6 +75,7 @@ def main():
             cache.append(key[:, :, history:history + CHUNK].contiguous(),
                          value[:, :, history:history + CHUNK].contiguous(), fused=True)
             # 读回含本块，长度即 cache.length；掩码偏移是 history，与 decoder_layer_forward 一致。
+            # 生产首块 history=0 时不读回、直接用本段 K/V，所以块1 这一行给出的是探针值而非生产成本。
             new_ms, new_spread = timed(lambda: cache.get())
             old_ms, old_spread = timed(lambda: (old_read_back(cache, storage._key),
                                                 old_read_back(cache, storage._value)))
@@ -75,7 +88,7 @@ def main():
                                    <= (history + torch.arange(CHUNK, device="cuda"))[:, None])
             masked_ms, _ = timed(lambda: sdpa_attention(query, read_key, read_value,
                                                         history=history, causal=True))
-            # 同形状去掉偏移掩码：语义不成立（torch 的 is_causal 按左上角对齐），只观察后端选择差异。
+            # 同一包装调用去掉偏移掩码：仍由 is_causal 承担因果（按左上角对齐），差值里混着后端选择。
             plain_ms, _ = timed(lambda: sdpa_attention(query, read_key, read_value, history=0, causal=True))
             table_ms, _ = timed(lambda: torch.tensor(cache._table.block_ids, dtype=torch.long, device="cuda"))
             values = (new_ms, old_ms, expand_ms, mask_ms, masked_ms, plain_ms, table_ms)
@@ -83,13 +96,14 @@ def main():
                 totals[name] += ms
             print(f"[块{block + 1}] 偏移={history} 长度={cache.length}："
                   f"读回新={new_ms:.2f}（极差{new_spread:.2f}）vs 旧={old_ms:.2f}（极差{old_spread:.2f}），"
-                  f"GQA展开={expand_ms:.2f}，掩码={mask_ms:.2f}，SDPA带掩码={masked_ms:.2f}，"
-                  f"SDPA无掩码={plain_ms:.2f}，块表上传={table_ms:.2f}（单位 ms）")
+                  f"GQA展开={expand_ms:.2f}，掩码={mask_ms:.2f}，SDPA整调用带掩码={masked_ms:.2f}，"
+                  f"SDPA整调用无偏移掩码={plain_ms:.2f}，块表上传={table_ms:.2f}（单位 ms，整调用两列含展开与掩码）")
     finally:
         cache.release()
     print("[合计] " + "，".join(f"{name}={ms:.2f} ms" for name, ms in totals.items()))
-    print("[边界] 每层毫秒数 ×36 是线性外推，不含投影/MLP/归一化与写入内核；SDPA无掩码只是后端对照列，"
-          "不是可用实现；端到端仍以 bench_scheduler --only insert 为准。")
+    print("[边界] 整调用两列包含展开与掩码，与其他列重叠，任何一列都不能相加当总账；×36 是线性外推，"
+          "不含投影/MLP/归一化与写入内核，也不含同步与派发留出的 GPU 空闲；块1 的读回列在真实前向里不存在；"
+          "端到端仍以 bench_scheduler --only insert 为准。")
 
 
 if __name__ == "__main__":
