@@ -190,20 +190,33 @@ def calibrate_sample(model, tokenizer, batch: int, history: int, processed: int 
             # 计时外把待插入请求推进恰好 processed 个 Token；它必须还留在 Prefill 槽位里，
             # 否则下面测到的就是"最终块 + 选词"，不是中间块。
             scheduler.prefill_chunk_size = processed
-            scheduler.step()
+            scheduler._admit()
+            scheduler._advance(scheduler.prefilling, prefill=True)
             assert scheduler.prefilling is not None, "待插入请求已提前选词，测的不是中间块"
     scheduler.prefill_chunk_size = chunk if processed is not None else 0
     for key in scheduler.ready:
         scheduler.ready[key] = scheduler.ready[key][-1:]  # 只留"上一 Token 就绪"作为窗口起点。
     started = time.perf_counter()
     scheduler.step()  # 轮 R：既有请求 Decode，随后才执行那个 C Token 中间块
+    # 中间块不选词，此处可能尚未执行完；两列墙钟只描述宿主调用，不是各阶段GPU耗时。
     block_wall = (time.perf_counter() - started) * 1000
     started = time.perf_counter()
-    scheduler.step()  # 轮 R+1：step 是先 Decode 后 Prefill，块的影响体现在这一轮的间隔里
+    # 只推进下一轮既有请求的 Decode：完整 step 会再处理 pending 的末尾1个Token，
+    # 让它选词并进入 running（B变B+1），还把第二次Prefill混进下一轮墙钟。
+    sizes = scheduler._decode_round()
     next_wall = (time.perf_counter() - started) * 1000
-    assert len(scheduler.running) == batch, "计时窗口内有请求退场，工作量不固定"
+    assert sum(sizes) == batch and scheduler.running == requests, "计时窗口内既有请求集合或工作量改变"
+    if pending is not None:
+        assert scheduler.prefilling.caches[0].length == processed + chunk
+        assert not scheduler.prefilling.output_ids, "中间块不应产生首Token"
     delay = max((scheduler.ready[request.request_id][-1] - scheduler.ready[request.request_id][-2]) * 1000
                 for request in requests)
+    # 样本结束才回收，不能为清理再跑一次step，改变刚测量的工作量。
+    for request in requests + ([scheduler.prefilling] if scheduler.prefilling is not None else []):
+        scheduler._retire(request)
+    scheduler.running.clear()
+    scheduler.prefilling = None
+    assert scheduler.reserved_blocks == 0
     return delay, block_wall, next_wall
 
 
@@ -220,6 +233,8 @@ def bench_calibrate(model, tokenizer, batches: tuple[int, ...], history: int,
           f"C={list(chunks)}，每格有效样本={samples}；另加一轮预热丢弃，块大小固定 16 Token")
     print("[口径] 值取既有请求『上一 Token 就绪 → 下一 Token 就绪』的最大间隔；中间块在该轮 Decode 之后"
           "执行，所以影响落在下一轮。待插入 Prompt 恒为 H+C+1，块永远是中间块，不含最终选词，不是 TTFT。")
+    print("[配对] H>0只预填插入请求，不推进旧请求；活动请求准备后的KV长度为L+B-1-i（i从0起），"
+          "同B的对照与候选一致；下一轮只测Decode，不执行插入请求的末尾块。")
     for index in range(samples + 1):
         offset = index % len(cells)  # 确定性轮换：每轮从不同格子起步，对照与候选同轮穿插
         for cell in cells[offset:] + cells[:offset]:
@@ -241,7 +256,7 @@ def bench_calibrate(model, tokenizer, batches: tuple[int, ...], history: int,
                       f"中位数={median:.2f}，最大={max(delays):.2f}，极差={max(delays) - min(delays):.2f}，"
                       f"相对基线={median / base:.2f}× → "
                       f"{'块长可行' if median <= base * 1.25 else '超预算'}"
-                      f"（轮墙钟中位数：块所在轮={statistics.median(row[1] for row in rows):.2f}，"
+                      f"（宿主调用墙钟中位数，非GPU阶段耗时：块所在轮={statistics.median(row[1] for row in rows):.2f}，"
                       f"下一轮={statistics.median(row[2] for row in rows):.2f} ms）")
     print("[标定] 只给趋势与可行性：候选全部超预算时直接报告无可行块长，不增大系数、不换更松指标、"
           "不拿最小块冒充满足；轮墙钟另列一栏，不替代实际间隔")
