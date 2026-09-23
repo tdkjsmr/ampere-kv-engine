@@ -123,7 +123,7 @@ def run_schedule(model, tokenizer, batch, chunk, *, mixed, max_batch=None, stop_
 
     既有请求用不同的生成上限，一次覆盖"中途正常完成"与"空位后新请求准入"两类分支；新请求
     Prompt 为 `3*C+1`，所以混合轮既遇到中间块、也遇到 1 Token 末块。`stop_after_mixed` 在跑满
-    若干混合轮后取消正在 Prefill 的新请求，用来确认之后确实切回纯 Decode。
+    若干次新请求参与的混合轮后取消它；其余等待请求仍可正常参与混合。
     """
     prompts = [make_prompts(tokenizer, 1, 33 + 11 * i)[0] for i in range(batch)]
     limits = [4, 6, 3, 5, 2, 2, 2, 2][:batch]
@@ -137,16 +137,23 @@ def run_schedule(model, tokenizer, batch, chunk, *, mixed, max_batch=None, stop_
     tracked = requests + [new]
     decoded = {request.request_id: 0 for request in tracked}
     mixed_flags, first = [], None
+    mixed_with_new, cancelled_round = 0, None
     for rounds in range(64):
         active = [request.request_id for request in scheduler.running]  # 本轮起点参与 Decode 的集合
         was_mixed = scheduler.mixed_rounds
-        if (stop_after_mixed is not None and scheduler.mixed_rounds >= stop_after_mixed
+        prefilling_new = scheduler.prefilling is new
+        admitting_new = scheduler.prefilling is None and bool(scheduler.waiting) and scheduler.waiting[0] is new
+        if (stop_after_mixed is not None and mixed_with_new >= stop_after_mixed
                 and scheduler.prefilling is new and not new.stop_reason):
             scheduler.cancel(new)  # 只在轮次边界取消，已发出的 GPU 工作不打断
+            cancelled_round = rounds
         scheduler.step()
         for request_id in active:
             decoded[request_id] += 1
         mixed_flags.append(scheduler.mixed_rounds > was_mixed)
+        if (mixed_flags[-1] and cancelled_round != rounds
+                and (prefilling_new or (admitting_new and scheduler.prefilling is new))):
+            mixed_with_new += 1
         if first is None and new.output_ids:
             first = rounds
         if all(request.status == FINISHED for request in tracked):
@@ -155,6 +162,7 @@ def run_schedule(model, tokenizer, batch, chunk, *, mixed, max_batch=None, stop_
         raise AssertionError(f"调度未在 64 轮内收尾：已 Decode {decoded}")
     return {"seqs": [request.output_ids for request in requests], "new_seq": new.output_ids,
             "decoded": decoded, "first": first, "limits": limits, "mixed_flags": mixed_flags,
+            "mixed_with_new": mixed_with_new, "cancelled_round": cancelled_round,
             "mixed_rounds": scheduler.mixed_rounds, "fallback_rounds": scheduler.fallback_rounds,
             "reserved": scheduler.reserved_blocks, "capacity": capacity, "new_status": new.status,
             "new_reason": new.stop_reason,
@@ -189,12 +197,14 @@ def check_schedule(model, tokenizer, batch=4, chunk=16) -> None:
     flags = cancelled["mixed_flags"]
     assert cancelled["new_status"] == FINISHED and cancelled["new_reason"] == "已取消", f"{cancelled}"
     assert cancelled["first"] is None and not cancelled["new_seq"], f"被取消的新请求仍选了词：{cancelled}"
-    assert any(flags) and not any(flags[flags.index(True) + 1:]), f"取消后没切回纯 Decode：{flags}"
+    assert cancelled["mixed_with_new"] == 1 and cancelled["cancelled_round"] is not None, (
+        f"新请求没有在一次混合轮后取消：{cancelled}")
     assert all(len(seq) == limit for seq, limit in zip(cancelled["seqs"], cancelled["limits"])), (
         f"取消新请求后邻座没继续到各自上限：{[len(s) for s in cancelled['seqs']]}")
     assert cancelled["reserved"] == 0 and cancelled["free"], f"取消后收尾账目不对：{cancelled}"
-    print(f"[PASS] 混合轮后取消新请求：{flags.count(True)} 个混合轮后停止混合，新请求未选词即归还块，"
-          f"其余请求仍按各自上限完成")
+    print(f"[PASS] 混合轮后取消新请求：参与 {cancelled['mixed_with_new']} 轮后取消，"
+          f"取消轮次={cancelled['cancelled_round']}，总混合轮={sum(flags)}；"
+          "新请求未选词即归还块，其余请求仍按各自上限完成")
     fallback = run_schedule(model, tokenizer, 2, chunk, mixed=True, max_batch=1)
     assert fallback["fallback_rounds"] > 0, f"没走到超过一批的回退分支：{fallback}"
     assert all(len(seq) == limit for seq, limit in zip(fallback["seqs"], fallback["limits"])), (
