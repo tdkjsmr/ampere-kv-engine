@@ -118,7 +118,8 @@ def run_case(model, tokenizer, batch, history, chunks, *, alternate=False, last_
 
 
 @torch.inference_mode()
-def run_schedule(model, tokenizer, batch, chunk, *, mixed, max_batch=None, stop_after_mixed=None):
+def run_schedule(model, tokenizer, batch, chunk, *, mixed, max_batch=None, stop_after_mixed=None,
+                 limits=None):
     """真实调度跑一遍：返回每请求序列、实际 Decode 轮数、新请求首 Token 轮次与收尾账目。
 
     既有请求用不同的生成上限，一次覆盖"中途正常完成"与"空位后新请求准入"两类分支；新请求
@@ -126,7 +127,7 @@ def run_schedule(model, tokenizer, batch, chunk, *, mixed, max_batch=None, stop_
     若干次新请求参与的混合轮后取消它；其余等待请求仍可正常参与混合。
     """
     prompts = [make_prompts(tokenizer, 1, 33 + 11 * i)[0] for i in range(batch)]
-    limits = [4, 6, 3, 5, 2, 2, 2, 2][:batch]
+    limits = list(limits) if limits is not None else [4, 6, 3, 5, 2, 2, 2, 2][:batch]
     pending = make_prompts(tokenizer, 1, 3 * chunk + 1)[0]
     capacity = (sum((p.shape[1] + n + 15) // 16 for p, n in zip(prompts, limits))
                 + (pending.shape[1] + 8 + 15) // 16)
@@ -205,7 +206,8 @@ def check_schedule(model, tokenizer, batch=4, chunk=16) -> None:
     print(f"[PASS] 混合轮后取消新请求：参与 {cancelled['mixed_with_new']} 轮后取消，"
           f"取消轮次={cancelled['cancelled_round']}，总混合轮={sum(flags)}；"
           "新请求未选词即归还块，其余请求仍按各自上限完成")
-    fallback = run_schedule(model, tokenizer, 2, chunk, mixed=True, max_batch=1)
+    # 两条旧请求要活到新请求开始 Prefill，才能实际覆盖活动数超过一批的回退分支。
+    fallback = run_schedule(model, tokenizer, 2, chunk, mixed=True, max_batch=1, limits=(12, 14))
     assert fallback["fallback_rounds"] > 0, f"没走到超过一批的回退分支：{fallback}"
     assert all(len(seq) == limit for seq, limit in zip(fallback["seqs"], fallback["limits"])), (
         f"回退轮里请求没跑完：{[len(s) for s in fallback['seqs']]}")
