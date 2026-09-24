@@ -497,3 +497,9 @@
 - **补证结项**：RTX 3090、`8aec24c` 的仅证据运行，B=1/B=4 每请求输出数均为 32；按输入索引对齐后，两引擎的四条预热序列各自逐 Token 完全一致，输入文件和选中输入摘要与旧计时回传匹配。B=1 可能是 B=4 子集，不称五条独立输入；本次 `samples=[]`，不产生新性能数字。私有 Token ID 不上传。
 - **配置边界**：本次成功启动的 vLLM 日志显示 Chunked Prefill、FlashAttention 2、PIECEWISE/FULL Graph 捕获和 5.88 GiB / 42,800 Token KV 预算，采样器开关为 `0`。仅证明补证进程启动配置，不倒推 `f20cb3e` 原计时进程或证明该负载实际命中 Graph；旧结果仍是单顺序离线观察，不归因性能差距。
 - **时间线诊断入口**：`bench_external --engine ampere --profile` 仅支持正式 B=1/B=4 负载；原模型、调度器与预热保持不变，预热后等待 GPU，再用 CUDA Profiler API 只捕获一批生成，末尾等待后停止。诊断专用调度器给离线批次、调度轮和 Prefill/单请求或批量 Decode 加 NVTX；叶范围是宿主调用范围，不直接代表 GPU 耗时。输出与预热序列、请求数和 KV 归还均在捕获区外核对；无正式耗时样本。默认 benchmark/evidence 路径不加标签或同步。本地仅做静态检查，尚无时间线结论。
+
+### 2026-09-24 固定 RoPE 频率复用（待云端验证）
+
+- **前序诊断**：RTX 3090、提交 `a19a66a` 的 B=1/B=4 单批 Nsight Systems 捕获均正常，输出数与缓存回收检查通过。B=4 为 4 次 Prefill、34 次批量 Decode（组大小 4/3/2/1 分别 28/2/2/2 次），对应 124 个 Decode Token；`cudaMemcpyAsync` 与 `cudaStreamSynchronize` 各 4066 次。NVTX 叶范围是宿主调用，GPU 投影是关联操作的首末跨度，均非纯 GPU 忙碌时间；尚未核实小拷贝方向、尺寸与来源，不将 4066 次直接归因于 RoPE。
+- **本轮改动**：模型加载后按旧 CPU 公式、旧 dtype 与运算顺序创建一次 FP32 `inv_freq`，上传并注册为非持久 buffer；单请求、批量、混合前向及 INT8 对照入口显式共用该张量。每次仍按当前位置生成角度和 cos/sin，未动 RoPE 旋转顺序、块表、缓存所有权、量化规则、选词、Graph 或计时边界。
+- **有限对照**：`bench_external --engine ampere --evidence-only --rope-check` 在计时外将共享频率与旧 CPU 公式上传值逐位比较，并核对位置 0/17 的单 Token 与 0/5/17 的多 Token BF16 Q/K 输出；只在显式诊断模式运行，不进入热路径。Windows 本地只做源码静态检查；云端正确性、NSYS API 计数及无 Profiler 配对性能仍待实测，不预告收益。

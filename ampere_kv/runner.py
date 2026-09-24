@@ -38,6 +38,10 @@ def load_model_and_tokenizer():
     # 固定模型结构仅在加载后检查一次，不在36层的每次前向里重复判断。
     if model.config.hidden_act != "silu" or any(layer.self_attn.sliding_window is not None for layer in model.model.layers):
         raise ValueError("当前只支持SiLU且无滑动窗口的Qwen3")
+    dim = model.config.head_dim
+    exponent = torch.arange(0, dim, 2, dtype=torch.int64).float() / dim
+    inv_freq = (1.0 / (model.config.rope_theta ** exponent)).to(model.model.embed_tokens.weight.device)
+    model.register_buffer("_ampere_inv_freq", inv_freq, persistent=False)
     return model, AutoTokenizer.from_pretrained(MODEL_ID, revision=MODEL_REVISION, local_files_only=True)
 
 
@@ -73,15 +77,12 @@ def project_qkv(normalized: torch.Tensor, attention) -> tuple[torch.Tensor, torc
     return query.transpose(1, 2), key.transpose(1, 2), value.transpose(1, 2)
 
 
-def apply_rope(query: torch.Tensor, key: torch.Tensor, position_ids: torch.Tensor, config):
+def apply_rope(query: torch.Tensor, key: torch.Tensor, position_ids: torch.Tensor, config, inv_freq: torch.Tensor):
     """按固定 Qwen3 的默认 RoPE 旋转 Q/K；位置显式传入，不修改原张量或 V。
 
     模型 Revision 固定、rope_scaling 为空且头维度完整，因此不在每层每步重复校验配置。
     """
     dim = config.head_dim
-    # 从真实 rope_theta 计算各维度频率；只生成很短的频率向量，不复制模型权重。
-    exponent = torch.arange(0, dim, 2, dtype=torch.int64).float() / dim
-    inv_freq = (1.0 / (config.rope_theta ** exponent)).to(query.device)
     with torch.autocast(device_type=query.device.type, enabled=False):
         # [批大小, 半个头维度, 1] @ [批大小, 1, Token 数]，得到各位置的旋转角度。
         frequencies = inv_freq[None, :, None].expand(query.shape[0], -1, 1)
@@ -100,7 +101,8 @@ def apply_rope(query: torch.Tensor, key: torch.Tensor, position_ids: torch.Tenso
 @torch.no_grad()
 def decoder_layer_forward(
     hidden_states: torch.Tensor, layer, position_ids: torch.Tensor,
-    cache: ContiguousKVCache | PagedKVCache, config, *, is_prefill: bool, cuda_decode: bool = False,
+    cache: ContiguousKVCache | PagedKVCache, config, inv_freq: torch.Tensor,
+    *, is_prefill: bool, cuda_decode: bool = False,
     v3: bool = False,
 ) -> torch.Tensor:
     """执行单请求、无填充的整段/分块 Prefill 或单 Token Decode，返回本次隐藏状态。
@@ -116,7 +118,7 @@ def decoder_layer_forward(
     norm = layer.input_layernorm
     normalized = rms_norm(hidden_states, norm.weight, norm.variance_epsilon)
     query, key, value = project_qkv(normalized, attention)
-    query, key = apply_rope(query, key, position_ids, config)
+    query, key = apply_rope(query, key, position_ids, config, inv_freq)
     # 只有缓存 Attention 的阶段不同，归一化、投影、RoPE、残差与 MLP 共用原实现。
     # CUDA 分页且块大小16、每头128维时，两种精度的 Prefill 共用批量写入；其余仍走参考实现。
     fused_prefill = (is_prefill and isinstance(cache, PagedKVCache) and cache._key.is_cuda
@@ -179,7 +181,7 @@ def finish_decoder_layer(hidden_states: torch.Tensor, head_output: torch.Tensor,
 
 @torch.no_grad()
 def decoder_layer_batched_forward(
-    hidden_states: torch.Tensor, layer, positions: torch.Tensor, caches: list, config,
+    hidden_states: torch.Tensor, layer, positions: torch.Tensor, caches: list, config, inv_freq: torch.Tensor,
 ) -> torch.Tensor:
     """一次处理 B 个请求各一个 Token 的 Decode 层：批量投影 + 批量分页 Attention。
 
@@ -191,7 +193,7 @@ def decoder_layer_batched_forward(
     attention = layer.self_attn
     normalized = rms_norm(hidden_states, layer.input_layernorm.weight, layer.input_layernorm.variance_epsilon)
     query, key, value = project_qkv(normalized, attention)
-    query, key = apply_rope(query, key, positions, config)
+    query, key = apply_rope(query, key, positions, config, inv_freq)
     head_output = batched_decode_attention(query, key, value, caches)
     return finish_decoder_layer(hidden_states, head_output, layer)
 
@@ -226,11 +228,12 @@ def model_forward_mixed(model, decode_ids, decode_positions, layer_caches,
     ids = torch.cat((decode_ids.reshape(1, batch), prefill_ids), dim=1)
     positions = torch.cat((decode_positions.reshape(1, batch), prefill_positions), dim=1)
     hidden = model.model.embed_tokens.weight[ids]
+    inv_freq = model._ampere_inv_freq
     for layer, caches, prefill_cache in zip(model.model.layers, layer_caches, prefill_caches):
         norm = layer.input_layernorm
         normalized = rms_norm(hidden, norm.weight, norm.variance_epsilon)
         query, key, value = project_qkv(normalized, layer.self_attn)
-        query, key = apply_rope(query, key, positions, model.config)
+        query, key = apply_rope(query, key, positions, model.config, inv_freq)
         # 前B个位置改成[B,头,1,维]供既有批量内核使用；绝不把它们当一条长历史。
         dq, dk, dv = (tensor[:, :, :batch].permute(2, 1, 0, 3) for tensor in (query, key, value))
         decoded = batched_decode_attention(dq, dk, dv, caches).permute(2, 1, 0, 3)
@@ -257,8 +260,9 @@ def model_forward_batched(model, token_ids: torch.Tensor, positions: torch.Tenso
     只处理批量 Decode，Prefill 仍走单请求的 model_forward。
     """
     hidden_states = model.model.embed_tokens.weight[token_ids]
+    inv_freq = model._ampere_inv_freq
     for layer, caches in zip(model.model.layers, layer_caches):
-        hidden_states = decoder_layer_batched_forward(hidden_states, layer, positions, caches, model.config)
+        hidden_states = decoder_layer_batched_forward(hidden_states, layer, positions, caches, model.config, inv_freq)
     # 各请求都只有一个新 Token，末尾位置即该 Token，与单请求路径共用同一个输出头。
     return final_logits(model, hidden_states)
 
@@ -276,9 +280,11 @@ def model_forward(model, input_ids, position_ids, caches, *, is_prefill: bool, c
         raise ValueError("分块 Prefill 当前只支持 BF16 KV")
     layers = model.model.layers
     hidden_states = model.model.embed_tokens.weight[input_ids]
+    inv_freq = model._ampere_inv_freq
     for layer, cache in zip(layers, caches):
         hidden_states = decoder_layer_forward(
-            hidden_states, layer, position_ids, cache, model.config, is_prefill=is_prefill, cuda_decode=cuda_decode, v3=v3,
+            hidden_states, layer, position_ids, cache, model.config, inv_freq,
+            is_prefill=is_prefill, cuda_decode=cuda_decode, v3=v3,
         )
     # Prefill 和 Decode 共用末尾归一化与输出投影，不另写一套生成计算。
     return final_logits(model, hidden_states) if output_logits else None
@@ -564,7 +570,8 @@ def check_int8_decode(model, input_ids, v3: bool = False) -> None:
                 storage = PagedKVStorage(config.num_key_value_heads, config.head_dim, blocks,
                                         PAGED_BLOCK_SIZE, device=input_ids.device, kv_dtype=dtype)
                 caches.append(PagedKVCache(storage))
-            hidden = decoder_layer_forward(hidden, layer, positions, reference_caches[-1], config, is_prefill=True)
+            hidden = decoder_layer_forward(hidden, layer, positions, reference_caches[-1], config,
+                                           model._ampere_inv_freq, is_prefill=True)
             # get只在诊断准备阶段复制当前层历史；Decode直接由CUDA读取物理块。
             key, value = reference_caches[-1].get()
             quantized_caches[-1].append(key, value, fused=True)

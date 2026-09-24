@@ -40,7 +40,31 @@ def load_inputs(path: Path, batch: int, input_tokens: int, smoke: bool):
     return selected, hashlib.sha256(raw).hexdigest(), digest
 
 
-def run_ampere(prompts, batch: int, output_tokens: int, repeats: int, profile: bool = False):
+def check_rope_frequency(model):
+    """计时外核对固定频率与旧公式，覆盖零/非零位置和单/多 Token。"""
+    import torch
+    from ampere_kv.runner import apply_rope
+
+    dim = model.config.head_dim
+    exponent = torch.arange(0, dim, 2, dtype=torch.int64).float() / dim
+    previous = (1.0 / (model.config.rope_theta ** exponent)).to(model._ampere_inv_freq.device)
+    if (model._ampere_inv_freq.shape != (64,) or model._ampere_inv_freq.dtype != torch.float32
+            or not torch.equal(model._ampere_inv_freq, previous)):
+        raise AssertionError("固定 RoPE 频率与旧公式不一致")
+    for indices in ((0,), (17,), (0, 5, 17)):
+        positions = torch.tensor([indices], device=previous.device)
+        values = torch.arange(len(indices) * dim, device=previous.device).reshape(1, 1, len(indices), dim)
+        query = (values.float() / dim).to(torch.bfloat16)
+        key = ((values.float() + 1) / dim).to(torch.bfloat16)
+        current = apply_rope(query, key, positions, model.config, model._ampere_inv_freq)
+        reference = apply_rope(query, key, positions, model.config, previous)
+        if not all(torch.equal(actual, expected) for actual, expected in zip(current, reference)):
+            raise AssertionError(f"RoPE 位置 {indices} 的输出与旧频率路径不一致")
+    print("[PASS] RoPE 固定频率及位置 0/17/0,5,17 的 BF16 Q/K 输出逐位一致")
+
+
+def run_ampere(prompts, batch: int, output_tokens: int, repeats: int,
+               profile: bool = False, rope_check: bool = False):
     """模型和物理 KV 池只初始化一次；每个样本仅提交新请求。"""
     import torch
     from ampere_kv.runner import MODEL_REVISION as RUNNER_REVISION, load_model_and_tokenizer
@@ -49,6 +73,8 @@ def run_ampere(prompts, batch: int, output_tokens: int, repeats: int, profile: b
     if RUNNER_REVISION != MODEL_REVISION:
         raise RuntimeError("外部基线的模型 revision 与引擎锁定值不同")
     model, _ = load_model_and_tokenizer()
+    if rope_check:
+        check_rope_frequency(model)
     gpu_inputs = [torch.tensor(ids, device="cuda", dtype=torch.long)[None, :] for ids in prompts]
     budgets = [(len(ids) + output_tokens + BLOCK_SIZE) // BLOCK_SIZE for ids in prompts]
     blocks_per_layer = sum(budgets)
@@ -180,11 +206,14 @@ def main():
     parser.add_argument("--smoke", action="store_true", help="只取第一条输入前16个 Token，生成4个，测1次")
     parser.add_argument("--evidence-only", action="store_true", help="仅运行一次完整预热并保存输出，不测性能")
     parser.add_argument("--profile", action="store_true", help="仅采集 AmpereKV 预热后一批的 Nsight Systems 时间线")
+    parser.add_argument("--rope-check", action="store_true", help="仅在 AmpereKV 证据运行前核对固定 RoPE 频率与输出")
     args = parser.parse_args()
     if args.smoke and args.batch != 1:
         parser.error("烟测只支持 B=1")
     if args.profile and (args.engine != "ampere" or args.smoke or args.evidence_only):
         parser.error("--profile 只支持 AmpereKV 正式负载，不能与 --smoke/--evidence-only 同用")
+    if args.rope_check and (args.engine != "ampere" or not args.evidence_only or args.smoke):
+        parser.error("--rope-check 只支持 AmpereKV 正式 --evidence-only 运行")
     repo = Path(__file__).resolve().parents[1]
     if args.output.resolve().is_relative_to(repo):
         parser.error("私有结果必须写到仓库外，不能成为待提交文件")
@@ -195,7 +224,7 @@ def main():
     prompts, file_hash, selected_hash = load_inputs(args.input, args.batch, input_tokens, args.smoke)
     if args.engine == "ampere":
         samples, engine_config, warmup_outputs, profile_outputs = run_ampere(
-            prompts, args.batch, output_tokens, repeats, profile=args.profile)
+            prompts, args.batch, output_tokens, repeats, profile=args.profile, rope_check=args.rope_check)
     else:
         samples, engine_config, warmup_outputs = run_vllm(prompts, args.batch, output_tokens, repeats)
         profile_outputs = None
