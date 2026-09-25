@@ -1,34 +1,36 @@
 # AmpereKV Engine
 
-面向 RTX 3090（`sm_86`）和固定版本 Qwen3-8B 的单卡推理引擎。执行链、分页 KV 缓存、Decode CUDA 算子与请求调度由本项目实现；Embedding、线性层等仍使用 PyTorch。本项目不是 vLLM 或 nano-vLLM 的 Fork。
+AmpereKV 是针对固定版本 Qwen3-8B、单张 RTX 3090（`sm_86`）的最小文本推理引擎。项目自行组织逐层执行、分页 KV 缓存、CUDA Decode 和有限多请求调度；Embedding、线性层与 MLP 等仍调用 PyTorch，不是从零实现全部算子，也不是 vLLM 的 Fork 或通用生产服务。
 
-## 已实现范围
+## 能力与边界
 
-- BF16 权重与 KV：Prefill、贪心 Decode、连续或分页缓存；分页 Decode 默认使用 CUDA V1 算子。
-- 多请求：独立块表与共享物理块池、批量 Decode、固定大小 Chunked Prefill；混合 Prefill/Decode 是可选路径，默认关闭。
-- 请求生命周期：轮次边界上的合作式取消和到期处理，完成后归还块。
-- INT8 KV：K 每 32 维一组 scale，V 每 Token、每 KV 头一个 scale；CUDA 路径融合反量化。相同物理容量下，已测布局字节比约为 BF16/INT8 = 1.9248；这不是实测最大上下文倍率。
-- 可选 V3 GQA 共享载入 Decode 内核；多请求调度默认仍使用 BF16/V1。
+- 单请求入口支持 BF16 Prefill、贪心生成、连续或分页 KV；`runner --mode generate --cache paged` 的 BF16 Decode 走 SDPA。多请求调度默认使用 BF16/V1 分页 CUDA Decode；混合 Prefill/Decode 为可选实验路径。
+- 分页缓存按请求维护独立块表，共享每层物理块池；已分配的块归请求独占，完成、合作式取消或到期后归还。块大小固定为 16 Token。
+- INT8 仅量化 KV，不量化模型权重：K 每 32 维一组 scale，V 每 Token、每 KV 头一个 scale。相同物理容量下，BF16/INT8 的已测布局字节比约为 `1.9248`，不是实测最大上下文倍率；INT8 多请求、长期质量和最大容量未验收。
+- 不提供跨轮会话历史/KV 保留、前缀复用、通用模型适配、多模态、HTTP 服务或自建 CUDA Graph。现有对照与性能证据仅覆盖报告列出的设备、提交和负载。
 
-模型与分词器使用固定 Revision，从本地 Hugging Face 缓存加载。BF16 模型对照、分页缓存、混合调度及有限 INT8 诊断已有 RTX 3090 结果；INT8 的多请求、长期质量与最大容量尚未验收。不提供 CUDA Graph、HTTP 服务、前缀复用或通用模型适配。
+## 工具链
 
-## 运行
+已有云端证据使用 Ubuntu 22.04、Python `3.12.3`、PyTorch `2.5.1+cu124`、系统 CUDA Toolkit `12.4`、RTX 3090（24 GiB）和驱动 `595.71.05`；模型对照曾使用 `transformers 4.51.0`。`accelerate 1.6.0` 见既有云端安装记录；`huggingface_hub` 的精确版本未留存，依赖组合尚未在全新环境按下列步骤完整复验。系统 Toolkit 的 `nvcc`、PyTorch 的 CUDA runtime 标记 `cu124` 和 NVIDIA 驱动是三个不同版本字段，不应互相替代。
 
-在已配置模型缓存和 CUDA PyTorch 的云端环境中：
+需要 Git、`make`、可用的 C++/CUDA 编译器和足够空间存放约 16 GB 的模型权重。`setup.py` 只构建本项目扩展，**不自动安装所有运行依赖**。以下命令供 CUDA 12.4 云端环境依次执行；若使用其他环境，应先确认与 PyTorch 扩展构建兼容：
 
 ```bash
+git clone https://github.com/tdkjsmr/ampere-kv-engine.git
+cd ampere-kv-engine
+python3.12 -m venv .venv
+source .venv/bin/activate
+python -m pip install --upgrade pip 'setuptools>=69' wheel
+python -m pip install 'torch==2.5.1' --index-url https://download.pytorch.org/whl/cu124
+python -m pip install 'transformers==4.51.0' 'accelerate==1.6.0' 'huggingface_hub[cli]'
+export OMP_NUM_THREADS=1
+export HF_HOME=/path/to/persistent/huggingface  # 换成有足够空间的持久化目录；运行时保持一致
+hf download Qwen/Qwen3-8B --revision b968826d9c46dd6066d109eabc6255188de91218
 make build
 make smoke
-python -m ampere_kv.runner --mode check --cache paged
-python -m ampere_kv.runner --mode cuda-check --cache paged
-python -m ampere_kv.check_mixed
 python -m ampere_kv.runner --mode generate --cache paged
 ```
 
-CUDA 源码变化后需要重新构建扩展；仅修改 Python 或文档则不需要。`check` 是与 HF 的有界正确性对照，`cuda-check` 检查分页 CUDA Decode，`check_mixed` 检查混合前向与调度，均不是性能测量。单请求计时与 INT8 诊断的完整命令见 `runner.py --help`。
+下载模型不需要 GPU；生成命令会在终端询问一段文本。模型和分词器只从 `HF_HOME` 对应的本地缓存加载固定 Revision，因此切换服务器或缓存目录后须先确认文件仍在。上面的全新环境安装流程尚未端到端实测通过；已有 GPU 正确性与离线性能证据不等于此流程的验收。更多模式与参数见 `python -m ampere_kv.runner --help`。
 
-## 测量边界
-
-[外部基线报告](docs/BENCHMARK.md)记录固定 Token ID、锁定版本 vLLM 的离线整批完成时间与输出吞吐。模型加载、分词和预热不计入；AmpereKV 接收预建 CUDA 输入，vLLM 接收宿主 Token ID 列表，两边入口并非完全同构。该结果不是 TTFT、TPOT、在线吞吐、P99 或 SLO。
-
-项目内部 `runner --mode benchmark` 则是另一种单请求口径：从模型与输入就绪开始，包含 KV 分配、选词与必要同步，但不含结束后的块归还。不同口径的数字不直接相除；INT8/BF16 固定步数计时忽略 EOS，不能用作生成质量评估。`allocated` 是活跃张量占用，`reserved` 是分配器保留空间，短期回到基线不证明长期无泄漏。
+[架构说明](docs/ARCHITECTURE.md) · [固定负载测量报告](docs/BENCHMARK.md)

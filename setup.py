@@ -6,7 +6,7 @@ from torch.utils.cpp_extension import BuildExtension, CUDAExtension
 
 setup(
     name="ampere-kv-engine",
-    version="0.1.0",
+    version="1.0.0",
     packages=["ampere_kv"],
     ext_modules=[
         CUDAExtension(
