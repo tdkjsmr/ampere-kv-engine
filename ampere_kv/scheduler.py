@@ -58,6 +58,9 @@ class Scheduler:
         # 两个计数器只服务一件事：报告开关到底生效了几轮、回退了几轮，防止"没混合也报收益"。
         self.mixed_rounds = 0
         self.fallback_rounds = 0
+        self.graphs = None
+        self.graph_calls = self.graph_fallbacks = self.graph_captures = 0
+        self._submitted = False
         self.blocks_per_layer = blocks_per_layer
         # 每层一份共享物理张量与块池；请求接入时只新建块表，不再分配或复制张量。
         self.storages = [PagedKVStorage(config.num_key_value_heads, config.head_dim, blocks_per_layer,
@@ -69,6 +72,27 @@ class Scheduler:
         self.reserved_blocks = 0
         eos = model.generation_config.eos_token_id
         self.eos_ids = {eos} if isinstance(eos, int) else set(eos or [])
+
+    def enable_graphs(self, max_tokens: int) -> None:
+        """首个请求提交前，在本调度器的物理 KV 池捕获固定 B=1/4 Decode 图。"""
+        if self._submitted or self.graphs is not None or self.mixed:
+            raise ValueError("Graph 只能在首次提交前启用，且不与混合轮同时使用")
+        if (max_tokens <= 0 or max_tokens % PAGED_BLOCK_SIZE or self.block_size != PAGED_BLOCK_SIZE
+                or self.model.config.head_dim != 128 or not self.storages[0]._key.is_cuda
+                or self.storages[0]._key.dtype != torch.bfloat16):
+            raise ValueError("Graph 仅支持 CUDA BF16 V1、128维、块16及16对齐的正容量")
+        from ampere_kv.graph_decode import capture_scheduler_graph
+        batches = (1, 4) if self.max_batch >= 4 else (1,)
+        if self.blocks_per_layer < max(batches):
+            raise ValueError("物理池不足以捕获所需批量")
+        graphs = {batch: capture_scheduler_graph(self.model, self.storages, batch, max_tokens)
+                  for batch in batches}
+        self.graphs = graphs
+        self.graph_max_tokens = max_tokens
+        self.graph_captures = len(graphs)
+        if self.reserved_blocks or any(storage._pool.num_free_blocks != self.blocks_per_layer
+                                       for storage in self.storages):
+            raise AssertionError("捕获临时块未全部归还")
 
     def submit(self, request_id: str, input_ids: torch.Tensor, max_new_tokens: int,
                ignore_eos: bool = False, deadline: float | None = None) -> Request:
@@ -89,6 +113,7 @@ class Scheduler:
         if need > self.blocks_per_layer:
             raise ValueError(f"单请求预算 {need} 块超过每层容量 {self.blocks_per_layer} 块")
         request = Request(request_id, input_ids, max_new_tokens, need, ignore_eos, deadline)
+        self._submitted = True
         self.waiting.append(request)
         return request
 
@@ -128,7 +153,7 @@ class Scheduler:
         if output_logits:
             self._commit(request, logits[0, 0].argmax().item())
 
-    def _decode_batch(self, group: list[Request]) -> None:
+    def _decode_batch(self, group: list[Request], graph=None) -> None:
         """G6-B：一组请求的当前 Token 合成一次模型前向，各请求仍用自己的块表与位置。"""
         tokens = torch.tensor([[request.output_ids[-1]] for request in group],
                               dtype=torch.long, device=self.device)
@@ -137,10 +162,23 @@ class Scheduler:
                                  dtype=torch.long, device=self.device)
         # 转置成"每层一组请求缓存"：同一层的 B 个缓存指向同一份共享物理存储与块池。
         layer_caches = [[request.caches[layer] for request in group] for layer in range(len(self.storages))]
-        logits = model_forward_batched(self.model, tokens, positions, layer_caches)
+        logits = (model_forward_batched(self.model, tokens, positions, layer_caches) if graph is None
+                  else graph.step(layer_caches, tokens, positions))
+        if graph is not None:
+            self.graph_calls += 1
         # 一次同步取回 B 个 Token：这是各请求停止判断本身需要的，不是为检查而同步。
         for request, token in zip(group, logits[:, 0].argmax(dim=-1).tolist()):
             self._commit(request, token)
+
+    def _graph_for(self, group: list[Request]):
+        """只读宿主长度，在登记本步新 Token 之前决定是否重放。"""
+        if self.graphs is None:
+            return None
+        graph = self.graphs.get(len(group))
+        if graph is None or any(request.caches[0].length >= self.graph_max_tokens for request in group):
+            self.graph_fallbacks += 1
+            return None
+        return graph
 
     def _decode_round(self) -> list[int]:
         """按 max_batch 分块推进活动请求，返回每一批实际处理的请求数。
@@ -151,12 +189,16 @@ class Scheduler:
         sizes: list[int] = []
         if self.max_batch == 1:
             for request in self.running:
-                self._advance(request, prefill=False)
+                graph = self._graph_for([request])
+                if graph is None:
+                    self._advance(request, prefill=False)
+                else:
+                    self._decode_batch([request], graph)
                 sizes.append(1)
             return sizes
         for offset in range(0, len(self.running), self.max_batch):
             group = self.running[offset:offset + self.max_batch]
-            self._decode_batch(group)
+            self._decode_batch(group, self._graph_for(group))
             sizes.append(len(group))
         return sizes
 

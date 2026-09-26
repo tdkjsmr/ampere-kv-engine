@@ -97,6 +97,25 @@ class CapturedDecode:
         return self.logits
 
 
+def capture_scheduler_graph(model, storages, batch, max_tokens):
+    """在调度器原有物理池上捕获；临时请求只借块，不成为图的所有者。"""
+    caches = [[PagedKVCache(storage) for _ in range(batch)] for storage in storages]
+    key = torch.zeros(1, storages[0]._key.shape[1], 1, storages[0]._key.shape[3],
+                      dtype=torch.bfloat16, device=storages[0]._key.device)
+    for layer in caches:
+        for cache in layer:
+            cache.append(key, key, fused=True)
+    tokens = torch.zeros(batch, 1, dtype=torch.long, device=key.device)
+    positions = torch.ones_like(tokens)
+    try:
+        return CapturedDecode(model, caches, max_tokens // PAGED_BLOCK_SIZE, tokens, positions)
+    finally:
+        torch.cuda.synchronize()
+        for layer in caches:
+            for cache in layer:
+                cache.release()
+
+
 def inputs(model, lengths, step):
     tokens = torch.tensor([[(11 + 37 * request + step * 13) % model.config.vocab_size]
                            for request in range(len(lengths))], dtype=torch.long, device="cuda")
