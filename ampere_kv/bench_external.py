@@ -64,7 +64,7 @@ def check_rope_frequency(model):
 
 
 def run_ampere(prompts, batch: int, output_tokens: int, repeats: int,
-               profile: bool = False, rope_check: bool = False):
+               profile: bool = False, rope_check: bool = False, cuda_graph: bool = False):
     """模型和物理 KV 池只初始化一次；每个样本仅提交新请求。"""
     import torch
     from ampere_kv.runner import MODEL_REVISION as RUNNER_REVISION, load_model_and_tokenizer
@@ -95,9 +95,10 @@ def run_ampere(prompts, batch: int, output_tokens: int, repeats: int,
                 with torch.cuda.nvtx.range(f"{stage}:tokens={tokens},history={history}"):
                     return super()._advance(request, prefill=prefill)
 
-            def _decode_batch(self, group):
-                with torch.cuda.nvtx.range(f"decode_batch:batch={len(group)}"):
-                    return super()._decode_batch(group)
+            def _decode_batch(self, group, graph=None):
+                stage = "decode_graph" if graph is not None else "decode_batch"
+                with torch.cuda.nvtx.range(f"{stage}:batch={len(group)}"):
+                    return super()._decode_batch(group, graph)
 
         scheduler_class = TimelineScheduler
     else:
@@ -105,6 +106,38 @@ def run_ampere(prompts, batch: int, output_tokens: int, repeats: int,
     scheduler = scheduler_class(model, blocks_per_layer, max_batch=batch, prefill_chunk_size=0, mixed=False)
     if profile:
         scheduler.profile_round = 0
+    graph_capacity = ((len(prompts[0]) + output_tokens + BLOCK_SIZE - 1) // BLOCK_SIZE) * BLOCK_SIZE
+    graph_init = None
+    if cuda_graph:
+        torch.cuda.synchronize()
+        before_allocated = torch.cuda.memory_allocated()
+        before_reserved = torch.cuda.memory_reserved()
+        start = time.perf_counter()
+        scheduler.enable_graphs(graph_capacity)
+        torch.cuda.synchronize()
+        graph_init = {
+            "wall_ms": (time.perf_counter() - start) * 1000,
+            "allocated_delta_bytes": torch.cuda.memory_allocated() - before_allocated,
+            "reserved_delta_bytes": torch.cuda.memory_reserved() - before_reserved,
+        }
+
+    def graph_counts():
+        return {
+            "calls": scheduler.graph_calls, "fallbacks": scheduler.graph_fallbacks,
+            "captures": scheduler.graph_captures,
+            "replays": {str(size): graph.replays for size, graph in (scheduler.graphs or {}).items()},
+        }
+
+    def graph_delta(before):
+        after = graph_counts()
+        if after["captures"] != before["captures"]:
+            raise RuntimeError("稳态生成期间发生 Graph 重捕获")
+        return {
+            "calls": after["calls"] - before["calls"],
+            "fallbacks": after["fallbacks"] - before["fallbacks"],
+            "replays": {size: count - before["replays"][size]
+                        for size, count in after["replays"].items()},
+        }
 
     def generate(sample: int):
         requests = [scheduler.submit(f"sample{sample}-r{i}", ids, output_tokens, ignore_eos=True)
@@ -113,12 +146,16 @@ def run_ampere(prompts, batch: int, output_tokens: int, repeats: int,
             scheduler.step()
         return [list(request.output_ids) for request in requests]
 
+    before_warmup = graph_counts()
     warmup_outputs = generate(-1)  # 复用完整预热结果，只供计时外诊断。
     check_output_counts(warmup_outputs, batch, output_tokens, "AmpereKV 预热")
+    if scheduler.reserved_blocks or any(s._pool.num_free_blocks != blocks_per_layer for s in scheduler.storages):
+        raise RuntimeError("AmpereKV 预热结束后没有归还全部 KV 块")
+    warmup_graph = graph_delta(before_warmup)
     profile_outputs = None
+    profile_graph = None
     if profile:
-        if scheduler.reserved_blocks or any(s._pool.num_free_blocks != blocks_per_layer for s in scheduler.storages):
-            raise RuntimeError("AmpereKV 预热结束后没有归还全部 KV 块")
+        before_profile = graph_counts()
         scheduler.profile_round = 0  # 采集窗口内的调度轮从 1 重新编号。
         torch.cuda.synchronize()  # 窗口前排空预热工作；不计入这次采集。
         torch.cuda.profiler.start()
@@ -135,21 +172,31 @@ def run_ampere(prompts, batch: int, output_tokens: int, repeats: int,
             raise RuntimeError("AmpereKV 时间线批次与同进程预热的 Token 序列不同")
         if scheduler.reserved_blocks or any(s._pool.num_free_blocks != blocks_per_layer for s in scheduler.storages):
             raise RuntimeError("AmpereKV 时间线批次结束后没有归还全部 KV 块")
+        profile_graph = graph_delta(before_profile)
     samples = []
     for index in range(repeats):
         torch.cuda.synchronize()  # 等待预热/上个样本的 GPU 工作，不把它计入本轮。
+        before_sample = graph_counts()
         start = time.perf_counter()
         outputs = generate(index)
         elapsed_ms = (time.perf_counter() - start) * 1000
         check_output_counts(outputs, batch, output_tokens, "AmpereKV")
+        if outputs != warmup_outputs:
+            raise RuntimeError("AmpereKV 正式样本与同进程预热的完整 Token 序列不同")
         if scheduler.reserved_blocks or any(s._pool.num_free_blocks != blocks_per_layer for s in scheduler.storages):
             raise RuntimeError("AmpereKV 请求结束后没有归还全部 KV 块")
-        samples.append({"wall_ms": elapsed_ms, "output_tokens": sum(map(len, outputs))})
+        samples.append({"wall_ms": elapsed_ms, "output_tokens": sum(map(len, outputs)),
+                        "graph_counts": graph_delta(before_sample)})
     return samples, {
         "torch": torch.__version__, "torch_cuda": torch.version.cuda,
         "kv_dtype": "bfloat16", "kernel": "BF16/V1", "blocks_per_layer": blocks_per_layer,
         "block_size": BLOCK_SIZE, "max_batch": batch, "prefill_chunk_size": 0,
-        "mixed": False, "prefix_cache": False, "graph": False,
+        "mixed": False, "prefix_cache": False, "graph": cuda_graph,
+        "graph_max_tokens": graph_capacity if cuda_graph else None,
+        "graph_table_width": graph_capacity // BLOCK_SIZE if cuda_graph else None,
+        "graph_captured_batches": sorted((scheduler.graphs or {}).keys()),
+        "graph_initialization": graph_init, "graph_warmup_counts": warmup_graph,
+        "graph_profile_counts": profile_graph, "graph_captures_after_measurement": scheduler.graph_captures,
     }, warmup_outputs, profile_outputs
 
 
@@ -206,12 +253,15 @@ def main():
     parser.add_argument("--smoke", action="store_true", help="只取第一条输入前16个 Token，生成4个，测1次")
     parser.add_argument("--evidence-only", action="store_true", help="仅运行一次完整预热并保存输出，不测性能")
     parser.add_argument("--profile", action="store_true", help="仅采集 AmpereKV 预热后一批的 Nsight Systems 时间线")
+    parser.add_argument("--cuda-graph", action="store_true", help="AmpereKV 显式启用固定 B1/B4 Decode Graph")
     parser.add_argument("--rope-check", action="store_true", help="仅在 AmpereKV 证据运行前核对固定 RoPE 频率与输出")
     args = parser.parse_args()
     if args.smoke and args.batch != 1:
         parser.error("烟测只支持 B=1")
     if args.profile and (args.engine != "ampere" or args.smoke or args.evidence_only):
         parser.error("--profile 只支持 AmpereKV 正式负载，不能与 --smoke/--evidence-only 同用")
+    if args.cuda_graph and args.engine != "ampere":
+        parser.error("--cuda-graph 只支持 AmpereKV")
     if args.rope_check and (args.engine != "ampere" or not args.evidence_only or args.smoke):
         parser.error("--rope-check 只支持 AmpereKV 正式 --evidence-only 运行")
     repo = Path(__file__).resolve().parents[1]
@@ -224,7 +274,8 @@ def main():
     prompts, file_hash, selected_hash = load_inputs(args.input, args.batch, input_tokens, args.smoke)
     if args.engine == "ampere":
         samples, engine_config, warmup_outputs, profile_outputs = run_ampere(
-            prompts, args.batch, output_tokens, repeats, profile=args.profile, rope_check=args.rope_check)
+            prompts, args.batch, output_tokens, repeats, profile=args.profile,
+            rope_check=args.rope_check, cuda_graph=args.cuda_graph)
     else:
         samples, engine_config, warmup_outputs = run_vllm(prompts, args.batch, output_tokens, repeats)
         profile_outputs = None
@@ -277,6 +328,15 @@ def main():
     else:
         print(f"[证据] {args.engine} B={args.batch} 预热输出已保存；无计时样本，不报告性能")
     print(f"[诊断] 预热请求数={len(warmup_outputs)}，每请求输出数={[len(ids) for ids in warmup_outputs]}；不属于计时样本")
+    if args.engine == "ampere":
+        print(f"[Graph] 请求={args.cuda_graph}，容量={engine_config['graph_max_tokens']}，"
+              f"块表宽度={engine_config['graph_table_width']}，捕获批量={engine_config['graph_captured_batches']}，"
+              f"初始化={engine_config['graph_initialization']}，预热计数={engine_config['graph_warmup_counts']}")
+        if times:
+            print(f"[Graph] 正式样本计数={[sample['graph_counts'] for sample in samples]}，"
+                  f"捕获总数={engine_config['graph_captures_after_measurement']}")
+        elif args.profile:
+            print(f"[Graph] 时间线批次计数={engine_config['graph_profile_counts']}")
     print(f"[指纹] 输入文件SHA256={file_hash}，选中Token SHA256={selected_hash}，提交={commit[:7]}")
     if times:
         print("[边界] 离线整批完成与输出吞吐；不是 TTFT、TPOT、服务吞吐、P99 或 SLO")

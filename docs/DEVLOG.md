@@ -557,3 +557,14 @@
 - **范围**：调度器增加首次提交前显式启用的固定容量 Graph；仅在 BF16 V1、块16、头维128下，对当前 Decode 子批 B=1/B=4 且全部历史未达容量的请求重放；B=2/3、超容量在预留块之前回退原 eager。默认不开启，不接 mixed、INT8/V3 或动态捕获。
 - **所有权**：捕获绑定调度器现有逐层物理 KV 池，临时缓存以合法位置预热与捕获后同步归还；图仅持有存储引用和静态设备缓冲，不持有真实请求块。每次真实步仍由原请求块表登记，停止与回收路径不变。按实际调用统计捕获、Graph 命中和开启后的 eager 回退。
 - **待验证**：Windows 仅做静态检查。RTX 3090 需运行 `python -m ampere_kv.check_graph_scheduler`、`python -m ampere_kv.graph_decode`、`python -m ampere_kv.scheduler`、`python -m ampere_kv.check_mixed`；新入口覆盖真实序列、B1 容量边界、B4 准入退场、取消/到期后块复用与同图再命中。此轮不测性能，不把原型收益写成调度器收益。
+
+### 2026-09-26 V2 第二轮 Graph 调度云端验证（覆盖上条待验证状态）
+
+- **环境与提交**：用户在 RTX 3090、PyTorch `2.5.1+cu124`、提交 `7712193508b20ca13a1fc9749be7373b9f603bc1` 运行检查；`graph_decode`、`scheduler`、`check_mixed` 既有回归均通过。
+- **调度正确性**：`check_graph_scheduler` 对 B1/B4 的输出、停止原因、36 层 KV 长度与地址、块隔离及归还对照通过。B1 在起点 31 命中、32 回退，计 Graph 16 次、回退 3 次；B4 准入退场覆盖 B1/B4 命中和 B2/B3 回退，计 Graph 6 次、回退 4 次。取消/到期后块复用、原图再命中且捕获总数不增加也通过；逐层上传元数据检查分别为 576、576、252 次。
+- **边界**：这不是调度器性能测量；未验证动态批次 Graph、INT8/V3、mixed 或服务路径。独立 `graph_decode` 入口末尾的“未接调度器”仅描述其原型入口，不代表本轮新增的可选调度路径未接入。
+
+### 2026-09-26 V2 第三轮 Graph 离线基准入口（待云端执行）
+
+- **实现范围**：沿用固定 Token ID 的 `bench_external`，新增仅 AmpereKV 可用的 `--cuda-graph`。在首次提交前按固定输入加输出上限向上对齐至块16捕获；初始化时间及 `allocated`/`reserved` 差值单列，正式样本不含捕获。预热、时间线批次与每个正式样本分别记录 Graph 调用、回退、逐图重放；每个 AmpereKV 样本计时外核对完整序列与预热一致、输出数及块归还。时间线子类适配 `_decode_batch(group, graph)` 并区分 Graph/eager NVTX 标签；不改 vLLM 路径、调度器和 CUDA。
+- **口径与待验证**：关闭开关仍是原单请求/批量路径；B1 开启后改走批量 B1 入口，故开关消融不等于单独 `cudaGraphLaunch` 收益。Windows 只做静态检查；RTX 3090 的开关正确性、Graph 命中、时间线及同卡 E→G→V→V→G→E 独立进程样本均待用户执行，未填性能数字。
