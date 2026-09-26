@@ -182,6 +182,7 @@ def finish_decoder_layer(hidden_states: torch.Tensor, head_output: torch.Tensor,
 @torch.no_grad()
 def decoder_layer_batched_forward(
     hidden_states: torch.Tensor, layer, positions: torch.Tensor, caches: list, config, inv_freq: torch.Tensor,
+    metadata=None,
 ) -> torch.Tensor:
     """一次处理 B 个请求各一个 Token 的 Decode 层：批量投影 + 批量分页 Attention。
 
@@ -194,23 +195,33 @@ def decoder_layer_batched_forward(
     normalized = rms_norm(hidden_states, layer.input_layernorm.weight, layer.input_layernorm.variance_epsilon)
     query, key, value = project_qkv(normalized, attention)
     query, key = apply_rope(query, key, positions, config, inv_freq)
-    head_output = batched_decode_attention(query, key, value, caches)
+    head_output = batched_decode_attention(query, key, value, caches, metadata)
     return finish_decoder_layer(hidden_states, head_output, layer)
 
 
-def batched_decode_attention(query, key, value, caches):
-    """复用批量写入与 V1 Attention；输入是每请求一个 Token，不做模型投影。"""
-    from ampere_kv import _C
-
-    shared_key, shared_value = caches[0]._key, caches[0]._value
+def prepare_batched_decode(caches, device, width=None):
+    """在宿主端一次登记本层新 Token，并准备写入起点与设备块表。"""
+    if width is not None and any(cache.length >= width * cache._key.shape[2] for cache in caches):
+        raise ValueError("固定块表容量不足")
     # 起点必须在登记新块之前取：reserve 之后 length 已含本步 Token，而写入位置仍是旧长度。
-    starts = torch.tensor([cache.length for cache in caches], dtype=torch.long, device=query.device)
+    starts = torch.tensor([cache.length for cache in caches], dtype=torch.long, device=device)
     rows = [cache.reserve(1) for cache in caches]
-    width = max(len(row) for row in rows)
+    width = max(len(row) for row in rows) if width is None else width
+    if any(len(row) > width for row in rows):
+        raise ValueError("固定块表宽度不足")
     # 块表按行定宽填充 0；内核只索引到各请求自己的有效长度，填充列不会被读到，
     # 越界情况由内核在读表之前的设备端断言拦截。
     table = torch.tensor([list(row) + [0] * (width - len(row)) for row in rows],
-                         dtype=torch.long, device=query.device)
+                         dtype=torch.long, device=device)
+    return starts, table
+
+
+def batched_decode_attention(query, key, value, caches, metadata=None):
+    """复用批量写入与 V1 Attention；预备模式不执行宿主端预留。"""
+    from ampere_kv import _C
+
+    shared_key, shared_value = caches[0]._key, caches[0]._value
+    starts, table = metadata if metadata is not None else prepare_batched_decode(caches, query.device)
     _C.bf16_write_batched(key.contiguous(), value.contiguous(), shared_key, shared_value, table, starts)
     return _C.paged_decode_batched(query.contiguous(), shared_key, shared_value, table, starts)
 
@@ -253,7 +264,8 @@ def model_forward_mixed(model, decode_ids, decode_positions, layer_caches,
 
 
 @torch.no_grad()
-def model_forward_batched(model, token_ids: torch.Tensor, positions: torch.Tensor, layer_caches: list):
+def model_forward_batched(model, token_ids: torch.Tensor, positions: torch.Tensor, layer_caches: list,
+                          metadata=None):
     """批量 Decode 的模型级前向：一次算完 B 个请求的当前 Token，返回 [B, 1, 词表] logits。
 
     `layer_caches[layer][request]` 是该层该请求的缓存；由调用方从各请求的逐层列表转置得到。
@@ -261,8 +273,10 @@ def model_forward_batched(model, token_ids: torch.Tensor, positions: torch.Tenso
     """
     hidden_states = model.model.embed_tokens.weight[token_ids]
     inv_freq = model._ampere_inv_freq
-    for layer, caches in zip(model.model.layers, layer_caches):
-        hidden_states = decoder_layer_batched_forward(hidden_states, layer, positions, caches, model.config, inv_freq)
+    for index, (layer, caches) in enumerate(zip(model.model.layers, layer_caches)):
+        prepared = None if metadata is None else metadata[index]
+        hidden_states = decoder_layer_batched_forward(hidden_states, layer, positions, caches,
+                                                       model.config, inv_freq, prepared)
     # 各请求都只有一个新 Token，末尾位置即该 Token，与单请求路径共用同一个输出头。
     return final_logits(model, hidden_states)
 
