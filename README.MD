@@ -4,10 +4,10 @@ AmpereKV 是针对固定版本 Qwen3-8B、单张 RTX 3090（`sm_86`）的最小�
 
 ## 能力与边界
 
-- 单请求入口支持 BF16 Prefill、贪心生成、连续或分页 KV；`runner --mode generate --cache paged` 的 BF16 Decode 走 SDPA。多请求调度默认使用 BF16/V1 分页 CUDA Decode；混合 Prefill/Decode 为可选实验路径。
+- 单请求入口支持 BF16 Prefill、贪心生成、连续或分页 KV；`runner --mode generate --cache paged` 的 BF16 Decode 走 SDPA。多请求调度默认使用 BF16/V1 分页 CUDA Decode；混合 Prefill/Decode 为可选实验路径。V2 开发分支可在首次提交前显式启用固定 B1/B4 Decode CUDA Graph，其他批量回退 eager，不改变默认路径。
 - 分页缓存按请求维护独立块表，共享每层物理块池；已分配的块归请求独占，完成、合作式取消或到期后归还。块大小固定为 16 Token。
 - INT8 仅量化 KV，不量化模型权重：K 每 32 维一组 scale，V 每 Token、每 KV 头一个 scale。相同物理容量下，BF16/INT8 的已测布局字节比约为 `1.9248`，不是实测最大上下文倍率；INT8 多请求、长期质量和最大容量未验收。
-- 不提供跨轮会话历史/KV 保留、前缀复用、通用模型适配、多模态、HTTP 服务或自建 CUDA Graph。现有对照与性能证据仅覆盖报告列出的设备、提交和负载。
+- 不提供跨轮会话历史/KV 保留、前缀复用、通用模型适配、多模态或 HTTP 服务。V2 的可选 Graph 不支持 INT8/V3、mixed 或动态批次；首版 `v1.0.0` 不包含该功能。现有对照与性能证据仅覆盖报告列出的设备、提交和负载，V2 尚未发布正式版本。
 
 ## 工具链
 
