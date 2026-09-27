@@ -50,7 +50,7 @@ def prepare_layers(caches, width):
 
 
 class CapturedDecode:
-    """图长期持有静态输入、逐层元数据、输出及捕获时的物理 KV 存储。"""
+    """图长期持有静态输入、连续元数据视图、输出及物理 KV 存储。"""
 
     def __init__(self, model, caches, width, tokens, positions):
         batch = len(caches[0])
@@ -61,13 +61,14 @@ class CapturedDecode:
         started = time.perf_counter()
         self.tokens = torch.empty_like(tokens)
         self.positions = torch.empty_like(positions)
-        self.metadata = [(torch.empty(batch, dtype=torch.long, device="cuda"),
-                          torch.empty(batch, width, dtype=torch.long, device="cuda")) for _ in caches]
+        layers = len(caches)
+        self.metadata_buffer = torch.empty(layers * batch * (width + 1), dtype=torch.long, device=tokens.device)
+        starts = self.metadata_buffer[:layers * batch].view(layers, batch)
+        tables = self.metadata_buffer[layers * batch:].view(layers, batch, width)
+        self.metadata = [(starts[layer], tables[layer]) for layer in range(layers)]
         self.tokens.copy_(tokens)
         self.positions.copy_(positions)
-        for target, source in zip(self.metadata, prepare_layers(caches, width)):
-            target[0].copy_(source[0])
-            target[1].copy_(source[1])
+        self.upload_metadata(caches)
 
         # 侧流预热与捕获只覆盖已经登记的合法位置；宿主长度不能随重放自动前进。
         stream = torch.cuda.Stream()
@@ -85,12 +86,24 @@ class CapturedDecode:
                             torch.cuda.memory_reserved() - before[1])
         self.replays = 0
 
+    def upload_metadata(self, caches):
+        if any(cache.length >= self.width * cache._key.shape[2] for layer in caches for cache in layer):
+            raise ValueError("固定块表容量不足")
+        starts, tables = [], []
+        for layer in caches:
+            starts.extend(cache.length for cache in layer)
+            for cache in layer:
+                row = cache.reserve(1)
+                tables.extend(row)
+                tables.extend([0] * (self.width - len(row)))
+        # 前半段按层存起点，后半段按层、请求存块表；当前流一次阻塞上传。
+        host = torch.tensor(starts + tables, dtype=torch.long)
+        self.metadata_buffer.copy_(host, non_blocking=False)
+
     def step(self, caches, tokens, positions):
         self.tokens.copy_(tokens)
         self.positions.copy_(positions)
-        for target, source in zip(self.metadata, prepare_layers(caches, self.width)):
-            target[0].copy_(source[0])
-            target[1].copy_(source[1])
+        self.upload_metadata(caches)
         self.graph.replay()
         self.replays += 1
         # 下一次 replay 会覆盖这个输出；调用方必须当步读取或克隆。
@@ -153,6 +166,12 @@ def create_paths(model, lengths, steps):
     paths = [("旧eager", eager_storage, eager)]
     for name in ("预备eager", "Graph"):
         storage, caches, _ = make_state(model, lengths, steps)
+        if name == "Graph":
+            # 仅改变第1层空闲栈顺序，让各层的逻辑块落到不同物理编号。
+            pool = storage[1]._pool
+            held = (pool.allocate(), pool.allocate())
+            for block in held:
+                pool.free(block)
         paths.append((name, storage, restore(storage, caches, prefix)))
     return paths, prefix, width
 
@@ -177,6 +196,8 @@ def close_paths(paths, blocks):
 def check_case(model, lengths):
     steps = 4
     paths, prefix, width = create_paths(model, lengths, steps)
+    if paths[2][2][0][0]._table.block_ids == paths[2][2][1][0]._table.block_ids:
+        raise AssertionError("Graph 用例未覆盖不同层的物理块编号")
     tokens, positions = inputs(model, lengths, 0)
     graph = CapturedDecode(model, paths[2][2], width, tokens, positions)
     captured_table = tuple(tuple(cache._table.block_ids) for cache in paths[2][2][0])
@@ -191,6 +212,14 @@ def check_case(model, lengths):
         for name, output in outputs[1:]:
             check_equal(output, outputs[0][1], f"B={len(lengths)} 第{step + 1}步 {name} logits")
             check_equal(output.argmax(dim=-1), outputs[0][1].argmax(dim=-1), "选词")
+        for layer, (starts, table) in enumerate(graph.metadata):
+            actual = paths[2][2][layer]
+            if starts.tolist() != [cache.length - 1 for cache in actual]:
+                raise AssertionError(f"Graph 第{layer}层起点映射错误")
+            rows = table.tolist()
+            for row, cache in zip(rows, actual):
+                if row[:len(cache._table.block_ids)] != list(cache._table.block_ids):
+                    raise AssertionError(f"Graph 第{layer}层块表映射错误")
         check_state([(name, caches) for name, _, caches in paths], addresses, lengths, step)
         seen_tables.add(tuple(tuple(cache._table.block_ids) for cache in paths[2][2][0]))
     if len(seen_tables) < 2 or all(table == captured_table for table in seen_tables):

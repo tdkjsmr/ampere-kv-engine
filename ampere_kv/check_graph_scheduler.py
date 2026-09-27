@@ -53,9 +53,18 @@ def compare(eager, graph, references, requests, addresses):
                 assert (cache._key.data_ptr(), cache._value.data_ptr()) == addresses[name][layer]
 
 
-def check_uploaded(graph, before, groups):
+def check_uploaded(graph, before, groups, addresses):
     checks = 0
     for batch, captured in graph.graphs.items():
+        base, views = addresses[batch]
+        assert captured.metadata_buffer.data_ptr() == base
+        assert captured.metadata_buffer.numel() == len(captured.metadata) * batch * (captured.width + 1)
+        item_size = captured.metadata_buffer.element_size()
+        for layer, (starts, table) in enumerate(captured.metadata):
+            assert starts.is_contiguous() and table.is_contiguous()
+            assert (starts.data_ptr(), table.data_ptr()) == views[layer]
+            assert starts.data_ptr() == base + layer * batch * item_size
+            assert table.data_ptr() == base + (len(captured.metadata) * batch + layer * batch * captured.width) * item_size
         if captured.replays == before[batch]:
             continue
         # 用例每轮至多四个活动请求；只核对本轮真实命中的那个子批。
@@ -75,6 +84,9 @@ def check_uploaded(graph, before, groups):
 def drive(model, lengths, limits, max_batch, max_tokens, *, lifecycle=False):
     eager, graph, references, requests, addresses, blocks = start_pair(
         model, lengths, limits, max_batch, max_tokens)
+    metadata_addresses = {batch: (captured.metadata_buffer.data_ptr(),
+                                  [(starts.data_ptr(), table.data_ptr()) for starts, table in captured.metadata])
+                          for batch, captured in graph.graphs.items()}
     sizes_seen, boundary, uploads = set(), [], 0
     stopped = added = reused = new_hit = False
     freed = set()
@@ -93,7 +105,7 @@ def drive(model, lengths, limits, max_batch, max_tokens, *, lifecycle=False):
         assert graph_sizes == eager_sizes
         sizes_seen.update(graph_sizes)
         compare(eager, graph, references, requests, addresses)
-        uploads += check_uploaded(graph, before, groups)
+        uploads += check_uploaded(graph, before, groups, metadata_addresses)
         if added and requests[-1] in running and graph.graph_calls > before_calls:
             new_hit = True
         if max_batch == 1 and running:
