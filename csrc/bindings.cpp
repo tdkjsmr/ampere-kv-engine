@@ -52,9 +52,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, module) {
              py::arg("query"), py::arg("key"), py::arg("value"), py::arg("table"), py::arg("starts"));
   // 保留原有 Smoke，便于区分扩展链路错误与 Attention 错误。
   module.def("smoke_add", &smoke_add_cuda, "两个 CUDA Tensor 逐元素相加");
-  // pybind11 要求 py::arg 要么覆盖全部参数、要么一个都不用，只命名末位会在编译期 static_assert 失败；
-  // 所以这里把四个分页 Decode 入口的参数名逐个写全，只有 v3 带默认值。
-  module.def("paged_decode", &paged_decode_cuda, "单请求 BF16 分页 Decode V0",
+  // 参数名必须完整声明；只有选择 V3 的开关带默认值。
+  module.def("paged_decode", &paged_decode_cuda, "单请求 BF16 分页 Decode：默认 V1，可选 V3",
              py::arg("query"), py::arg("key"), py::arg("value"), py::arg("table"), py::arg("length"),
              py::arg("v3") = false);
   module.def("paged_decode_int8", &paged_decode_int8_cuda, "单请求 INT8 分页 Decode 融合反量化，输出 BF16",

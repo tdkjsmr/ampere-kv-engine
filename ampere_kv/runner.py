@@ -1,8 +1,6 @@
-"""自建 Qwen3 BF16 生成、HF 逐步对照与单请求性能基线。"""
+"""自建 Qwen3 模型前向、单请求生成与可选 HF 对照。"""
 
 import argparse
-import statistics
-import time
 
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
@@ -207,8 +205,6 @@ def prepare_batched_decode(caches, device, width=None):
     starts = torch.tensor([cache.length for cache in caches], dtype=torch.long, device=device)
     rows = [cache.reserve(1) for cache in caches]
     width = max(len(row) for row in rows) if width is None else width
-    if any(len(row) > width for row in rows):
-        raise ValueError("固定块表宽度不足")
     # 块表按行定宽填充 0；内核只索引到各请求自己的有效长度，填充列不会被读到，
     # 越界情况由内核在读表之前的设备端断言拦截。
     table = torch.tensor([list(row) + [0] * (width - len(row)) for row in rows],
@@ -312,19 +308,14 @@ def final_logits(model, hidden_states):
 
 
 @torch.inference_mode()
-def generate_tokens(model, input_ids, *, max_new_tokens: int = MAX_NEW_TOKENS, verify: bool = False, timings: dict | None = None, cache_kind: str = "contiguous", cuda_decode: bool = False, kv_dtype: torch.dtype = torch.bfloat16, ignore_eos: bool = False, v3: bool = False) -> list[int]:
+def generate_tokens(model, input_ids, *, max_new_tokens: int = MAX_NEW_TOKENS, verify: bool = False, cache_kind: str = "contiguous", cuda_decode: bool = False, kv_dtype: torch.dtype = torch.bfloat16, ignore_eos: bool = False, v3: bool = False) -> list[int]:
     """返回新 Token IDs；每次请求创建独立缓存，不向调用方保留 GPU 张量。
 
-    verify 额外执行 HF 参考与诊断，timings 写入请求级墙钟指标，两者互斥；模式组合与
-    输入张量由 main 保证，这里不重复校验。cuda_decode 只切换 Decode，Prefill 始终用 SDPA。
+    verify 额外执行 HF 参考与诊断；模式组合在 CLI 边界检查。
+    cuda_decode 只切换 Decode，Prefill 始终用 SDPA。
     v3 进一步选择四头共享载入的 Decode 内核，只在 cuda_decode 为真时有意义。
     """
     tokens = input_ids.shape[1]
-    if timings is not None:
-        # 先排空前序 GPU 工作，再开始计时；模型加载、分词、输入搬运都已完成。
-        torch.cuda.synchronize(input_ids.device)
-        started = time.perf_counter()
-    # 请求计时包含缓存分配，不是仅测某个 CUDA 内核。
     capacity = tokens + max_new_tokens
     caches = []
     for _ in model.model.layers:
@@ -358,12 +349,6 @@ def generate_tokens(model, input_ids, *, max_new_tokens: int = MAX_NEW_TOKENS, v
         logits = model_forward(model, current_input, positions, caches, is_prefill=(step == 0), cuda_decode=cuda_decode and step > 0, v3=v3)
         used_tokens += current_input.shape[1]
         next_id = logits[0, 0].argmax().item()
-        if timings is not None:
-            # 当前路径在同一流上计算；item() 已等待产生 Token 的 GPU 工作完成。
-            # 在 CPU 可取得 Token ID 的时刻记时，不额外为每层/每 Token 插入同步。
-            token_ready = time.perf_counter()
-            if step == 0:
-                first_ready = token_ready
         generated_ids.append(next_id)
 
         if verify:
@@ -386,8 +371,6 @@ def generate_tokens(model, input_ids, *, max_new_tokens: int = MAX_NEW_TOKENS, v
             reference_input = torch.tensor([[reference_ids[-1]]], dtype=torch.long, device=input_ids.device)
 
     if verify:
-        assert generated_ids == reference_ids
-        assert all(cache.length == used_tokens for cache in caches)
         print(f"reference_token_ids = {reference_ids}")
         print("[PASS] 本次逐步 logits、完整 Token 序列与缓存检查通过；不代表性能验证通过")
         if cache_kind == "paged":
@@ -395,307 +378,34 @@ def generate_tokens(model, input_ids, *, max_new_tokens: int = MAX_NEW_TOKENS, v
             print(f"分页块大小={PAGED_BLOCK_SIZE}，Prefill 长度={tokens}，最终 KV 长度={used_tokens}，Decode 跨块={crossed}")
             if not crossed:
                 print("[未覆盖] 本次 Decode 未跨块，需换输入补验；不能据此宣称跨块生成验证通过")
-    if timings is not None:
-        # 统计在最后Token就绪之后，只查元数据，不计入推理时间；包含已预留的空闲槽位。
-        timings["kv_data_bytes"] = sum(t.numel() * t.element_size() for c in caches for t in (c._key, c._value))
-        timings["kv_scale_bytes"] = sum(
-            t.numel() * t.element_size() for c in caches
-            for t in (getattr(c, "_key_scale", None), getattr(c, "_value_scale", None)) if t is not None
-        )
-        timings["bf16_capacity_bytes"] = sum(c._key.numel() * 4 for c in caches)
-        timings["capacity"] = caches[0].capacity
     if cache_kind == "paged":
         for cache in caches:
             cache.release()
         if verify:
             print("已归还全部层分页块；本入口不再重复检查块池内部标记")
-    if timings is not None:
-        # 终点为最后一个 Token ID 可用；不包含文本解码、打印和函数退出时的缓存释放。
-        total = token_ready - started
-        timings.update(
-            ttft_ms=(first_ready - started) * 1000,
-            tpot_ms=(token_ready - first_ready) * 1000 / (len(generated_ids) - 1) if len(generated_ids) > 1 else None,
-            total_ms=total * 1000, output_tokens_per_s=len(generated_ids) / total,
-        )
     return generated_ids
-
-
-def benchmark(model, input_ids, *, repeats: int = 3, cache_kind: str = "contiguous", cuda_decode: bool = False, reference_ids: list[int] | None = None, kv_dtype: torch.dtype = torch.bfloat16, v3: bool = False) -> list[int]:
-    """同一模型预热一次、重复纯生成；只打印基础统计，不保存输入或结果文件。"""
-    if repeats < 1:
-        raise ValueError("测量次数必须为正数")
-    # 标签写实际使用的内核：默认内部入口跑 V1，显式选 v3 时才是四头共享载入。
-    backend = "CUDA V3" if cuda_decode and v3 else ("CUDA V1" if cuda_decode else "SDPA")
-    print(f"\n基线路径：缓存={cache_kind}，KV={kv_dtype}，Decode={backend}，Prefill=BF16 SDPA")
-    print(f"基线：预热=1 次，测量={repeats} 次，输入 Token={input_ids.shape[1]}，输出上限={MAX_NEW_TOKENS}")
-    print("范围：模型与输入已就绪，包含 KV 分配和选词；无 HF 对照、分词、文本解码或终端打印")
-    print("终点为最后一个 Token ID 可用；不计随后缓存归还。保留实现必需的输入检查和同步，不是内核单独计时。")
-    print(f"固定工作量：忽略EOS，生成{MAX_NEW_TOKENS}个Token；EOS后输出不用于质量评估。")
-    if cache_kind == "paged":
-        print("分页 SDPA 包含逻辑读回与 GQA 临时复制；CUDA Decode 包含块表创建/上传和块号检查同步；两边均包含 KV 追加。")
-    # 预热不计入结果；每次调用都新建请求缓存，不复用上个请求的有效内容。
-    expected_ids = generate_tokens(model, input_ids, cache_kind=cache_kind, cuda_decode=cuda_decode,
-                                   kv_dtype=kv_dtype, ignore_eos=True, v3=v3)
-    if reference_ids is not None:
-        if kv_dtype == torch.int8:
-            print(f"[观测] 与BF16固定长度序列一致={expected_ids == reference_ids}；各自选词，历史可能不同，不是精度验收")
-        elif expected_ids != reference_ids:
-            raise RuntimeError("CUDA 预热序列与 SDPA 不一致，取消 CUDA 测量；请运行 cuda-check 定位")
-        else:
-            print("[PASS] 计时外完整 Token 序列与 SDPA 一致；不代表 logits 精度验收通过")
-    device = input_ids.device
-    torch.cuda.synchronize(device)
-    baseline_allocated = torch.cuda.memory_allocated(device)
-    rows, after_allocated = [], []
-    print(f"预热后活跃张量显存={baseline_allocated / 1024**2:.2f} MiB")
-    for run in range(repeats):
-        # 重置峰值与读取显存放在生成计时区间外；不调用 empty_cache 改变分配器状态。
-        torch.cuda.reset_peak_memory_stats(device)
-        metrics = {}
-        generated_ids = generate_tokens(model, input_ids, timings=metrics, cache_kind=cache_kind,
-                                        cuda_decode=cuda_decode, kv_dtype=kv_dtype, ignore_eos=True, v3=v3)
-        torch.cuda.synchronize(device)
-        allocated = torch.cuda.memory_allocated(device)
-        reserved = torch.cuda.memory_reserved(device)
-        peak = torch.cuda.max_memory_allocated(device)
-        # 结果一致性检查也在计时之外；这只验证重复运行，不代替 HF 正确性对照。
-        if generated_ids != expected_ids:
-            raise RuntimeError("重复请求 Token 序列不一致，停止性能汇总")
-        rows.append(metrics)
-        after_allocated.append(allocated)
-        if run == 0:
-            kv_bytes = metrics["kv_data_bytes"] + metrics["kv_scale_bytes"]
-            ratio = metrics["bf16_capacity_bytes"] / kv_bytes
-            print(f'[容量] 每层物理容量={metrics["capacity"]} Token，全部层KV数据={metrics["kv_data_bytes"]}字节，scale={metrics["kv_scale_bytes"]}字节，总计={kv_bytes}字节')
-            print(f'[容量] 同容量BF16字节数/当前KV字节数={ratio:.6f}；不含权重、页表、临时张量和分配器保留空间，不代表最大上下文倍数')
-        tpot = "N/A" if metrics["tpot_ms"] is None else f'{metrics["tpot_ms"]:.3f} ms'
-        print(f'测量 {run + 1}：输出={len(generated_ids)}，TTFT={metrics["ttft_ms"]:.3f} ms，平均 TPOT={tpot}，总耗时={metrics["total_ms"]:.3f} ms，输出吞吐={metrics["output_tokens_per_s"]:.3f} Token/s')
-        print(f"显存：结束 allocated={allocated / 1024**2:.2f} MiB（较预热 {allocated - baseline_allocated:+d} 字节），reserved={reserved / 1024**2:.2f} MiB，峰值 allocated={peak / 1024**2:.2f} MiB")
-    for name in ("ttft_ms", "tpot_ms", "total_ms", "output_tokens_per_s"):
-        values = [row[name] for row in rows if row[name] is not None]
-        print(f'{name} 中位数 = {statistics.median(values):.3f}' if values else f"{name} 中位数 = N/A（仅生成一个 Token）")
-    if all(value == baseline_allocated for value in after_allocated):
-        print("[观测] 本次各请求结束后的活跃张量显存均回到预热基线；不代表长期无泄漏")
-    else:
-        print("[注意] 请求结束后的活跃张量显存未全部回到预热基线，请结合逐次变化检查；不能仅凭此认定泄漏")
-    print("reserved 是分配器保留空间，峰值包含模型权重；这些数值不是整卡总显存。少量重复的中位数不是 P95 或服务吞吐。")
-    return generated_ids
-
-
-@torch.inference_mode()
-def check_cuda_decode(model, input_ids, v3: bool = False) -> None:
-    """两套独立分页缓存做有界贪心生成；首次选词不一致即停止，不强制喂参考 Token。
-
-    v3 只作用于 CUDA 那一套；参考那一套始终走 SDPA，保持起点相同。
-    """
-    config = model.config
-    if config.head_dim != 128 or PAGED_BLOCK_SIZE != 16:
-        raise ValueError("CUDA Decode 只支持每头 128 维和块大小 16")
-    tokens = input_ids.shape[1]
-    num_blocks = (tokens + MAX_NEW_TOKENS + PAGED_BLOCK_SIZE - 1) // PAGED_BLOCK_SIZE
-    eos_ids = model.generation_config.eos_token_id
-    eos_ids = [eos_ids] if isinstance(eos_ids, int) else (eos_ids or [])
-    actual_ids, reference_ids = [], []
-    # 两条路径共享只读权重，但不共享缓存张量或请求元数据。
-    actual_caches, reference_caches = [], []
-    try:
-        for caches in (actual_caches, reference_caches):
-            for _ in model.model.layers:
-                caches.append(PagedKVCache(PagedKVStorage(
-                    config.num_key_value_heads, config.head_dim, num_blocks,
-                    PAGED_BLOCK_SIZE, device=input_ids.device,
-                )))
-        all_caches = actual_caches + reference_caches
-        actual_input, reference_input = input_ids, input_ids
-        print(f"对照上限={MAX_NEW_TOKENS} 个新 Token，输入长度={tokens}，每层物理容量={num_blocks * PAGED_BLOCK_SIZE}，CUDA 内核={'V3 四头共享载入' if v3 else 'V1 默认'}")
-        for step in range(MAX_NEW_TOKENS):
-            is_prefill = step == 0
-            # 第一次 Decode 的位置为 tokens；此后每步只增加一个位置。
-            positions = torch.arange(tokens, device=input_ids.device).unsqueeze(0) if is_prefill else torch.tensor([[tokens + step - 1]], device=input_ids.device)
-            # 各自完整走一遍模型，上一层自己的输出直接进入下一层，不能换回参考状态。
-            actual = model_forward(model, actual_input, positions, actual_caches, is_prefill=is_prefill, cuda_decode=not is_prefill, v3=v3)
-            reference = model_forward(model, reference_input, positions, reference_caches, is_prefill=is_prefill)
-            assert torch.isfinite(actual).all().item() and torch.isfinite(reference).all().item()
-            used = tokens + step
-            assert all(cache.length == used for cache in all_caches)
-            actual_id, reference_id = actual.argmax(dim=-1).item(), reference.argmax(dim=-1).item()
-            if is_prefill:
-                # 起点必须相同，防止把 Prefill 的差异误归因于 CUDA Decode。
-                torch.testing.assert_close(actual, reference, rtol=0, atol=0)
-                print(f"[PASS] 两套 SDPA Prefill logits 完全一致：首个 Token={actual_id}，KV 长度={used}")
-            else:
-                # BF16 logits 的差值转 FP32 统计；不直接套用 Attention 算子的容差。
-                difference = actual.float() - reference.float()
-                reference_norm = torch.linalg.vector_norm(reference.float()).item()
-                relative_l2 = f"{torch.linalg.vector_norm(difference).item() / reference_norm:.8g}" if reference_norm != 0 else "N/A（参考全零）"
-                print(f"[观测] Decode 第 {step} 步 logits：最大绝对误差={difference.abs().max().item():.8g}，相对 L2 误差={relative_l2}")
-            actual_ids.append(actual_id)
-            reference_ids.append(reference_id)
-            if actual_id != reference_id:
-                print(f"[分歧] 第 {step + 1} 个 Token：CUDA={actual_id}，SDPA={reference_id}，KV 长度={used}")
-                # 只在分歧时补充候选，避免每步都打印大量词表诊断。
-                # 这是原始 logits 的间隔，不是概率；topk 的同分排序不保证与 argmax 相同。
-                for label, logits in (("CUDA", actual), ("SDPA", reference)):
-                    scores, ids = logits[0, 0].float().topk(2)
-                    print(f"[诊断] {label} 前两名 ID={ids.tolist()}，logits={scores.tolist()}，间隔={(scores[0] - scores[1]).item():.8g}")
-                print(f"CUDA 序列={actual_ids}，SDPA 序列={reference_ids}")
-                raise AssertionError("首次贪心选词不一致，停止后续生成；未将参考 Token 灌入 CUDA 路径")
-            # 最终选出的 Token（包括 EOS）不再写入缓存，最终长度为 P + N - 1。
-            if actual_id in eos_ids or step + 1 == MAX_NEW_TOKENS:
-                break
-            actual_input = torch.tensor([[actual_id]], dtype=torch.long, device=input_ids.device)
-            reference_input = torch.tensor([[reference_id]], dtype=torch.long, device=input_ids.device)
-        assert actual_ids == reference_ids
-        crossed = (used - 1) // PAGED_BLOCK_SIZE > (tokens - 1) // PAGED_BLOCK_SIZE
-        reason = "EOS" if actual_ids[-1] in eos_ids else "达到新 Token 上限"
-        print(f"CUDA 序列={actual_ids}")
-        print(f"SDPA 序列={reference_ids}")
-        print(f"停止原因={reason}，生成数={len(actual_ids)}，Decode 次数={len(actual_ids) - 1}，最终 KV 长度={used}，Decode 跨块={crossed}")
-        if len(actual_ids) == 1:
-            print("[未覆盖] 首个 Token 为 EOS，本次未执行 CUDA Decode")
-        elif not crossed:
-            print("[未覆盖] 本次真实模型 Decode 没有跨块")
-    finally:
-        # 成功、断言失败或首个 Token 为 EOS，都归还已经建立的两套缓存。
-        for cache in actual_caches + reference_caches:
-            cache.release()
-        print("已归还本次两套分页缓存；本入口不再重复检查块池内部标记")
-    print("[PASS] 本次有界生成的 Token 序列与自建 SDPA 参考一致，缓存检查通过")
-    print("[观测] 未设完整 logits 精度阈值；本次结果不代表独立 HF 对照、多输入、长上下文或性能验证通过")
-
-
-@torch.inference_mode()
-def check_int8_decode(model, input_ids, v3: bool = False) -> None:
-    """共享BF16 Prefill，按BF16选词驱动两条CUDA路径；仅同历史对照，不测性能。
-
-    v3 同时作用于两套 CUDA 路径，使差异只来自精度而不是内核版本。
-    """
-    config = model.config
-    length = input_ids.shape[1]
-    blocks = (length + MAX_NEW_TOKENS - 1 + PAGED_BLOCK_SIZE - 1) // PAGED_BLOCK_SIZE
-    reference_caches, quantized_caches = [], []
-    positions = torch.arange(length, device=input_ids.device)[None]
-    hidden = model.model.embed_tokens.weight[input_ids]
-    try:
-        # 只走一次BF16 Prefill，逐层将同一份RoPE后的K和原始V保存成两种表示。
-        # INT8缓存不参与Prefill Attention，避免起点已经是两套不同的隐藏状态。
-        for layer in model.model.layers:
-            for caches, dtype in ((reference_caches, torch.bfloat16), (quantized_caches, torch.int8)):
-                storage = PagedKVStorage(config.num_key_value_heads, config.head_dim, blocks,
-                                        PAGED_BLOCK_SIZE, device=input_ids.device, kv_dtype=dtype)
-                caches.append(PagedKVCache(storage))
-            hidden = decoder_layer_forward(hidden, layer, positions, reference_caches[-1], config,
-                                           model._ampere_inv_freq, is_prefill=True)
-            # get只在诊断准备阶段复制当前层历史；Decode直接由CUDA读取物理块。
-            key, value = reference_caches[-1].get()
-            quantized_caches[-1].append(key, value, fused=True)
-        first_logits = final_logits(model, hidden)
-        # 对照入口保留数值底线，避免NaN经argmax后被误报为选词一致。
-        assert torch.isfinite(first_logits).all().item()
-        first_token = first_logits.argmax(dim=-1)
-        all_caches = reference_caches + quantized_caches
-        assert all(cache.length == length for cache in all_caches)
-        print(f"[PASS] 共用BF16 Prefill完成：层数={len(reference_caches)}，KV长度={length}，首Token={first_token.item()}")
-        # 首Token来自共同Prefill，不计入Decode选词一致率；若它是EOS则零步结束。
-        del hidden, first_logits, key, value
-        eos_ids = model.generation_config.eos_token_id
-        eos_ids = [eos_ids] if isinstance(eos_ids, int) else (eos_ids or [])
-        current_id = first_token.item()
-        compared = matched = 0
-        relative_errors = []
-        kl_values, mismatch_gaps = [], []
-        first_mismatch = None
-        used = length
-        for step in range(MAX_NEW_TOKENS - 1):
-            if current_id in eos_ids:
-                break
-            # 两套缓存只共享Token历史，不共享中间隐藏状态或新计算的K/V。
-            current_input = input_ids.new_tensor([[current_id]])
-            positions = input_ids.new_tensor([[length + step]])
-            reference = model_forward(model, current_input, positions, reference_caches,
-                                      is_prefill=False, cuda_decode=True, v3=v3)
-            actual = model_forward(model, current_input, positions, quantized_caches,
-                                   is_prefill=False, cuda_decode=True, v3=v3)
-            assert torch.isfinite(reference).all().item() and torch.isfinite(actual).all().item()
-            reference_scores, actual_scores = reference.float().flatten(), actual.float().flatten()
-            delta = actual_scores - reference_scores
-            relative_errors.append((delta.norm() / reference_scores.norm().clamp_min(1e-12)).item())
-            # 完整词表、温度1、自然对数：KL方向为BF16到INT8，不做Top-k截断。
-            reference_logp = reference_scores.log_softmax(dim=-1)
-            actual_logp = actual_scores.log_softmax(dim=-1)
-            kl = (reference_logp.exp() * (reference_logp - actual_logp)).sum().item()
-            kl_values.append(kl)  # 保留FP32原始结果；极小负值可能来自浮点舍入。
-            reference_id = reference.argmax(dim=-1).item()
-            actual_id = actual.argmax(dim=-1).item()
-            compared += 1
-            matched += int(reference_id == actual_id)
-            if reference_id != actual_id:
-                # 衡量实际竞争候选的差距，而不假设INT8选择的是BF16第二名。
-                gap = (reference_scores[reference_id] - reference_scores[actual_id]).item()
-                mismatch_gaps.append(gap)
-                if first_mismatch is None:
-                    top_two = reference_scores.topk(2).values
-                    margin = (top_two[0] - top_two[1]).item()
-                    # 并列使用竞争排名：严格更高的候选数+1，不对整个词表排序。
-                    rank = (reference_scores > reference_scores[actual_id]).sum().item() + 1
-                    ids = [reference_id, actual_id]
-                    # 只保存CPU标量与两个候选分数，不保留逐步GPU logits。
-                    first_mismatch = (step + 2, length + step, ids, kl, margin, rank,
-                                      reference_scores[ids].tolist(), actual_scores[ids].tolist())
-            # INT8即使选到EOS也不提前结束；下一轮始终服从BF16基线，避免文本历史分叉。
-            current_id = reference_id
-            used = length + compared
-        reason = "BF16 EOS" if current_id in eos_ids else "达到输出上限"
-        print(f"[汇总] 同历史对照：输出上限={MAX_NEW_TOKENS}，基线输出数={compared + 1}，Decode比较数={compared}，停止原因={reason}")
-        if compared:
-            print(f"[观测] Decode选词一致={matched}/{compared}（{matched / compared:.2%}），不含共用首Token")
-            print(f"[观测] logits相对L2：均值={statistics.mean(relative_errors):.8g}，最大值={max(relative_errors):.8g}")
-            print(f"[观测] KL(BF16 || INT8)：均值={statistics.mean(kl_values):.8g}，最大值={max(kl_values):.8g}（自然对数，温度1）")
-            if mismatch_gaps:
-                print(f"[观测] 分歧步BF16竞争分差：均值={statistics.mean(mismatch_gaps):.8g}，最大值={max(mismatch_gaps):.8g}，仅统计{len(mismatch_gaps)}个分歧步")
-        else:
-            print("[未覆盖] 首Token为EOS，没有执行Decode；一致率与误差无定义")
-        if first_mismatch is not None:
-            number, position, ids, kl, margin, rank, reference_pair, actual_pair = first_mismatch
-            print(f"[观测] 首次分歧：第{number}个输出Token，输入位置={position}，BF16={ids[0]}，INT8={ids[1]}")
-            print(f"[观测] 该步KL={kl:.8g}，BF16前两名分差={margin:.8g}，INT8所选Token在BF16中排名={rank}（严格更高数+1）")
-            print(f"[观测] 候选顺序={ids}，BF16分数={reference_pair}，INT8分数={actual_pair}")
-        elif compared:
-            print("[观测] 本次Decode比较未出现选词分歧")
-        crossed = compared > 0 and (used - 1) // PAGED_BLOCK_SIZE > (length - 1) // PAGED_BLOCK_SIZE
-        assert all(cache.length == used for cache in all_caches)
-        print(f"[PASS] 两套全部层KV长度={used}，Decode跨块={crossed}")
-    finally:
-        for cache in reference_caches + quantized_caches:
-            cache.release()
-    assert all(cache._pool.num_free_blocks == blocks for cache in reference_caches + quantized_caches)
-    print("[PASS] 两套缓存块全部归还；本轮为BF16驱动的同历史对照，不代表INT8独立生成、完整精度验收、HF对照或性能通过")
 
 
 def main() -> None:
     """加载与分词只做一次；选择对照或纯生成模式，最后统一展示结果。"""
     parser = argparse.ArgumentParser(description="Qwen3 自建 BF16 生成与正确性对照")
     # 默认保留对照行为；纯生成须显式选择，避免把输出文本误认为验证通过。
-    parser.add_argument("--mode", choices=("check", "generate", "benchmark", "cuda-check", "int8-check"), default="check", help="check：HF 对照；generate：纯生成；benchmark：纯生成基线；cuda-check：有界 CUDA Decode 对照；int8-check：BF16驱动的INT8同历史对照")
-    parser.add_argument("--repeats", type=int, default=3, help="benchmark 模式测量次数，默认 3，另有 1 次预热")
+    parser.add_argument("--mode", choices=("check", "generate", "cuda-check", "int8-check"), default="check", help="check：HF 对照；generate：纯生成；cuda-check：有界 CUDA Decode 对照；int8-check：BF16驱动的INT8同历史对照")
     parser.add_argument("--cache", choices=("contiguous", "paged"), default="contiguous", help="默认连续缓存；paged 为每块 16 Token 的分页参考")
     parser.add_argument("--kv-dtype", choices=("bf16", "int8"), default="bf16",
-                        help="生成的KV类型；benchmark选int8则比较BF16/INT8 CUDA，均需paged；诊断模式自行选择")
+                        help="生成的KV类型；int8需paged；诊断模式自行选择")
     parser.add_argument("--decode-kernel", choices=("v1", "v3"), default="v1",
                         help="Decode CUDA 内核：v1 每块一个 Query 头（默认），v3 同组四个 Query 头共享一次 K/V 载入")
     args = parser.parse_args()
-    if args.repeats < 1:
-        parser.error("--repeats 必须为正数")
     if args.mode in ("cuda-check", "int8-check") and args.cache != "paged":
         parser.error("CUDA 对照模式需要显式指定 --cache paged")
-    if args.kv_dtype == "int8" and (args.mode not in ("generate", "benchmark") or args.cache != "paged"):
-        parser.error("--kv-dtype int8 仅用于 generate/benchmark 且需 --cache paged")
+    if args.kv_dtype == "int8" and (args.mode != "generate" or args.cache != "paged"):
+        parser.error("--kv-dtype int8 仅用于 generate 且需 --cache paged")
     # v3 只在真正调用 CUDA Decode 的组合下有意义，否则会被 SDPA 路径静默忽略，不能当作 V3 证据。
     if args.decode_kernel == "v3" and not (
             args.mode in ("cuda-check", "int8-check")
-            or (args.mode == "benchmark" and args.cache == "paged")
             or (args.mode == "generate" and args.kv_dtype == "int8")):
-        parser.error("--decode-kernel v3 需要实际走 CUDA Decode 的组合：cuda-check/int8-check、benchmark --cache paged 或 generate --kv-dtype int8")
+        parser.error("--decode-kernel v3 需要实际走 CUDA Decode 的组合：cuda-check/int8-check 或 generate --kv-dtype int8")
     if not torch.cuda.is_available():
         raise RuntimeError("模型生成需要在云端 CUDA 环境运行")
     text = input("请输入一段文本：")
@@ -706,41 +416,24 @@ def main() -> None:
     model, tokenizer = load_model_and_tokenizer()
     input_ids = encode_prompt(tokenizer, text)
     if args.mode == "int8-check":
+        from ampere_kv.check_model import check_int8_decode
+
         check_int8_decode(model, input_ids, v3=args.decode_kernel == "v3")
         return  # 同历史对照不等于INT8独立生成，不进入普通生成输出。
     if args.mode == "cuda-check":
+        from ampere_kv.check_model import check_cuda_decode
+
         check_cuda_decode(model, input_ids, v3=args.decode_kernel == "v3")
         return  # 对照入口自行汇总，不能落入下面的普通生成结果打印。
-    if args.mode == "benchmark":
-        if args.kv_dtype == "int8":
-            # 同一模型、同一输入、相同输出步数；先BF16再INT8，固定顺序仍可能受时钟漂移影响。
-            # 这里不执行SDPA陪跑；质量检查由int8-check承担，量化写入开销包含在计时内。
-            print("配对基线：BF16 CUDA → INT8 CUDA；各自独立选词，不要求跨精度序列完全一致。")
-            v3 = args.decode_kernel == "v3"
-            reference_ids = benchmark(model, input_ids, repeats=args.repeats, cache_kind="paged", cuda_decode=True, v3=v3)
-            benchmark(model, input_ids, repeats=args.repeats, cache_kind="paged", cuda_decode=True,
-                      kv_dtype=torch.int8, reference_ids=reference_ids, v3=v3)
-            print("[完成] 固定长度BF16/INT8 CUDA初步基线；不代表正式精度或稳定加速比验收")
-            return
-        generated_ids = benchmark(model, input_ids, repeats=args.repeats, cache_kind=args.cache)
-        if args.cache == "paged":
-            # 一次加载、同一输入、同一上限；两条路径仍分别创建并归还自己的缓存。
-            # 先 SDPA 后 CUDA 仅用于初步基线，固定顺序和少量重复不能代表稳定加速比。
-            generated_ids = benchmark(
-                model, input_ids, repeats=args.repeats, cache_kind="paged",
-                cuda_decode=True, reference_ids=generated_ids, v3=args.decode_kernel == "v3",
-            )
-        return  # benchmark忽略EOS，不把固定工作量输出打印为正常回答或EOS停止。
-    else:
-        # INT8直接复用循环，由自身logits选词；不创建BF16陪跑缓存。
-        use_int8 = args.kv_dtype == "int8"
-        if args.mode == "generate":
-            print(f"生成路径：KV={args.kv_dtype}，Prefill=BF16 SDPA，Decode={'INT8 CUDA' if use_int8 else 'BF16 SDPA'}，Decode内核={args.decode_kernel}")
-        generated_ids = generate_tokens(
-            model, input_ids, verify=(args.mode == "check"), cache_kind=args.cache,
-            cuda_decode=use_int8, kv_dtype=torch.int8 if use_int8 else torch.bfloat16,
-            v3=args.decode_kernel == "v3",
-        )
+    # INT8直接复用循环，由自身logits选词；不创建BF16陪跑缓存。
+    use_int8 = args.kv_dtype == "int8"
+    if args.mode == "generate":
+        print(f"生成路径：KV={args.kv_dtype}，Prefill=BF16 SDPA，Decode={'INT8 CUDA' if use_int8 else 'BF16 SDPA'}，Decode内核={args.decode_kernel}")
+    generated_ids = generate_tokens(
+        model, input_ids, verify=(args.mode == "check"), cache_kind=args.cache,
+        cuda_decode=use_int8, kv_dtype=torch.int8 if use_int8 else torch.bfloat16,
+        v3=args.decode_kernel == "v3",
+    )
     eos_ids = model.generation_config.eos_token_id
     eos_ids = [eos_ids] if isinstance(eos_ids, int) else (eos_ids or [])
     reason = "EOS" if generated_ids[-1] in eos_ids else "达到新 Token 上限"

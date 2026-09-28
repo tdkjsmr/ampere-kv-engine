@@ -18,6 +18,7 @@ AmpereKV 是针对固定版本 Qwen3-8B、单张 RTX 3090（`sm_86`）的最小�
 ```bash
 git clone https://github.com/tdkjsmr/ampere-kv-engine.git
 cd ampere-kv-engine
+git switch codex/v2-dev  # 当前交付候选分支；固定首版请改为 git switch --detach v1.0.0
 python3.12 -m venv .venv
 source .venv/bin/activate
 python -m pip install --upgrade pip 'setuptools>=69' wheel
@@ -34,3 +35,9 @@ python -m ampere_kv.runner --mode generate --cache paged
 下载模型不需要 GPU；生成命令会在终端询问一段文本。模型和分词器只从 `HF_HOME` 对应的本地缓存加载固定 Revision，因此切换服务器或缓存目录后须先确认文件仍在。上面的全新环境安装流程尚未端到端实测通过；已有 GPU 正确性与离线性能证据不等于此流程的验收。更多模式与参数见 `python -m ampere_kv.runner --help`。
 
 [架构说明](docs/ARCHITECTURE.md) · [固定负载测量报告](docs/BENCHMARK.md)
+
+## 阅读与验收入口
+
+阅读运行主线：`runner.py`（模型前向）→ `scheduler.py`（调度）→ `paged_cache.py`（缓存）→ `graph_decode.py`（可选 Graph）。模型诊断在 `check_model.py`，通过 `runner --mode cuda-check/int8-check --cache paged` 选择其中一种模式。
+
+云端回归入口为 `check_scheduler`、`check_chunked`、`check_mixed`、`check_graph_scheduler`，均用 `python -m ampere_kv.<模块名>` 运行；旧 `scheduler`/`graph_decode` 检查命令仍可用。正式整批测量集中在 `bench_external`，算子测量保留 `paged_decode --benchmark`；参数见各自 `--help`。历史阶段性计时脚本已撤下，原始实现与结果按报告中的 Git 提交追溯，不影响生成接口。

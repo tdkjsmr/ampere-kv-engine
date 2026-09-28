@@ -7,7 +7,8 @@ import torch
 from ampere_kv.kv_cache import sdpa_attention
 from ampere_kv.paged_cache import PagedKVCache, PagedKVStorage
 from ampere_kv.runner import encode_prompt, load_model_and_tokenizer, model_forward, generate_tokens
-from ampere_kv.scheduler import FINISHED, PREFILLING, RUNNING, Scheduler, _budgets
+from ampere_kv.scheduler import FINISHED, PREFILLING, RUNNING, Scheduler
+from ampere_kv.check_scheduler import _budgets
 
 
 def check_mask():

@@ -1,19 +1,25 @@
 """混合前向原型与调度接入对照：B 个 Decode Token 与一个 Prefill 块共用一次逐 Token 计算。
 
-独立前向、调度接入与有限负载配对三部分都在这里；不代表请求 TTFT、SLO 或完整独立生成通过。
+这里只做独立前向与调度接入对照；不测性能。
 """
 
 import argparse
-import statistics
-import time
 
 import torch
 
-from ampere_kv.bench_scheduler import make_prompts, revision
 from ampere_kv.paged_cache import PagedKVCache
-from ampere_kv.runner import (load_model_and_tokenizer, model_forward,
+from ampere_kv.runner import (encode_prompt, load_model_and_tokenizer, model_forward,
                               model_forward_batched, model_forward_mixed)
 from ampere_kv.scheduler import FINISHED, Scheduler
+
+
+def make_prompts(tokenizer, batch: int, history: int) -> list[torch.Tensor]:
+    """生成长度固定、内容不同的合成输入，只用于隔离与数值对照。"""
+    prompts = []
+    for index in range(batch):
+        ids = encode_prompt(tokenizer, f"用一句话解释 KV 缓存的第 {index} 种说法。")
+        prompts.append(ids.repeat(1, -(-history // ids.shape[1]))[:, :history])
+    return prompts
 
 
 def positions(ids, start):
@@ -56,13 +62,13 @@ def compare(actual, expected, label):
 
 
 @torch.inference_mode()
-def run_case(model, tokenizer, batch, history, chunks, *, alternate=False, last_logits=True, decode_history=17):
+def run_case(model, tokenizer, batch, history, chunks):
     """相同初始化后连续追加；旧请求由分离参考选词驱动，两侧始终使用同一输入历史。"""
-    prompts = [make_prompts(tokenizer, batch, decode_history + 7 * i)[i] for i in range(batch)]
-    pending = make_prompts(tokenizer, 1, history + sum(chunks) + (not last_logits))[0]
-    states, outputs, timings = {}, {}, {"分离": [], "混合": []}
+    prompts = [make_prompts(tokenizer, batch, 17 + 7 * i)[i] for i in range(batch)]
+    pending = make_prompts(tokenizer, 1, history + sum(chunks))[0]
+    states, outputs = {}, {}
     try:
-        for name in timings:
+        for name in ("分离", "混合"):
             states[name] = prepare(model, prompts, pending, history, len(chunks))
         # 初始化的历史应逐位相同，避免把准备差异算进混合计算误差。
         for left, right in zip(states["分离"][1], states["混合"][1]):
@@ -76,15 +82,13 @@ def run_case(model, tokenizer, batch, history, chunks, *, alternate=False, last_
         start = history
         for step, chunk in enumerate(chunks):
             ids = pending[:, start:start + chunk]
-            final = last_logits and step == len(chunks) - 1
-            order = ("混合", "分离") if (step + alternate) % 2 else ("分离", "混合")
+            final = step == len(chunks) - 1
+            order = ("混合", "分离") if step % 2 else ("分离", "混合")
             for name in order:
                 owner, caches, _ = states[name]
                 layer_caches = list(map(list, zip(*caches[:-1])))
                 pos = torch.tensor([[c[0].length] for c in caches[:-1]], device="cuda")
                 ppos = positions(ids, start)
-                torch.cuda.synchronize()
-                began = time.perf_counter()
                 if name == "混合":
                     out = model_forward_mixed(model, decode_ids, pos, layer_caches,
                                               ids, ppos, caches[-1], output_prefill_logits=final)
@@ -93,8 +97,6 @@ def run_case(model, tokenizer, batch, history, chunks, *, alternate=False, last_
                     prefilled = model_forward(model, ids, ppos, caches[-1], is_prefill=True,
                                               output_logits=final)
                     out = decoded, prefilled
-                torch.cuda.synchronize()
-                timings[name].append((time.perf_counter() - began) * 1000)
                 outputs[name] = out
                 for i, request in enumerate(caches):
                     length = start + chunk if i == batch else prompts[i].shape[1] + step + 1
@@ -114,7 +116,6 @@ def run_case(model, tokenizer, batch, history, chunks, *, alternate=False, last_
         for state in states.values():
             release(state)
     print(f"[PASS] B={batch} 初始H={history} 块长={chunks}：同历史选词、缓存长度、块隔离、地址与回收通过")
-    return {name: sum(values) for name, values in timings.items()}
 
 
 @torch.inference_mode()
@@ -219,28 +220,10 @@ def check_schedule(model, tokenizer, batch=4, chunk=16) -> None:
 
 def main():
     parser = argparse.ArgumentParser(description="BF16混合前向独立原型验证")
-    parser.add_argument("--benchmark", action="store_true", help="正确性通过后加测B4、C128中间块")
-    parser.add_argument("--repeats", type=int, default=3)
-    args = parser.parse_args()
-    if args.repeats < 1:
-        parser.error("重复次数必须为正")
-    print(f"[环境] {torch.cuda.get_device_name(0)}，torch={torch.__version__}，提交={revision()}")
+    parser.parse_args()
     model, tokenizer = load_model_and_tokenizer()
     for batch, history in ((1, 0), (4, 17)):
         run_case(model, tokenizer, batch, history, (16, 16, 1))
-    if args.benchmark:
-        print("[口径] 两路径相同KV与输入；准备/检查/归还不计时，前向含写入、读回和末尾等待，"
-              "不含CPU选词；不是用户输出间隔、TTFT或SLO，活动历史为512/519/526/533。")
-        for history in (0, 512):
-            rows = []
-            for repeat in range(args.repeats + 1):
-                row = run_case(model, tokenizer, 4, history, (128,),
-                               alternate=bool(repeat % 2), last_logits=False, decode_history=512)
-                if repeat:
-                    rows.append(row)
-            for name in ("分离", "混合"):
-                values = [row[name] for row in rows]
-                print(f"[基线] H={history} {name}：样本={values} ms，中位数={statistics.median(values):.3f}")
     check_schedule(model, tokenizer)
     print("[完成] 独立混合前向 + 可选混合调度接入对照通过；未做 INT8、Graph 与自适应块长，"
           "非自由生成或 SLO 验收")
