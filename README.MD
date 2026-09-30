@@ -4,21 +4,21 @@ AmpereKV 是针对固定版本 Qwen3-8B、单张 RTX 3090（`sm_86`）的最小�
 
 ## 能力与边界
 
-- 单请求入口支持 BF16 Prefill、贪心生成、连续或分页 KV；`runner --mode generate --cache paged` 的 BF16 Decode 走 SDPA。多请求调度默认使用 BF16/V1 分页 CUDA Decode；混合 Prefill/Decode 为可选实验路径。V2 开发分支可在首次提交前显式启用固定 B1/B4 Decode CUDA Graph，其他批量回退 eager，不改变默认路径。
+- 单请求入口支持 BF16 Prefill、贪心生成、连续或分页 KV；`runner --mode generate --cache paged` 的 BF16 Decode 走 SDPA。多请求调度默认使用 BF16/V1 分页 CUDA Decode；混合 Prefill/Decode 为可选实验路径。V2 可在首次提交前显式启用固定 B1/B4 Decode CUDA Graph，其他批量回退 eager，不改变默认路径。
 - 分页缓存按请求维护独立块表，共享每层物理块池；已分配的块归请求独占，完成、合作式取消或到期后归还。块大小固定为 16 Token。
 - INT8 仅量化 KV，不量化模型权重：K 每 32 维一组 scale，V 每 Token、每 KV 头一个 scale。相同物理容量下，BF16/INT8 的已测布局字节比约为 `1.9248`，不是实测最大上下文倍率；INT8 多请求、长期质量和最大容量未验收。
-- 不提供跨轮会话历史/KV 保留、前缀复用、通用模型适配、多模态或 HTTP 服务。V2 的可选 Graph 不支持 INT8/V3、mixed 或动态批次；首版 `v1.0.0` 不包含该功能。现有对照与性能证据仅覆盖报告列出的设备、提交和负载，V2 尚未发布正式版本。
+- 不提供跨轮会话历史/KV 保留、前缀复用、通用模型适配、多模态或 HTTP 服务。正式版本 `v2.0.0` 的可选 Graph 不支持 INT8/V3、mixed 或动态批次；首版 `v1.0.0` 不包含该功能。现有对照与性能证据仅覆盖报告列出的设备、提交和负载。
 
 ## 工具链
 
-候选源码 `56cb10e` 已在已有 Ubuntu 22.04 / CUDA Toolkit `12.4` 的 RTX 3090（24 GiB，驱动 `595.71.05`）上，用独立源码目录和新 venv 完成构建、冒烟与模型/调度/Graph 回归。实际依赖为 Python `3.12.3`、PyTorch `2.5.1+cu124`、`transformers 4.51.0`、`accelerate 1.6.0`、`huggingface_hub 0.36.2`；源码及扩展均来自新目录。系统 Toolkit 的 `nvcc`、PyTorch 的 CUDA runtime 标记 `cu124` 和 NVIDIA 驱动是三个不同版本字段，不应互相替代。
+V2 运行源码 `56cb10e` 已在已有 Ubuntu 22.04 / CUDA Toolkit `12.4` 的 RTX 3090（24 GiB，驱动 `595.71.05`）上，用独立源码目录和新 venv 完成构建、冒烟与模型/调度/Graph 回归；正式发布仅追加版本字段和文档整理。实际依赖为 Python `3.12.3`、PyTorch `2.5.1+cu124`、`transformers 4.51.0`、`accelerate 1.6.0`、`huggingface_hub 0.36.2`；源码及扩展均来自新目录。系统 Toolkit 的 `nvcc`、PyTorch 的 CUDA runtime 标记 `cu124` 和 NVIDIA 驱动是三个不同版本字段，不应互相替代。
 
 需要 Git、`make`、可用的 C++/CUDA 编译器和足够空间存放约 16 GB 的模型权重。`setup.py` 只构建本项目扩展，**不自动安装所有运行依赖**。以下命令供 CUDA 12.4 云端环境依次执行；若使用其他环境，应先确认与 PyTorch 扩展构建兼容：
 
 ```bash
 git clone https://github.com/tdkjsmr/ampere-kv-engine.git
 cd ampere-kv-engine
-git switch codex/v2-dev  # 当前交付候选分支；固定首版请改为 git switch --detach v1.0.0
+git switch --detach v2.0.0  # 固定正式版本；首版请改为 git switch --detach v1.0.0
 python3.12 -m venv .venv
 source .venv/bin/activate
 python -m pip install --upgrade pip 'setuptools>=69' wheel
