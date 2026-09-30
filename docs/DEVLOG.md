@@ -593,3 +593,10 @@
 - **迁移**：CUDA/INT8 模型诊断移至 `check_model.py`；调度自检移至 `check_scheduler.py`；Graph 原型正确性用例并入 `check_graph_scheduler.py`。旧生成、模型对照及调度/Graph 检查命令保留，已撤下的性能入口见 BENCHMARK。模型算子、调度状态机与 Graph 类不改，扩展仅订正旧 V0 说明。
 - **检查取舍**：删除已被逐步检查覆盖的最终序列/长度重复断言，以及已由登记前容量判断覆盖的登记后块表宽度判断；保留 CLI 组合约束、块所有权、访存前设备断言、量化规则、数值容差和关键模型/生命周期/Graph 对照。
 - **验证边界**：Windows 只做 AST、依赖与迁移函数静态核对、差异检查；未导入项目、编译、运行 GPU 或重测性能。需云端核对新入口、生成与调度回归后才算行为保持，不把历史 PASS 自动继承为本次 PASS。
+
+### 2026-09-30 V2 第五轮：精简候选版隔离环境回归（覆盖上条待回归状态）
+
+- **身份与环境**：候选源码 `56cb10e36f2d51dc3d70deafd8f0e58b2e775721`；RTX 3090、已有 CUDA Toolkit 12.4 与固定 Revision 缓存，独立源码目录及新 venv。用户回传 Python 3.12.3、torch 2.5.1+cu124 / CUDA 12.4、transformers 4.51.0、accelerate 1.6.0、huggingface_hub 0.36.2；源码与 `_C.so` 均来自新目录，构建及冒烟通过。
+- **行为回归**：`paged_decode` 的 BF16 写入、INT8 六场景及对应 V3 对照通过；`runner` 的 check/generate/cuda-check/int8-check 均执行成功，HF 严格对照、BF16 CUDA 序列及跨块检查通过，INT8 同历史11步选词一致。`check_scheduler`、`check_chunked`、`check_mixed`、`check_graph_scheduler` 通过，覆盖交错/分块/混合、合作式取消到期、容量回退与块复用。无迁移修复；不把同历史 INT8 观察当作完整质量验收。
+- **固定输出补证**：Run ID `v2-r5-b1-e-evidence`、`v2-r5-b1-g-evidence`、`v2-r5-b4-e-evidence`、`v2-r5-b4-g-evidence`；每请求固定输入512、输出32 Token，均无计时样本。用户在云端直接核对四份 JSON 与旧 `0ac0d95` 保存的 Graph 输出：完整逐请求序列、模型 Revision 和输入指纹一致；eager 无捕获，Graph B1重放31/回退0/捕获1，B4重放30（B1为2、B4为28）/回退4/捕获2。入口同时检查输出数及块全部归还；私有原始输出保留仓库外。
+- **交付边界**：完成已有工具链上的隔离 Python 环境复现，未覆盖全新系统、首次模型下载、长上下文或新性能测量；历史收益仍归原提交。此条及 README 为验证后文档整理，阶段发布由上游裁定，版本字段与正式标签尚未变更。

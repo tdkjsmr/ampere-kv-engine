@@ -11,7 +11,7 @@ AmpereKV 是针对固定版本 Qwen3-8B、单张 RTX 3090（`sm_86`）的最小�
 
 ## 工具链
 
-已有云端证据使用 Ubuntu 22.04、Python `3.12.3`、PyTorch `2.5.1+cu124`、系统 CUDA Toolkit `12.4`、RTX 3090（24 GiB）和驱动 `595.71.05`；模型对照曾使用 `transformers 4.51.0`。`accelerate 1.6.0` 见既有云端安装记录；`huggingface_hub` 的精确版本未留存，依赖组合尚未在全新环境按下列步骤完整复验。系统 Toolkit 的 `nvcc`、PyTorch 的 CUDA runtime 标记 `cu124` 和 NVIDIA 驱动是三个不同版本字段，不应互相替代。
+候选源码 `56cb10e` 已在已有 Ubuntu 22.04 / CUDA Toolkit `12.4` 的 RTX 3090（24 GiB，驱动 `595.71.05`）上，用独立源码目录和新 venv 完成构建、冒烟与模型/调度/Graph 回归。实际依赖为 Python `3.12.3`、PyTorch `2.5.1+cu124`、`transformers 4.51.0`、`accelerate 1.6.0`、`huggingface_hub 0.36.2`；源码及扩展均来自新目录。系统 Toolkit 的 `nvcc`、PyTorch 的 CUDA runtime 标记 `cu124` 和 NVIDIA 驱动是三个不同版本字段，不应互相替代。
 
 需要 Git、`make`、可用的 C++/CUDA 编译器和足够空间存放约 16 GB 的模型权重。`setup.py` 只构建本项目扩展，**不自动安装所有运行依赖**。以下命令供 CUDA 12.4 云端环境依次执行；若使用其他环境，应先确认与 PyTorch 扩展构建兼容：
 
@@ -23,7 +23,7 @@ python3.12 -m venv .venv
 source .venv/bin/activate
 python -m pip install --upgrade pip 'setuptools>=69' wheel
 python -m pip install 'torch==2.5.1' --index-url https://download.pytorch.org/whl/cu124
-python -m pip install 'transformers==4.51.0' 'accelerate==1.6.0' 'huggingface_hub[cli]'
+python -m pip install 'transformers==4.51.0' 'accelerate==1.6.0' 'huggingface_hub[cli]==0.36.2'
 export OMP_NUM_THREADS=1
 export HF_HOME=/path/to/persistent/huggingface  # 换成有足够空间的持久化目录；运行时保持一致
 hf download Qwen/Qwen3-8B --revision b968826d9c46dd6066d109eabc6255188de91218
@@ -32,7 +32,7 @@ make smoke
 python -m ampere_kv.runner --mode generate --cache paged
 ```
 
-下载模型不需要 GPU；生成命令会在终端询问一段文本。模型和分词器只从 `HF_HOME` 对应的本地缓存加载固定 Revision，因此切换服务器或缓存目录后须先确认文件仍在。上面的全新环境安装流程尚未端到端实测通过；已有 GPU 正确性与离线性能证据不等于此流程的验收。更多模式与参数见 `python -m ampere_kv.runner --help`。
+下载模型不需要 GPU；已有固定 Revision 缓存时跳过下载。生成命令会在终端询问一段文本。模型和分词器只从 `HF_HOME` 对应的本地缓存加载，因此切换服务器或缓存目录后须先确认文件仍在。本轮复用了已有驱动、Toolkit 和模型缓存，验证范围是隔离 Python 环境复现，尚未覆盖全新系统安装或首次模型下载。更多模式与参数见 `python -m ampere_kv.runner --help`。
 
 [架构说明](docs/ARCHITECTURE.md) · [固定负载测量报告](docs/BENCHMARK.md)
 
